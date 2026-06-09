@@ -285,10 +285,10 @@ class TrainerSpec::_Internal {
     (*has_bits)[0] |= 1u;
   }
   static void set_has_model_type(HasBits* has_bits) {
-    (*has_bits)[0] |= 16777216u;
+    (*has_bits)[0] |= 268435456u;
   }
   static void set_has_vocab_size(HasBits* has_bits) {
-    (*has_bits)[0] |= 33554432u;
+    (*has_bits)[0] |= 536870912u;
   }
   static void set_has_self_test_sample_size(HasBits* has_bits) {
     (*has_bits)[0] |= 1024u;
@@ -297,19 +297,19 @@ class TrainerSpec::_Internal {
     (*has_bits)[0] |= 16384u;
   }
   static void set_has_differential_privacy_noise_level(HasBits* has_bits) {
-    (*has_bits)[0] |= 4194304u;
+    (*has_bits)[0] |= 16777216u;
   }
   static void set_has_differential_privacy_clipping_threshold(HasBits* has_bits) {
     (*has_bits)[0] |= 8388608u;
   }
   static void set_has_character_coverage(HasBits* has_bits) {
-    (*has_bits)[0] |= 67108864u;
+    (*has_bits)[0] |= 1073741824u;
   }
   static void set_has_input_sentence_size(HasBits* has_bits) {
     (*has_bits)[0] |= 4096u;
   }
   static void set_has_shuffle_input_sentence(HasBits* has_bits) {
-    (*has_bits)[1] |= 2u;
+    (*has_bits)[1] |= 32u;
   }
   static void set_has_mining_sentence_size(HasBits* has_bits) {
     (*has_bits)[0] |= 2048u;
@@ -318,31 +318,31 @@ class TrainerSpec::_Internal {
     (*has_bits)[0] |= 8192u;
   }
   static void set_has_seed_sentencepiece_size(HasBits* has_bits) {
-    (*has_bits)[0] |= 134217728u;
-  }
-  static void set_has_shrinking_factor(HasBits* has_bits) {
-    (*has_bits)[0] |= 268435456u;
-  }
-  static void set_has_max_sentence_length(HasBits* has_bits) {
     (*has_bits)[0] |= 2147483648u;
   }
-  static void set_has_num_threads(HasBits* has_bits) {
-    (*has_bits)[0] |= 536870912u;
-  }
-  static void set_has_num_sub_iterations(HasBits* has_bits) {
-    (*has_bits)[0] |= 1073741824u;
-  }
-  static void set_has_max_sentencepiece_length(HasBits* has_bits) {
+  static void set_has_shrinking_factor(HasBits* has_bits) {
     (*has_bits)[1] |= 1u;
   }
-  static void set_has_split_by_unicode_script(HasBits* has_bits) {
-    (*has_bits)[1] |= 4u;
-  }
-  static void set_has_split_by_number(HasBits* has_bits) {
+  static void set_has_max_sentence_length(HasBits* has_bits) {
     (*has_bits)[1] |= 8u;
   }
-  static void set_has_split_by_whitespace(HasBits* has_bits) {
+  static void set_has_num_threads(HasBits* has_bits) {
+    (*has_bits)[1] |= 2u;
+  }
+  static void set_has_num_sub_iterations(HasBits* has_bits) {
+    (*has_bits)[1] |= 4u;
+  }
+  static void set_has_max_sentencepiece_length(HasBits* has_bits) {
     (*has_bits)[1] |= 16u;
+  }
+  static void set_has_split_by_unicode_script(HasBits* has_bits) {
+    (*has_bits)[1] |= 64u;
+  }
+  static void set_has_split_by_number(HasBits* has_bits) {
+    (*has_bits)[1] |= 128u;
+  }
+  static void set_has_split_by_whitespace(HasBits* has_bits) {
+    (*has_bits)[1] |= 256u;
   }
   static void set_has_treat_whitespace_as_suffix(HasBits* has_bits) {
     (*has_bits)[0] |= 32768u;
@@ -360,28 +360,28 @@ class TrainerSpec::_Internal {
     (*has_bits)[0] |= 4u;
   }
   static void set_has_byte_fallback(HasBits* has_bits) {
-    (*has_bits)[0] |= 262144u;
-  }
-  static void set_has_vocabulary_output_piece_score(HasBits* has_bits) {
-    (*has_bits)[1] |= 32u;
-  }
-  static void set_has_hard_vocab_limit(HasBits* has_bits) {
-    (*has_bits)[1] |= 64u;
-  }
-  static void set_has_use_all_vocab(HasBits* has_bits) {
     (*has_bits)[0] |= 524288u;
   }
+  static void set_has_vocabulary_output_piece_score(HasBits* has_bits) {
+    (*has_bits)[1] |= 512u;
+  }
+  static void set_has_hard_vocab_limit(HasBits* has_bits) {
+    (*has_bits)[1] |= 1024u;
+  }
+  static void set_has_use_all_vocab(HasBits* has_bits) {
+    (*has_bits)[0] |= 1048576u;
+  }
   static void set_has_unk_id(HasBits* has_bits) {
-    (*has_bits)[0] |= 2097152u;
+    (*has_bits)[0] |= 262144u;
   }
   static void set_has_bos_id(HasBits* has_bits) {
-    (*has_bits)[1] |= 128u;
+    (*has_bits)[1] |= 2048u;
   }
   static void set_has_eos_id(HasBits* has_bits) {
-    (*has_bits)[1] |= 256u;
+    (*has_bits)[1] |= 4096u;
   }
   static void set_has_pad_id(HasBits* has_bits) {
-    (*has_bits)[1] |= 512u;
+    (*has_bits)[1] |= 8192u;
   }
   static void set_has_unk_piece(HasBits* has_bits) {
     (*has_bits)[0] |= 16u;
@@ -399,10 +399,22 @@ class TrainerSpec::_Internal {
     (*has_bits)[0] |= 8u;
   }
   static void set_has_train_extremely_large_corpus(HasBits* has_bits) {
-    (*has_bits)[0] |= 1048576u;
+    (*has_bits)[0] |= 2097152u;
   }
   static void set_has_seed_sentencepieces_file(HasBits* has_bits) {
     (*has_bits)[0] |= 512u;
+  }
+  static void set_has_split_by_interval(HasBits* has_bits) {
+    (*has_bits)[0] |= 4194304u;
+  }
+  static void set_has_split_by_barline(HasBits* has_bits) {
+    (*has_bits)[0] |= 33554432u;
+  }
+  static void set_has_phase1_merge_budget(HasBits* has_bits) {
+    (*has_bits)[0] |= 67108864u;
+  }
+  static void set_has_phase2_merge_budget(HasBits* has_bits) {
+    (*has_bits)[0] |= 134217728u;
   }
 };
 
@@ -501,8 +513,8 @@ void TrainerSpec::SharedCtor() {
   seed_sentencepieces_file_.UnsafeSetDefault(&::PROTOBUF_NAMESPACE_ID::internal::GetEmptyStringAlreadyInited());
   ::memset(reinterpret_cast<char*>(this) + static_cast<size_t>(
       reinterpret_cast<char*>(&self_test_sample_size_) - reinterpret_cast<char*>(this)),
-      0, static_cast<size_t>(reinterpret_cast<char*>(&differential_privacy_clipping_threshold_) -
-      reinterpret_cast<char*>(&self_test_sample_size_)) + sizeof(differential_privacy_clipping_threshold_));
+      0, static_cast<size_t>(reinterpret_cast<char*>(&phase2_merge_budget_) -
+      reinterpret_cast<char*>(&self_test_sample_size_)) + sizeof(phase2_merge_budget_));
   model_type_ = 1;
   vocab_size_ = 8000;
   character_coverage_ = 0.9995f;
@@ -615,27 +627,30 @@ void TrainerSpec::Clear() {
         reinterpret_cast<char*>(&allow_whitespace_only_pieces_)) + sizeof(differential_privacy_clipping_threshold_));
   }
   if (cached_has_bits & 0xff000000u) {
+    ::memset(&differential_privacy_noise_level_, 0, static_cast<size_t>(
+        reinterpret_cast<char*>(&phase2_merge_budget_) -
+        reinterpret_cast<char*>(&differential_privacy_noise_level_)) + sizeof(phase2_merge_budget_));
     model_type_ = 1;
     vocab_size_ = 8000;
     character_coverage_ = 0.9995f;
     seed_sentencepiece_size_ = 1000000;
+  }
+  cached_has_bits = _has_bits_[1];
+  if (cached_has_bits & 0x000000ffu) {
     shrinking_factor_ = 0.75f;
     num_threads_ = 16;
     num_sub_iterations_ = 2;
     max_sentence_length_ = 4192;
-  }
-  cached_has_bits = _has_bits_[1];
-  if (cached_has_bits & 0x000000ffu) {
     max_sentencepiece_length_ = 16;
     shuffle_input_sentence_ = true;
     split_by_unicode_script_ = true;
     split_by_number_ = true;
+  }
+  if (cached_has_bits & 0x00003f00u) {
     split_by_whitespace_ = true;
     vocabulary_output_piece_score_ = true;
     hard_vocab_limit_ = true;
     bos_id_ = 1;
-  }
-  if (cached_has_bits & 0x00000300u) {
     eos_id_ = 2;
     pad_id_ = -1;
   }
@@ -1042,6 +1057,38 @@ const char* TrainerSpec::_InternalParse(const char* ptr, ::PROTOBUF_NAMESPACE_ID
           CHK_(ptr);
         } else goto handle_unusual;
         continue;
+      // optional bool split_by_interval = 55 [default = false];
+      case 55:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<::PROTOBUF_NAMESPACE_ID::uint8>(tag) == 184)) {
+          _Internal::set_has_split_by_interval(&_has_bits_);
+          split_by_interval_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr);
+          CHK_(ptr);
+        } else goto handle_unusual;
+        continue;
+      // optional bool split_by_barline = 56 [default = false];
+      case 56:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<::PROTOBUF_NAMESPACE_ID::uint8>(tag) == 192)) {
+          _Internal::set_has_split_by_barline(&_has_bits_);
+          split_by_barline_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr);
+          CHK_(ptr);
+        } else goto handle_unusual;
+        continue;
+      // optional int32 phase1_merge_budget = 57 [default = 0];
+      case 57:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<::PROTOBUF_NAMESPACE_ID::uint8>(tag) == 200)) {
+          _Internal::set_has_phase1_merge_budget(&_has_bits_);
+          phase1_merge_budget_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr);
+          CHK_(ptr);
+        } else goto handle_unusual;
+        continue;
+      // optional int32 phase2_merge_budget = 58 [default = 0];
+      case 58:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<::PROTOBUF_NAMESPACE_ID::uint8>(tag) == 208)) {
+          _Internal::set_has_phase2_merge_budget(&_has_bits_);
+          phase2_merge_budget_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr);
+          CHK_(ptr);
+        } else goto handle_unusual;
+        continue;
       default: {
       handle_unusual:
         if ((tag & 7) == 4 || tag == 0) {
@@ -1090,14 +1137,14 @@ failure:
   }
 
   // optional .sentencepiece.TrainerSpec.ModelType model_type = 3 [default = UNIGRAM];
-  if (cached_has_bits & 0x01000000u) {
+  if (cached_has_bits & 0x10000000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteEnumToArray(
       3, this->_internal_model_type(), target);
   }
 
   // optional int32 vocab_size = 4 [default = 8000];
-  if (cached_has_bits & 0x02000000u) {
+  if (cached_has_bits & 0x20000000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(4, this->_internal_vocab_size(), target);
   }
@@ -1121,7 +1168,7 @@ failure:
   }
 
   // optional float character_coverage = 10 [default = 0.9995];
-  if (cached_has_bits & 0x04000000u) {
+  if (cached_has_bits & 0x40000000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteFloatToArray(10, this->_internal_character_coverage(), target);
   }
@@ -1145,62 +1192,62 @@ failure:
   }
 
   // optional int32 seed_sentencepiece_size = 14 [default = 1000000];
-  if (cached_has_bits & 0x08000000u) {
+  if (cached_has_bits & 0x80000000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(14, this->_internal_seed_sentencepiece_size(), target);
   }
 
+  cached_has_bits = _has_bits_[1];
   // optional float shrinking_factor = 15 [default = 0.75];
-  if (cached_has_bits & 0x10000000u) {
+  if (cached_has_bits & 0x00000001u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteFloatToArray(15, this->_internal_shrinking_factor(), target);
   }
 
   // optional int32 num_threads = 16 [default = 16];
-  if (cached_has_bits & 0x20000000u) {
+  if (cached_has_bits & 0x00000002u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(16, this->_internal_num_threads(), target);
   }
 
   // optional int32 num_sub_iterations = 17 [default = 2];
-  if (cached_has_bits & 0x40000000u) {
+  if (cached_has_bits & 0x00000004u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(17, this->_internal_num_sub_iterations(), target);
   }
 
   // optional int32 max_sentence_length = 18 [default = 4192];
-  if (cached_has_bits & 0x80000000u) {
+  if (cached_has_bits & 0x00000008u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(18, this->_internal_max_sentence_length(), target);
   }
 
-  cached_has_bits = _has_bits_[1];
   // optional bool shuffle_input_sentence = 19 [default = true];
-  if (cached_has_bits & 0x00000002u) {
+  if (cached_has_bits & 0x00000020u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(19, this->_internal_shuffle_input_sentence(), target);
   }
 
   // optional int32 max_sentencepiece_length = 20 [default = 16];
-  if (cached_has_bits & 0x00000001u) {
+  if (cached_has_bits & 0x00000010u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(20, this->_internal_max_sentencepiece_length(), target);
   }
 
   // optional bool split_by_unicode_script = 21 [default = true];
-  if (cached_has_bits & 0x00000004u) {
+  if (cached_has_bits & 0x00000040u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(21, this->_internal_split_by_unicode_script(), target);
   }
 
   // optional bool split_by_whitespace = 22 [default = true];
-  if (cached_has_bits & 0x00000010u) {
+  if (cached_has_bits & 0x00000100u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(22, this->_internal_split_by_whitespace(), target);
   }
 
   // optional bool split_by_number = 23 [default = true];
-  if (cached_has_bits & 0x00000008u) {
+  if (cached_has_bits & 0x00000080u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(23, this->_internal_split_by_number(), target);
   }
@@ -1238,26 +1285,26 @@ failure:
 
   cached_has_bits = _has_bits_[1];
   // optional bool vocabulary_output_piece_score = 32 [default = true];
-  if (cached_has_bits & 0x00000020u) {
+  if (cached_has_bits & 0x00000200u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(32, this->_internal_vocabulary_output_piece_score(), target);
   }
 
   // optional bool hard_vocab_limit = 33 [default = true];
-  if (cached_has_bits & 0x00000040u) {
+  if (cached_has_bits & 0x00000400u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(33, this->_internal_hard_vocab_limit(), target);
   }
 
   cached_has_bits = _has_bits_[0];
   // optional bool use_all_vocab = 34 [default = false];
-  if (cached_has_bits & 0x00080000u) {
+  if (cached_has_bits & 0x00100000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(34, this->_internal_use_all_vocab(), target);
   }
 
   // optional bool byte_fallback = 35 [default = false];
-  if (cached_has_bits & 0x00040000u) {
+  if (cached_has_bits & 0x00080000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(35, this->_internal_byte_fallback(), target);
   }
@@ -1269,26 +1316,26 @@ failure:
   }
 
   // optional int32 unk_id = 40 [default = 0];
-  if (cached_has_bits & 0x00200000u) {
+  if (cached_has_bits & 0x00040000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(40, this->_internal_unk_id(), target);
   }
 
   cached_has_bits = _has_bits_[1];
   // optional int32 bos_id = 41 [default = 1];
-  if (cached_has_bits & 0x00000080u) {
+  if (cached_has_bits & 0x00000800u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(41, this->_internal_bos_id(), target);
   }
 
   // optional int32 eos_id = 42 [default = 2];
-  if (cached_has_bits & 0x00000100u) {
+  if (cached_has_bits & 0x00001000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(42, this->_internal_eos_id(), target);
   }
 
   // optional int32 pad_id = 43 [default = -1];
-  if (cached_has_bits & 0x00000200u) {
+  if (cached_has_bits & 0x00002000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(43, this->_internal_pad_id(), target);
   }
@@ -1325,7 +1372,7 @@ failure:
   }
 
   // optional bool train_extremely_large_corpus = 49 [default = false];
-  if (cached_has_bits & 0x00100000u) {
+  if (cached_has_bits & 0x00200000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(49, this->_internal_train_extremely_large_corpus(), target);
   }
@@ -1337,7 +1384,7 @@ failure:
   }
 
   // optional float differential_privacy_noise_level = 51 [default = 0];
-  if (cached_has_bits & 0x00400000u) {
+  if (cached_has_bits & 0x01000000u) {
     target = stream->EnsureSpace(target);
     target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteFloatToArray(51, this->_internal_differential_privacy_noise_level(), target);
   }
@@ -1358,6 +1405,30 @@ failure:
   if (cached_has_bits & 0x00000200u) {
     target = stream->WriteStringMaybeAliased(
         54, this->_internal_seed_sentencepieces_file(), target);
+  }
+
+  // optional bool split_by_interval = 55 [default = false];
+  if (cached_has_bits & 0x00400000u) {
+    target = stream->EnsureSpace(target);
+    target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(55, this->_internal_split_by_interval(), target);
+  }
+
+  // optional bool split_by_barline = 56 [default = false];
+  if (cached_has_bits & 0x02000000u) {
+    target = stream->EnsureSpace(target);
+    target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteBoolToArray(56, this->_internal_split_by_barline(), target);
+  }
+
+  // optional int32 phase1_merge_budget = 57 [default = 0];
+  if (cached_has_bits & 0x04000000u) {
+    target = stream->EnsureSpace(target);
+    target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(57, this->_internal_phase1_merge_budget(), target);
+  }
+
+  // optional int32 phase2_merge_budget = 58 [default = 0];
+  if (cached_has_bits & 0x08000000u) {
+    target = stream->EnsureSpace(target);
+    target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::WriteInt32ToArray(58, this->_internal_phase2_merge_budget(), target);
   }
 
   // Extension range [200, 536870912)
@@ -1538,31 +1609,31 @@ size_t TrainerSpec::ByteSizeLong() const {
       total_size += 2 + 1;
     }
 
-    // optional bool byte_fallback = 35 [default = false];
-    if (cached_has_bits & 0x00040000u) {
-      total_size += 2 + 1;
-    }
-
-    // optional bool use_all_vocab = 34 [default = false];
-    if (cached_has_bits & 0x00080000u) {
-      total_size += 2 + 1;
-    }
-
-    // optional bool train_extremely_large_corpus = 49 [default = false];
-    if (cached_has_bits & 0x00100000u) {
-      total_size += 2 + 1;
-    }
-
     // optional int32 unk_id = 40 [default = 0];
-    if (cached_has_bits & 0x00200000u) {
+    if (cached_has_bits & 0x00040000u) {
       total_size += 2 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_unk_id());
     }
 
-    // optional float differential_privacy_noise_level = 51 [default = 0];
+    // optional bool byte_fallback = 35 [default = false];
+    if (cached_has_bits & 0x00080000u) {
+      total_size += 2 + 1;
+    }
+
+    // optional bool use_all_vocab = 34 [default = false];
+    if (cached_has_bits & 0x00100000u) {
+      total_size += 2 + 1;
+    }
+
+    // optional bool train_extremely_large_corpus = 49 [default = false];
+    if (cached_has_bits & 0x00200000u) {
+      total_size += 2 + 1;
+    }
+
+    // optional bool split_by_interval = 55 [default = false];
     if (cached_has_bits & 0x00400000u) {
-      total_size += 2 + 4;
+      total_size += 2 + 1;
     }
 
     // optional uint64 differential_privacy_clipping_threshold = 52 [default = 0];
@@ -1574,115 +1645,139 @@ size_t TrainerSpec::ByteSizeLong() const {
 
   }
   if (cached_has_bits & 0xff000000u) {
-    // optional .sentencepiece.TrainerSpec.ModelType model_type = 3 [default = UNIGRAM];
+    // optional float differential_privacy_noise_level = 51 [default = 0];
     if (cached_has_bits & 0x01000000u) {
+      total_size += 2 + 4;
+    }
+
+    // optional bool split_by_barline = 56 [default = false];
+    if (cached_has_bits & 0x02000000u) {
+      total_size += 2 + 1;
+    }
+
+    // optional int32 phase1_merge_budget = 57 [default = 0];
+    if (cached_has_bits & 0x04000000u) {
+      total_size += 2 +
+        ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
+          this->_internal_phase1_merge_budget());
+    }
+
+    // optional int32 phase2_merge_budget = 58 [default = 0];
+    if (cached_has_bits & 0x08000000u) {
+      total_size += 2 +
+        ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
+          this->_internal_phase2_merge_budget());
+    }
+
+    // optional .sentencepiece.TrainerSpec.ModelType model_type = 3 [default = UNIGRAM];
+    if (cached_has_bits & 0x10000000u) {
       total_size += 1 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::EnumSize(this->_internal_model_type());
     }
 
     // optional int32 vocab_size = 4 [default = 8000];
-    if (cached_has_bits & 0x02000000u) {
+    if (cached_has_bits & 0x20000000u) {
       total_size += 1 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_vocab_size());
     }
 
     // optional float character_coverage = 10 [default = 0.9995];
-    if (cached_has_bits & 0x04000000u) {
+    if (cached_has_bits & 0x40000000u) {
       total_size += 1 + 4;
     }
 
     // optional int32 seed_sentencepiece_size = 14 [default = 1000000];
-    if (cached_has_bits & 0x08000000u) {
+    if (cached_has_bits & 0x80000000u) {
       total_size += 1 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_seed_sentencepiece_size());
     }
 
+  }
+  cached_has_bits = _has_bits_[1];
+  if (cached_has_bits & 0x000000ffu) {
     // optional float shrinking_factor = 15 [default = 0.75];
-    if (cached_has_bits & 0x10000000u) {
+    if (cached_has_bits & 0x00000001u) {
       total_size += 1 + 4;
     }
 
     // optional int32 num_threads = 16 [default = 16];
-    if (cached_has_bits & 0x20000000u) {
+    if (cached_has_bits & 0x00000002u) {
       total_size += 2 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_num_threads());
     }
 
     // optional int32 num_sub_iterations = 17 [default = 2];
-    if (cached_has_bits & 0x40000000u) {
+    if (cached_has_bits & 0x00000004u) {
       total_size += 2 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_num_sub_iterations());
     }
 
     // optional int32 max_sentence_length = 18 [default = 4192];
-    if (cached_has_bits & 0x80000000u) {
+    if (cached_has_bits & 0x00000008u) {
       total_size += 2 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_max_sentence_length());
     }
 
-  }
-  cached_has_bits = _has_bits_[1];
-  if (cached_has_bits & 0x000000ffu) {
     // optional int32 max_sentencepiece_length = 20 [default = 16];
-    if (cached_has_bits & 0x00000001u) {
+    if (cached_has_bits & 0x00000010u) {
       total_size += 2 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_max_sentencepiece_length());
     }
 
     // optional bool shuffle_input_sentence = 19 [default = true];
-    if (cached_has_bits & 0x00000002u) {
-      total_size += 2 + 1;
-    }
-
-    // optional bool split_by_unicode_script = 21 [default = true];
-    if (cached_has_bits & 0x00000004u) {
-      total_size += 2 + 1;
-    }
-
-    // optional bool split_by_number = 23 [default = true];
-    if (cached_has_bits & 0x00000008u) {
-      total_size += 2 + 1;
-    }
-
-    // optional bool split_by_whitespace = 22 [default = true];
-    if (cached_has_bits & 0x00000010u) {
-      total_size += 2 + 1;
-    }
-
-    // optional bool vocabulary_output_piece_score = 32 [default = true];
     if (cached_has_bits & 0x00000020u) {
       total_size += 2 + 1;
     }
 
-    // optional bool hard_vocab_limit = 33 [default = true];
+    // optional bool split_by_unicode_script = 21 [default = true];
     if (cached_has_bits & 0x00000040u) {
       total_size += 2 + 1;
     }
 
-    // optional int32 bos_id = 41 [default = 1];
+    // optional bool split_by_number = 23 [default = true];
     if (cached_has_bits & 0x00000080u) {
+      total_size += 2 + 1;
+    }
+
+  }
+  if (cached_has_bits & 0x00003f00u) {
+    // optional bool split_by_whitespace = 22 [default = true];
+    if (cached_has_bits & 0x00000100u) {
+      total_size += 2 + 1;
+    }
+
+    // optional bool vocabulary_output_piece_score = 32 [default = true];
+    if (cached_has_bits & 0x00000200u) {
+      total_size += 2 + 1;
+    }
+
+    // optional bool hard_vocab_limit = 33 [default = true];
+    if (cached_has_bits & 0x00000400u) {
+      total_size += 2 + 1;
+    }
+
+    // optional int32 bos_id = 41 [default = 1];
+    if (cached_has_bits & 0x00000800u) {
       total_size += 2 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_bos_id());
     }
 
-  }
-  if (cached_has_bits & 0x00000300u) {
     // optional int32 eos_id = 42 [default = 2];
-    if (cached_has_bits & 0x00000100u) {
+    if (cached_has_bits & 0x00001000u) {
       total_size += 2 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_eos_id());
     }
 
     // optional int32 pad_id = 43 [default = -1];
-    if (cached_has_bits & 0x00000200u) {
+    if (cached_has_bits & 0x00002000u) {
       total_size += 2 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::Int32Size(
           this->_internal_pad_id());
@@ -1777,19 +1872,19 @@ void TrainerSpec::MergeFrom(const TrainerSpec& from) {
       split_digits_ = from.split_digits_;
     }
     if (cached_has_bits & 0x00040000u) {
-      byte_fallback_ = from.byte_fallback_;
-    }
-    if (cached_has_bits & 0x00080000u) {
-      use_all_vocab_ = from.use_all_vocab_;
-    }
-    if (cached_has_bits & 0x00100000u) {
-      train_extremely_large_corpus_ = from.train_extremely_large_corpus_;
-    }
-    if (cached_has_bits & 0x00200000u) {
       unk_id_ = from.unk_id_;
     }
+    if (cached_has_bits & 0x00080000u) {
+      byte_fallback_ = from.byte_fallback_;
+    }
+    if (cached_has_bits & 0x00100000u) {
+      use_all_vocab_ = from.use_all_vocab_;
+    }
+    if (cached_has_bits & 0x00200000u) {
+      train_extremely_large_corpus_ = from.train_extremely_large_corpus_;
+    }
     if (cached_has_bits & 0x00400000u) {
-      differential_privacy_noise_level_ = from.differential_privacy_noise_level_;
+      split_by_interval_ = from.split_by_interval_;
     }
     if (cached_has_bits & 0x00800000u) {
       differential_privacy_clipping_threshold_ = from.differential_privacy_clipping_threshold_;
@@ -1798,64 +1893,76 @@ void TrainerSpec::MergeFrom(const TrainerSpec& from) {
   }
   if (cached_has_bits & 0xff000000u) {
     if (cached_has_bits & 0x01000000u) {
-      model_type_ = from.model_type_;
+      differential_privacy_noise_level_ = from.differential_privacy_noise_level_;
     }
     if (cached_has_bits & 0x02000000u) {
-      vocab_size_ = from.vocab_size_;
+      split_by_barline_ = from.split_by_barline_;
     }
     if (cached_has_bits & 0x04000000u) {
-      character_coverage_ = from.character_coverage_;
+      phase1_merge_budget_ = from.phase1_merge_budget_;
     }
     if (cached_has_bits & 0x08000000u) {
-      seed_sentencepiece_size_ = from.seed_sentencepiece_size_;
+      phase2_merge_budget_ = from.phase2_merge_budget_;
     }
     if (cached_has_bits & 0x10000000u) {
-      shrinking_factor_ = from.shrinking_factor_;
+      model_type_ = from.model_type_;
     }
     if (cached_has_bits & 0x20000000u) {
-      num_threads_ = from.num_threads_;
+      vocab_size_ = from.vocab_size_;
     }
     if (cached_has_bits & 0x40000000u) {
-      num_sub_iterations_ = from.num_sub_iterations_;
+      character_coverage_ = from.character_coverage_;
     }
     if (cached_has_bits & 0x80000000u) {
-      max_sentence_length_ = from.max_sentence_length_;
+      seed_sentencepiece_size_ = from.seed_sentencepiece_size_;
     }
     _has_bits_[0] |= cached_has_bits;
   }
   cached_has_bits = from._has_bits_[1];
   if (cached_has_bits & 0x000000ffu) {
     if (cached_has_bits & 0x00000001u) {
-      max_sentencepiece_length_ = from.max_sentencepiece_length_;
+      shrinking_factor_ = from.shrinking_factor_;
     }
     if (cached_has_bits & 0x00000002u) {
-      shuffle_input_sentence_ = from.shuffle_input_sentence_;
+      num_threads_ = from.num_threads_;
     }
     if (cached_has_bits & 0x00000004u) {
-      split_by_unicode_script_ = from.split_by_unicode_script_;
+      num_sub_iterations_ = from.num_sub_iterations_;
     }
     if (cached_has_bits & 0x00000008u) {
-      split_by_number_ = from.split_by_number_;
+      max_sentence_length_ = from.max_sentence_length_;
     }
     if (cached_has_bits & 0x00000010u) {
-      split_by_whitespace_ = from.split_by_whitespace_;
+      max_sentencepiece_length_ = from.max_sentencepiece_length_;
     }
     if (cached_has_bits & 0x00000020u) {
-      vocabulary_output_piece_score_ = from.vocabulary_output_piece_score_;
+      shuffle_input_sentence_ = from.shuffle_input_sentence_;
     }
     if (cached_has_bits & 0x00000040u) {
-      hard_vocab_limit_ = from.hard_vocab_limit_;
+      split_by_unicode_script_ = from.split_by_unicode_script_;
     }
     if (cached_has_bits & 0x00000080u) {
-      bos_id_ = from.bos_id_;
+      split_by_number_ = from.split_by_number_;
     }
     _has_bits_[1] |= cached_has_bits;
   }
-  if (cached_has_bits & 0x00000300u) {
+  if (cached_has_bits & 0x00003f00u) {
     if (cached_has_bits & 0x00000100u) {
-      eos_id_ = from.eos_id_;
+      split_by_whitespace_ = from.split_by_whitespace_;
     }
     if (cached_has_bits & 0x00000200u) {
+      vocabulary_output_piece_score_ = from.vocabulary_output_piece_score_;
+    }
+    if (cached_has_bits & 0x00000400u) {
+      hard_vocab_limit_ = from.hard_vocab_limit_;
+    }
+    if (cached_has_bits & 0x00000800u) {
+      bos_id_ = from.bos_id_;
+    }
+    if (cached_has_bits & 0x00001000u) {
+      eos_id_ = from.eos_id_;
+    }
+    if (cached_has_bits & 0x00002000u) {
       pad_id_ = from.pad_id_;
     }
     _has_bits_[1] |= cached_has_bits;
@@ -1898,8 +2005,8 @@ void TrainerSpec::InternalSwap(TrainerSpec* other) {
   pretokenization_delimiter_.Swap(&other->pretokenization_delimiter_, &::PROTOBUF_NAMESPACE_ID::internal::GetEmptyStringAlreadyInited(), GetArena());
   seed_sentencepieces_file_.Swap(&other->seed_sentencepieces_file_, &::PROTOBUF_NAMESPACE_ID::internal::GetEmptyStringAlreadyInited(), GetArena());
   ::PROTOBUF_NAMESPACE_ID::internal::memswap<
-      PROTOBUF_FIELD_OFFSET(TrainerSpec, differential_privacy_clipping_threshold_)
-      + sizeof(TrainerSpec::differential_privacy_clipping_threshold_)
+      PROTOBUF_FIELD_OFFSET(TrainerSpec, phase2_merge_budget_)
+      + sizeof(TrainerSpec::phase2_merge_budget_)
       - PROTOBUF_FIELD_OFFSET(TrainerSpec, self_test_sample_size_)>(
           reinterpret_cast<char*>(&self_test_sample_size_),
           reinterpret_cast<char*>(&other->self_test_sample_size_));

@@ -20,7 +20,7 @@ option optimize_for = LITE_RUNTIME;
 package sentencepiece;
 
 // TrainerSpec encodes a various parameters for SentencePiece training.
-// Next id: 55
+// Next id: 59
 message TrainerSpec {
   ///////////////////////////////////////////////////////////////////
   // General parameters
@@ -235,6 +235,24 @@ message TrainerSpec {
  // Path to a seed sentencepieces file, with one tab-separated
   // seed sentencepiece <tab> frequency per line.
   optional string seed_sentencepieces_file = 54 [default = ""];
+
+  // Split only at whitespace followed by digit (0-9) or pipe (|).
+  // For intermo music notation: interval/barline boundaries.
+  // When true, split_by_whitespace must be false.
+  optional bool split_by_interval = 55 [default = false];
+
+  // Split only at whitespace followed by pipe (|).
+  // For intermo music notation: barline boundaries only.
+  // When true, split_by_whitespace must be false.
+  optional bool split_by_barline = 56 [default = false];
+
+  // Progressive BPE phase budgets (three-stage BPE).
+  // phase1_merge_budget: merges that must respect whitespace boundary.
+  // phase2_merge_budget: merges that must respect interval boundary.
+  // Remaining merges respect barline boundary only.
+  // Requires model_type=BPE and split_by_barline=true.
+  optional int32 phase1_merge_budget = 57 [default = 0];
+  optional int32 phase2_merge_budget = 58 [default = 0];
 
   // Customized extensions: the range of field numbers
   // are open to third-party extensions.
