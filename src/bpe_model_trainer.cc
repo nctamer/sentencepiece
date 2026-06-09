@@ -280,9 +280,46 @@ util::Status Trainer::Train() {
   // e.g., "aaa" => "aa" + "a" or "a" + "aa".
   absl::flat_hash_set<std::string> dup;
 
+  // Progressive constraint: symbols deferred in current phase.
+  absl::flat_hash_set<uint64_t> phase_deferred;
+  int current_phase = 0;
+  const int phase1 = trainer_spec_.phase1_merge_budget();
+  const int phase2 = trainer_spec_.phase2_merge_budget();
+  const bool use_phases = (phase1 > 0 || phase2 > 0);
+
+  auto crosses_phase_boundary = [&](const Symbol* sym, int phase) -> bool {
+    if (phase == 0) {
+      for (size_t i = 1; i < sym->chars.size(); ++i) {
+        if (sym->chars[i] == kWSChar) return true;
+      }
+    } else if (phase == 1) {
+      for (size_t i = 1; i + 1 < sym->chars.size(); ++i) {
+        if (sym->chars[i] == kWSChar) {
+          const char32 next = sym->chars[i + 1];
+          if ((next >= '0' && next <= '9') || next == '|') return true;
+        }
+      }
+    }
+    return false;
+  };
+
   // Main loop.
   RET_CHECK(final_pieces_.empty());
   while (final_pieces_.size() < static_cast<size_t>(vocab_size)) {
+    // Check for phase transition (forward only).
+    if (use_phases) {
+      int new_phase = 2;
+      if (static_cast<int>(final_pieces_.size()) < phase1) new_phase = 0;
+      else if (static_cast<int>(final_pieces_.size()) < phase1 + phase2) new_phase = 1;
+      if (new_phase > current_phase) {
+        LOG(INFO) << "Phase transition: " << current_phase << " -> "
+                  << new_phase << " at merge " << final_pieces_.size();
+        current_phase = new_phase;
+        phase_deferred.clear();
+        UpdateActiveSymbols();
+      }
+    }
+
     constexpr int kUpdateActiveSymbolsInterval = 100;
     if (final_pieces_.size() % kUpdateActiveSymbolsInterval == 0) {
       UpdateActiveSymbols();
@@ -292,9 +329,8 @@ util::Status Trainer::Train() {
     Symbol* best_symbol = nullptr;
     for (auto& it : active_symbols_) {
       Symbol* symbol = it;
+      if (use_phases && phase_deferred.count(symbol->fp)) continue;
       ComputeFreq(symbol);
-      // If the frequency is the same, take shorter symbol.
-      // if the length is the same, use lexicographical comparison
       if (best_symbol == nullptr ||
           (symbol->freq > best_symbol->freq ||
            (symbol->freq == best_symbol->freq &&
@@ -306,14 +342,28 @@ util::Status Trainer::Train() {
     }
 
     if (best_symbol == nullptr) {
+      if (use_phases && current_phase < 2) {
+        LOG(INFO) << "No valid symbol in phase " << current_phase
+                  << " at merge " << final_pieces_.size() << ", advancing phase";
+        current_phase++;
+        phase_deferred.clear();
+        UpdateActiveSymbols();
+        continue;
+      }
       LOG(WARNING) << "No valid symbol found";
       break;
     }
 
     if (!dup.insert(best_symbol->ToString()).second) {
-      // Removes best_symbol so it is not selected again.
       symbols_cache_.erase(best_symbol->fp);
       active_symbols_.erase(best_symbol);
+      continue;
+    }
+
+    // Progressive constraint: check if merge crosses current phase boundary.
+    if (use_phases && crosses_phase_boundary(best_symbol, current_phase)) {
+      dup.erase(best_symbol->ToString());
+      phase_deferred.insert(best_symbol->fp);
       continue;
     }
 

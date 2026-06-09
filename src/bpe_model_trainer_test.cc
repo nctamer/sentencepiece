@@ -132,6 +132,89 @@ TEST(BPETrainerTest, EndToEndTest) {
             absl::StrJoin(tok, " "));
 }
 
+TEST(BPETrainerTest, ProgressiveConstraintTest) {
+  // Train with split_by_barline + phase budgets on intermo-like data.
+  // Phase 1 (first 10 merges): within-event only (no internal whitespace)
+  // Phase 2 (next 10 merges): cross-event within-moment (no internal ws+digit/|)
+  // Phase 3 (remaining): cross-moment within-bar (no internal ws+|)
+  const std::string input_file =
+      util::JoinPath(::testing::TempDir(), "intermo_input");
+  const std::string model_prefix =
+      util::JoinPath(::testing::TempDir(), "intermo_model");
+  {
+    auto output = filesystem::NewWritableFile(input_file);
+    // Repeat to get sufficient frequency
+    for (int i = 0; i < 100; ++i) {
+      output->WriteLine(
+          "|4/4k0 PR: C5 1/4 PL: A-3 C4 F4 1/8 PR: c5 D-5 |3/4k0 PR: G4");
+    }
+  }
+
+  TrainerSpec trainer_spec;
+  trainer_spec.set_model_type(TrainerSpec::BPE);
+  trainer_spec.add_input(input_file);
+  trainer_spec.set_vocab_size(80);
+  trainer_spec.set_model_prefix(model_prefix);
+  trainer_spec.set_split_by_whitespace(false);
+  trainer_spec.set_split_by_barline(true);
+  trainer_spec.set_split_by_unicode_script(false);
+  trainer_spec.set_split_by_number(false);
+  trainer_spec.set_character_coverage(1.0);
+  trainer_spec.set_max_sentence_length(500000);
+  trainer_spec.set_phase1_merge_budget(10);
+  trainer_spec.set_phase2_merge_budget(10);
+
+  NormalizerSpec normalizer_spec;
+  normalizer_spec.set_name("identity");
+  normalizer_spec.set_add_dummy_prefix(true);
+
+  NormalizerSpec denormalizer_spec;
+
+  Trainer trainer(trainer_spec, normalizer_spec, denormalizer_spec);
+  EXPECT_TRUE(trainer.Train().ok());
+
+  SentencePieceProcessor processor;
+  EXPECT_TRUE(processor.Load(model_prefix + ".model").ok());
+
+  const auto &model = processor.model_proto();
+
+  // Check phase 1 pieces (first 10 after meta pieces): no internal whitespace
+  int phase1_violations = 0;
+  int phase2_violations = 0;
+  const int meta_size = 3;  // <unk>, <s>, </s>
+  for (int i = meta_size; i < model.pieces_size(); ++i) {
+    const std::string &piece = model.pieces(i).piece();
+    const int merge_idx = i - meta_size;
+
+    // Check for internal whitespace (▁ at pos > 0)
+    bool has_internal_ws = false;
+    bool has_interval_boundary = false;
+    for (size_t p = 3; p < piece.size(); p++) {
+      if (piece.substr(p, 3) == WS) {
+        has_internal_ws = true;
+        if (p + 3 < piece.size()) {
+          char next = piece[p + 3];
+          if ((next >= '0' && next <= '9') || next == '|') {
+            has_interval_boundary = true;
+          }
+        }
+      }
+    }
+
+    if (merge_idx < 10 && has_internal_ws) {
+      phase1_violations++;
+    }
+    if (merge_idx < 20 && has_interval_boundary) {
+      phase2_violations++;
+    }
+  }
+
+  EXPECT_EQ(0, phase1_violations)
+      << "Phase 1 pieces should not have internal whitespace";
+  EXPECT_EQ(0, phase2_violations)
+      << "Phase 2 pieces should not cross interval boundaries";
+}
+
 }  // namespace
 }  // namespace bpe
 }  // namespace sentencepiece
