@@ -158,12 +158,15 @@ void ModelInterface::InitializePieces() {
 
 std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
                                               bool treat_ws_as_suffix,
-                                              bool allow_ws_only_pieces) {
+                                              bool allow_ws_only_pieces,
+                                              bool split_by_interval,
+                                              bool split_by_barline) {
   const char *begin = text.data();
   const char *end = text.data() + text.size();
 
   // Space symbol (U+2581)
   constexpr absl::string_view kSpaceSymbol = "\xe2\x96\x81";
+  constexpr int kSpaceLen = 3;
   bool in_ws_sequence = false;
 
   std::vector<absl::string_view> result;
@@ -195,10 +198,24 @@ std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
           std::min<int>(string_util::OneCharLen(begin), end - begin);
       bool is_ws = absl::string_view(begin, mblen) == kSpaceSymbol;
 
-      // if is whitespace (and not in sequence if allow_ws_only_pieces is True)
+      bool should_split = is_ws;
+      if ((split_by_interval || split_by_barline) && is_ws) {
+        const char *after_ws = begin + kSpaceLen;
+        if (after_ws < end) {
+          const char c = *after_ws;
+          if (split_by_barline) {
+            should_split = (c == '|');
+          } else {
+            should_split = (c >= '0' && c <= '9') || c == '|';
+          }
+        } else {
+          should_split = false;
+        }
+      }
+
       if (begin == text.data() ||
-          (is_ws && (!in_ws_sequence || !allow_ws_only_pieces))) {
-        result.emplace_back(begin, 0);  // add empty string piece.
+          (should_split && (!in_ws_sequence || !allow_ws_only_pieces))) {
+        result.emplace_back(begin, 0);
         in_ws_sequence = true;
       }
 

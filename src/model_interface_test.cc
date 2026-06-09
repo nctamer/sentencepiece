@@ -457,6 +457,72 @@ TEST(ModelInterfaceTest, SplitIntoWordsWhiteSpaceOnly) {
   }
 }
 
+TEST(ModelInterfaceTest, SplitIntoWordsByIntervalTest) {
+  // intermo: |4/4k0 PR: C5 1/4 PL: A-3
+  // With split_by_interval=true, only split before WS+digit or WS+|
+  // Moments: [|4/4k0 PR: C5] [1/4 PL: A-3]
+  {
+    const auto v = SplitIntoWords(
+        WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3",
+        false, false, true, false);
+    EXPECT_EQ(2, v.size());
+    EXPECT_EQ(WS "|4/4k0" WS "PR:" WS "C5", v[0]);
+    EXPECT_EQ(WS "1/4" WS "PL:" WS "A-3", v[1]);
+  }
+
+  // Multiple moments
+  {
+    const auto v = SplitIntoWords(
+        WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3" WS "1/8" WS "PR:" WS "c5",
+        false, false, true, false);
+    EXPECT_EQ(3, v.size());
+    EXPECT_EQ(WS "|4/4k0" WS "PR:" WS "C5", v[0]);
+    EXPECT_EQ(WS "1/4" WS "PL:" WS "A-3", v[1]);
+    EXPECT_EQ(WS "1/8" WS "PR:" WS "c5", v[2]);
+  }
+
+  // WS followed by non-digit/non-pipe does NOT create boundary
+  {
+    const auto v = SplitIntoWords(
+        WS "PR:" WS "C5" WS "D4",
+        false, false, true, false);
+    EXPECT_EQ(1, v.size());
+    EXPECT_EQ(WS "PR:" WS "C5" WS "D4", v[0]);
+  }
+
+  // Text starting without WS
+  {
+    const auto v = SplitIntoWords(
+        "|4/4k0" WS "PR:" WS "1/4" WS "c5",
+        false, false, true, false);
+    EXPECT_EQ(2, v.size());
+    EXPECT_EQ("|4/4k0" WS "PR:", v[0]);
+    EXPECT_EQ(WS "1/4" WS "c5", v[1]);
+  }
+}
+
+TEST(ModelInterfaceTest, SplitIntoWordsByBarlineTest) {
+  // With split_by_barline=true, only split before WS+|
+  // Bars: [|4/4k0 PR: C5 1/4 PL: A-3] [|3/4k0 D5]
+  {
+    const auto v = SplitIntoWords(
+        WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3" WS "|3/4k0" WS "D5",
+        false, false, false, true);
+    EXPECT_EQ(2, v.size());
+    EXPECT_EQ(WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3", v[0]);
+    EXPECT_EQ(WS "|3/4k0" WS "D5", v[1]);
+  }
+
+  // WS+digit does NOT create boundary in barline mode
+  {
+    const auto v = SplitIntoWords(
+        WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3",
+        false, false, false, true);
+    EXPECT_EQ(1, v.size());
+    EXPECT_EQ(WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3", v[0]);
+  }
+}
+
 TEST(ModelInterfaceTest, ByteToPieceTest) {
   EXPECT_EQ(ByteToPiece(0), "<0x00>");
   EXPECT_EQ(ByteToPiece(1), "<0x01>");
