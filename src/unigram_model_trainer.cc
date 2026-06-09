@@ -531,6 +531,13 @@ TrainerModel::SentencePieces Trainer::PruneSentencePieces(
   // loss approximately by assuming that all sentencepiece[i] in the sentences
   // are replaced with alternatives[i] when sentencepiece[i] is removed.
   for (size_t i = 0; i < sentencepieces.size(); ++i) {
+    const bool is_protected = !protected_pieces_.empty() &&
+        protected_pieces_.count(sentencepieces[i].first);
+    if (freq[i] == 0 && is_protected) {
+      // Protected piece with zero freq: keep it anyway.
+      new_sentencepieces.push_back(sentencepieces[i]);
+      continue;
+    }
     if (freq[i] == 0 || !always_keep[i]) {
       // not found in Viterbi path. Can remove this entry safely.
       continue;
@@ -586,11 +593,14 @@ TrainerModel::SentencePieces Trainer::FinalizeSentencePieces(
                                              sentencepieces.end());
 
   // Protected pieces must be included in the final sentencepieces.
+  // Iterate over protected_pieces_ directly (not model pieces) to catch
+  // any that were lost earlier in the pipeline.
   if (!protected_pieces_.empty()) {
-    for (const auto &w : sentencepieces) {
-      if (protected_pieces_.count(w.first)) {
-        final_sentencepieces[w.first] = port::ContainsKey(sp, w.first)
-            ? sp[w.first] : model.min_score();
+    for (const auto &p : protected_pieces_) {
+      if (port::ContainsKey(sp, p)) {
+        final_sentencepieces[p] = sp[p];
+      } else {
+        final_sentencepieces[p] = model.min_score();
       }
     }
   }
