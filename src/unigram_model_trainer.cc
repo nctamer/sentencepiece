@@ -304,9 +304,13 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
     // split candidate frequent piece into the actual piece.
     auto split_into_pieces =
         [&](absl::string_view w) -> std::vector<absl::string_view> {
-      if (trainer_spec_.split_by_whitespace()) {
+      if (trainer_spec_.split_by_whitespace() ||
+          trainer_spec_.split_by_interval() ||
+          trainer_spec_.split_by_barline()) {
         return SplitIntoWords(w, trainer_spec_.treat_whitespace_as_suffix(),
-                              trainer_spec_.allow_whitespace_only_pieces());
+                              trainer_spec_.allow_whitespace_only_pieces(),
+                              trainer_spec_.split_by_interval(),
+                              trainer_spec_.split_by_barline());
       }
       return {w};
     };
@@ -619,7 +623,9 @@ util::Status Trainer::Train() {
 
   RETURN_IF_ERROR(model.SetSentencePieces(std::move(seed_sentencepieces)));
 
-  if (trainer_spec_.split_by_whitespace()) {
+  if (trainer_spec_.split_by_whitespace() ||
+      trainer_spec_.split_by_interval() ||
+      trainer_spec_.split_by_barline()) {
     SplitSentencesByWhitespace();
   }
 

@@ -232,7 +232,9 @@ util::Status Trainer::Train() {
   // Load all sentences
   RETURN_IF_ERROR(LoadSentences());
 
-  if (trainer_spec_.split_by_whitespace()) {
+  if (trainer_spec_.split_by_whitespace() ||
+      trainer_spec_.split_by_interval() ||
+      trainer_spec_.split_by_barline()) {
     SplitSentencesByWhitespace();
   }
 
@@ -349,7 +351,9 @@ util::Status Trainer::TrainFast() {
 
   RETURN_IF_ERROR(LoadSentences());
 
-  if (trainer_spec_.split_by_whitespace()) {
+  if (trainer_spec_.split_by_whitespace() ||
+      trainer_spec_.split_by_interval() ||
+      trainer_spec_.split_by_barline()) {
     SplitSentencesByWhitespace();
   }
 

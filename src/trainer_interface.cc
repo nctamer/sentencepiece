@@ -251,17 +251,22 @@ bool TrainerInterface::IsValidSentencePiece(
     }
 
     if (c == kWSChar) {
-      // Only allows whitespace to appear as a prefix of piece unless
-      // allow_whitespace_only_pieces is True.
-      // When split_by_whitespace is false, we allow whitespaces to
-      // appear in the middle, "foo_bar", but do not allow them
-      // to appear as suffix, "foo_bar_".
-      // Regardless of the setting of split_by_whitespace,
-      // whitespace is treated as a prefix/infix of symbol or
-      // independent symbol, unless allow_whitespace_only_pieces() is true,
-      // in which case whitespace only pieces can occur.
-      if (!trainer_spec_.allow_whitespace_only_pieces() ||
+      // Interval/barline mode: reject pieces with internal boundary-crossing
+      // whitespace (whitespace followed by digit/| at internal position).
+      if (trainer_spec_.split_by_interval() ||
+          trainer_spec_.split_by_barline()) {
+        if (pos > 0 && pos + 1 < sentencepiece.size()) {
+          const char32 next_c = sentencepiece[pos + 1];
+          if (trainer_spec_.split_by_barline()) {
+            if (next_c == '|') return false;
+          } else {
+            if ((next_c >= '0' && next_c <= '9') || next_c == '|')
+              return false;
+          }
+        }
+      } else if (!trainer_spec_.allow_whitespace_only_pieces() ||
           !all_whitespace_piece) {
+        // Standard whitespace handling
         if (trainer_spec_.treat_whitespace_as_suffix()) {
           if ((trainer_spec_.split_by_whitespace() &&
                pos < sentencepiece.size() - 1) ||
@@ -603,7 +608,9 @@ void TrainerInterface::SplitSentencesByWhitespace() {
   for (const auto &s : sentences_) {
     for (const auto &w :
          SplitIntoWords(s.first, trainer_spec_.treat_whitespace_as_suffix(),
-                        trainer_spec_.allow_whitespace_only_pieces())) {
+                        trainer_spec_.allow_whitespace_only_pieces(),
+                        trainer_spec_.split_by_interval(),
+                        trainer_spec_.split_by_barline())) {
       tokens[w] += s.second;
     }
   }
