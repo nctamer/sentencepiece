@@ -80,6 +80,14 @@ ABSL_FLAG(bool, split_by_whitespace, kDefaultTrainerSpec.split_by_whitespace(),
           "use a white space to split sentence pieces");
 ABSL_FLAG(bool, split_digits, kDefaultTrainerSpec.split_digits(),
           "split all digits (0-9) into separate pieces");
+ABSL_FLAG(bool, split_by_interval, false,
+          "split only at whitespace followed by digit or | (intermo interval/barline)");
+ABSL_FLAG(bool, split_by_barline, false,
+          "split only at whitespace followed by | (intermo barline only)");
+ABSL_FLAG(int32_t, phase1_merge_budget, 0,
+          "BPE phase 1: merges constrained to within-whitespace");
+ABSL_FLAG(int32_t, phase2_merge_budget, 0,
+          "BPE phase 2: merges constrained to within-interval");
 ABSL_FLAG(std::string, pretokenization_delimiter,
           kDefaultTrainerSpec.pretokenization_delimiter(),
           "specifies the delimiter of pre-tokenization");
@@ -235,6 +243,10 @@ int main(int argc, char *argv[]) {
   SetTrainerSpecFromFlag(split_by_whitespace);
   SetTrainerSpecFromFlag(split_by_number);
   SetTrainerSpecFromFlag(split_digits);
+  SetTrainerSpecFromFlag(split_by_interval);
+  SetTrainerSpecFromFlag(split_by_barline);
+  SetTrainerSpecFromFlag(phase1_merge_budget);
+  SetTrainerSpecFromFlag(phase2_merge_budget);
   SetTrainerSpecFromFlag(pretokenization_delimiter);
   SetTrainerSpecFromFlag(byte_fallback);
   SetTrainerSpecFromFlag(treat_whitespace_as_suffix);
