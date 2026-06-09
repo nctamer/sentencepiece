@@ -28,6 +28,7 @@
 #include "normalizer.h"
 #include "pretokenizer_for_training.h"
 #include "sentencepiece_trainer.h"
+#include "third_party/absl/container/flat_hash_set.h"
 #include "third_party/absl/container/flat_hash_map.h"
 #include "third_party/absl/strings/numbers.h"
 #include "third_party/absl/strings/str_replace.h"
@@ -417,12 +418,17 @@ TrainerModel::SentencePieces Trainer::RunMStep(
 
   float sum = 0.0;
   for (size_t i = 0; i < expected.size(); ++i) {
-    const float freq = expected[i];
+    float freq = expected[i];
 
     // Filter infrequent sentencepieces here.
     constexpr float kExpectedFrequencyThreshold = 0.5;
     if (freq < kExpectedFrequencyThreshold) {
-      continue;
+      if (!protected_pieces_.empty() &&
+          protected_pieces_.count(sentencepieces[i].first)) {
+        freq = kExpectedFrequencyThreshold;
+      } else {
+        continue;
+      }
     }
 
     new_sentencepieces.emplace_back(sentencepieces[i].first, freq);
@@ -455,6 +461,12 @@ TrainerModel::SentencePieces Trainer::PruneSentencePieces(
   // To do so, we take the second best segmentation of sentencepiece[i].
   // alternatives[i] stores the sequence of second best sentencepieces.
   for (size_t i = 0; i < sentencepieces.size(); ++i) {
+    // Protected pieces are always kept.
+    if (!protected_pieces_.empty() &&
+        protected_pieces_.count(sentencepieces[i].first)) {
+      always_keep[i] = true;
+      continue;
+    }
     const auto &w = sentencepieces[i];
     lattice.SetSentence(w.first);
     model.PopulateNodes(&lattice);
@@ -573,6 +585,16 @@ TrainerModel::SentencePieces Trainer::FinalizeSentencePieces(
   absl::flat_hash_map<std::string, float> sp(sentencepieces.begin(),
                                              sentencepieces.end());
 
+  // Protected pieces must be included in the final sentencepieces.
+  if (!protected_pieces_.empty()) {
+    for (const auto &w : sentencepieces) {
+      if (protected_pieces_.count(w.first)) {
+        final_sentencepieces[w.first] = port::ContainsKey(sp, w.first)
+            ? sp[w.first] : model.min_score();
+      }
+    }
+  }
+
   // required_chars_ must be included in the final sentencepieces.
   float min_score_penalty = 0.0;
   constexpr float kMinScorePenaltyDelta = 0.0001;
@@ -618,8 +640,44 @@ util::Status Trainer::Train() {
   RETURN_IF_ERROR(LoadSentences());
   RET_CHECK(!required_chars_.empty());
 
+  // Load protected pieces if specified.
+  protected_pieces_.clear();
+  if (!trainer_spec_.protected_pieces_file().empty()) {
+    auto input = filesystem::NewReadableFile(
+        trainer_spec_.protected_pieces_file());
+    RET_CHECK(input->status().ok())
+        << "Cannot open protected_pieces_file: "
+        << trainer_spec_.protected_pieces_file();
+    std::string line;
+    while (input->ReadLine(&line)) {
+      if (!line.empty()) {
+        protected_pieces_.insert(line);
+      }
+    }
+    LOG(INFO) << "Loaded " << protected_pieces_.size() << " protected pieces";
+  }
+
   auto seed_sentencepieces = MakeSeedSentencePieces();
   RET_CHECK(!seed_sentencepieces.empty());
+
+  // Inject protected pieces into seed if not already present.
+  if (!protected_pieces_.empty()) {
+    absl::flat_hash_set<std::string> seed_set;
+    for (const auto &sp : seed_sentencepieces) {
+      seed_set.insert(sp.first);
+    }
+    int injected = 0;
+    for (const auto &p : protected_pieces_) {
+      if (!seed_set.count(p)) {
+        seed_sentencepieces.emplace_back(p, 0.0);
+        injected++;
+      }
+    }
+    if (injected > 0) {
+      LOG(INFO) << "Injected " << injected
+                << " protected pieces into seed set";
+    }
+  }
 
   RETURN_IF_ERROR(model.SetSentencePieces(std::move(seed_sentencepieces)));
 

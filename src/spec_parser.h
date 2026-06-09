@@ -149,6 +149,7 @@ inline std::string PrintProto(const TrainerSpec &message,
   PRINT_PARAM(split_by_barline);
   PRINT_PARAM(phase1_merge_budget);
   PRINT_PARAM(phase2_merge_budget);
+  PRINT_PARAM(protected_pieces_file);
   PRINT_PARAM(pretokenization_delimiter);
   PRINT_PARAM(treat_whitespace_as_suffix);
   PRINT_PARAM(allow_whitespace_only_pieces);
@@ -233,6 +234,7 @@ util::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_BOOL(split_by_barline);
   PARSE_INT32(phase1_merge_budget);
   PARSE_INT32(phase2_merge_budget);
+  PARSE_STRING(protected_pieces_file);
   PARSE_STRING(pretokenization_delimiter);
   PARSE_BOOL(treat_whitespace_as_suffix);
   PARSE_BOOL(allow_whitespace_only_pieces);

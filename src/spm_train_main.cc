@@ -88,6 +88,8 @@ ABSL_FLAG(int32_t, phase1_merge_budget, 0,
           "BPE phase 1: merges constrained to within-whitespace");
 ABSL_FLAG(int32_t, phase2_merge_budget, 0,
           "BPE phase 2: merges constrained to within-interval");
+ABSL_FLAG(std::string, protected_pieces_file, "",
+          "unigram: pieces to protect from pruning (one per line)");
 ABSL_FLAG(std::string, pretokenization_delimiter,
           kDefaultTrainerSpec.pretokenization_delimiter(),
           "specifies the delimiter of pre-tokenization");
@@ -247,6 +249,7 @@ int main(int argc, char *argv[]) {
   SetTrainerSpecFromFlag(split_by_barline);
   SetTrainerSpecFromFlag(phase1_merge_budget);
   SetTrainerSpecFromFlag(phase2_merge_budget);
+  SetTrainerSpecFromFlag(protected_pieces_file);
   SetTrainerSpecFromFlag(pretokenization_delimiter);
   SetTrainerSpecFromFlag(byte_fallback);
   SetTrainerSpecFromFlag(treat_whitespace_as_suffix);

@@ -200,6 +200,133 @@ TEST(UnigramTrainerTest, EndToEndTest) {
 #endif
 }
 
+TEST(UnigramTrainerTest, ProtectedPiecesTest) {
+  // Train with protected sub-event pieces. Verify they survive despite being
+  // rare, and are used for encoding rare events.
+  const std::string input_file =
+      util::JoinPath(::testing::TempDir(), "intermo_unigram_input");
+  const std::string protected_file =
+      util::JoinPath(::testing::TempDir(), "protected_pieces");
+  const std::string model_prefix =
+      util::JoinPath(::testing::TempDir(), "unigram_protected");
+  {
+    auto output = filesystem::NewWritableFile(input_file);
+    // Common events (high frequency)
+    for (int i = 0; i < 200; ++i) {
+      output->WriteLine("PR: C5 1/4 PL: A-3 C4 F4 1/8 PR: c5 D-5 1/4 PL: G3 B3 D4");
+    }
+    for (int i = 0; i < 200; ++i) {
+      output->WriteLine("PR: E4 1/8 PL: B-2 D3 F3 1/16 PR: g4 a4 1/4 PL: C3 E3");
+    }
+    // Rare events with double-flats (low frequency)
+    for (int i = 0; i < 10; ++i) {
+      output->WriteLine("PR: A--0 1/4 PL: B--1 1/8 PR: C##5");
+    }
+  }
+
+  // Protected sub-event pieces that should survive despite low frequency
+  {
+    auto output = filesystem::NewWritableFile(protected_file);
+    output->WriteLine(WS "A-");
+    output->WriteLine("-0");
+    output->WriteLine(WS "B-");
+    output->WriteLine("-1");
+    output->WriteLine("##");
+  }
+
+  ASSERT_TRUE(
+      SentencePieceTrainer::Train(
+          absl::StrCat("--model_prefix=", model_prefix,
+                       " --input=", input_file,
+                       " --vocab_size=50"
+                       " --model_type=unigram"
+                       " --split_by_whitespace=true"
+                       " --split_by_unicode_script=false"
+                       " --split_by_number=false"
+                       " --character_coverage=1.0"
+                       " --max_sentence_length=500000"
+                       " --protected_pieces_file=", protected_file))
+          .ok());
+
+  SentencePieceProcessor sp;
+  ASSERT_TRUE(sp.Load(model_prefix + ".model").ok());
+
+  // All protected pieces must exist in the final model
+  std::vector<std::string> protected_pieces = {WS "A-", "-0", WS "B-", "-1", "##"};
+  for (const auto &piece : protected_pieces) {
+    EXPECT_NE(sp.PieceToId(piece), sp.unk_id())
+        << "Protected piece " << piece << " not found in model";
+  }
+
+  // Encoding rare event should use the protected sub-event pieces
+  std::vector<std::string> tokens;
+  ASSERT_TRUE(sp.Encode("PR: A--0", &tokens).ok());
+  // Should NOT be all single characters — protected pieces should be used
+  EXPECT_LT(tokens.size(), 8u)
+      << "A--0 should use sub-event pieces, not character fallback";
+}
+
+TEST(UnigramTrainerTest, ProtectedPiecesZeroFreqTest) {
+  // Test that protected pieces survive even when they have zero Viterbi
+  // frequency under the new boundary regime. This reproduces the bug where
+  // PruneSentencePieces drops always_keep pieces when freq==0.
+  const std::string input_file =
+      util::JoinPath(::testing::TempDir(), "zero_freq_input");
+  const std::string protected_file =
+      util::JoinPath(::testing::TempDir(), "zero_freq_protected");
+  const std::string model_prefix =
+      util::JoinPath(::testing::TempDir(), "zero_freq_model");
+  {
+    auto output = filesystem::NewWritableFile(input_file);
+    // Corpus has NO occurrences of "XY" or "ZW" as substrings.
+    // The protected pieces will have zero frequency in Viterbi paths.
+    for (int i = 0; i < 500; ++i) {
+      output->WriteLine("PR: C5 1/4 PL: A-3 C4 F4 1/8 PR: c5 D-5");
+    }
+  }
+
+  // Protect pieces that exist as substrings but are never optimal
+  // in Viterbi paths (longer alternatives always win).
+  // "P1" can appear in "PL:" context but unigram prefers "PL:" as one piece.
+  // "-3C" spans two events; with split_by_whitespace it can't be used.
+  {
+    auto output = filesystem::NewWritableFile(protected_file);
+    output->WriteLine("-3");   // rare sub-event piece (A-3 → A + -3 vs A-3)
+    output->WriteLine("4F");   // never useful: crosses character boundary oddly
+    output->WriteLine(WS "PR:");  // this one IS commonly used
+  }
+
+  ASSERT_TRUE(
+      SentencePieceTrainer::Train(
+          absl::StrCat("--model_prefix=", model_prefix,
+                       " --input=", input_file,
+                       " --vocab_size=25"
+                       " --model_type=unigram"
+                       " --split_by_whitespace=true"
+                       " --split_by_unicode_script=false"
+                       " --split_by_number=false"
+                       " --character_coverage=1.0"
+                       " --max_sentence_length=500000"
+                       " --protected_pieces_file=", protected_file))
+          .ok());
+
+  SentencePieceProcessor sp;
+  ASSERT_TRUE(sp.Load(model_prefix + ".model").ok());
+
+  // ▁PR: should survive (high frequency + protected)
+  EXPECT_NE(sp.PieceToId(WS "PR:"), sp.unk_id())
+      << "Protected piece " WS "PR: not found";
+
+  // -3 is a valid substring (in "A-3") but may not be optimal in Viterbi
+  // (unigram prefers "▁A-3" as one piece). Protection must keep it anyway.
+  EXPECT_NE(sp.PieceToId("-3"), sp.unk_id())
+      << "Protected piece -3 (low freq) dropped - protection bug";
+
+  // 4F spans "C4 F4" boundary chars — exists as substring but never in Viterbi
+  EXPECT_NE(sp.PieceToId("4F"), sp.unk_id())
+      << "Protected piece 4F (zero freq) dropped - protection bug";
+}
+
 }  // namespace
 }  // namespace unigram
 }  // namespace sentencepiece

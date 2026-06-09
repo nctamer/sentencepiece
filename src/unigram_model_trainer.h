@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "sentencepiece_model.pb.h"
+#include "third_party/absl/container/flat_hash_set.h"
 #include "third_party/absl/strings/string_view.h"
 #include "trainer_interface.h"
 #include "unigram_model.h"
@@ -104,6 +105,9 @@ class Trainer : public TrainerInterface {
   // and control/user defined symbols.
   TrainerModel::SentencePieces FinalizeSentencePieces(
       const TrainerModel &model) const;
+
+  // Pieces protected from pruning (loaded from protected_pieces_file).
+  absl::flat_hash_set<std::string> protected_pieces_;
 
   // When the size of SentencePieces becomes less than desired_vocab_size_,
   // break the main training loop. desired_vocab_size_ = 1.1 * vocab_size_
