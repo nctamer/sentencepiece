@@ -245,11 +245,17 @@ int main(int argc, char *argv[]) {
   SetTrainerSpecFromFlag(split_by_whitespace);
   SetTrainerSpecFromFlag(split_by_number);
   SetTrainerSpecFromFlag(split_digits);
-  SetTrainerSpecFromFlag(split_by_interval);
-  SetTrainerSpecFromFlag(split_by_barline);
-  SetTrainerSpecFromFlag(phase1_merge_budget);
-  SetTrainerSpecFromFlag(phase2_merge_budget);
-  SetTrainerSpecFromFlag(protected_pieces_file);
+  // intermo extensions (use SetExtension, not set_X)
+  trainer_spec.SetExtension(::sentencepiece::split_by_interval,
+                            absl::GetFlag(FLAGS_split_by_interval));
+  trainer_spec.SetExtension(::sentencepiece::split_by_barline,
+                            absl::GetFlag(FLAGS_split_by_barline));
+  trainer_spec.SetExtension(::sentencepiece::phase1_merge_budget,
+                            absl::GetFlag(FLAGS_phase1_merge_budget));
+  trainer_spec.SetExtension(::sentencepiece::phase2_merge_budget,
+                            absl::GetFlag(FLAGS_phase2_merge_budget));
+  trainer_spec.SetExtension(::sentencepiece::protected_pieces_file,
+                            absl::GetFlag(FLAGS_protected_pieces_file));
   SetTrainerSpecFromFlag(pretokenization_delimiter);
   SetTrainerSpecFromFlag(byte_fallback);
   SetTrainerSpecFromFlag(treat_whitespace_as_suffix);

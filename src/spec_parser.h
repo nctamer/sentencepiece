@@ -145,11 +145,11 @@ inline std::string PrintProto(const TrainerSpec &message,
   PRINT_PARAM(split_by_number);
   PRINT_PARAM(split_by_whitespace);
   PRINT_PARAM(split_digits);
-  PRINT_PARAM(split_by_interval);
-  PRINT_PARAM(split_by_barline);
-  PRINT_PARAM(phase1_merge_budget);
-  PRINT_PARAM(phase2_merge_budget);
-  PRINT_PARAM(protected_pieces_file);
+  os << "  split_by_interval: " << message.GetExtension(split_by_interval) << "\n";
+  os << "  split_by_barline: " << message.GetExtension(split_by_barline) << "\n";
+  os << "  phase1_merge_budget: " << message.GetExtension(phase1_merge_budget) << "\n";
+  os << "  phase2_merge_budget: " << message.GetExtension(phase2_merge_budget) << "\n";
+  os << "  protected_pieces_file: " << message.GetExtension(protected_pieces_file) << "\n";
   PRINT_PARAM(pretokenization_delimiter);
   PRINT_PARAM(treat_whitespace_as_suffix);
   PRINT_PARAM(allow_whitespace_only_pieces);
@@ -230,11 +230,34 @@ util::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_BOOL(split_by_number);
   PARSE_BOOL(split_by_whitespace);
   PARSE_BOOL(split_digits);
-  PARSE_BOOL(split_by_interval);
-  PARSE_BOOL(split_by_barline);
-  PARSE_INT32(phase1_merge_budget);
-  PARSE_INT32(phase2_merge_budget);
-  PARSE_STRING(protected_pieces_file);
+  if (name == "split_by_interval") {
+    bool v; if (!absl::SimpleAtob(value.empty() ? "true" : value, &v))
+      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC)
+             << "cannot parse \"" << value << "\" as bool.";
+    message->SetExtension(split_by_interval, v); return util::OkStatus();
+  }
+  if (name == "split_by_barline") {
+    bool v; if (!absl::SimpleAtob(value.empty() ? "true" : value, &v))
+      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC)
+             << "cannot parse \"" << value << "\" as bool.";
+    message->SetExtension(split_by_barline, v); return util::OkStatus();
+  }
+  if (name == "phase1_merge_budget") {
+    int32_t v; if (!absl::SimpleAtoi(value, &v))
+      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC)
+             << "cannot parse \"" << value << "\" as int.";
+    message->SetExtension(phase1_merge_budget, v); return util::OkStatus();
+  }
+  if (name == "phase2_merge_budget") {
+    int32_t v; if (!absl::SimpleAtoi(value, &v))
+      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC)
+             << "cannot parse \"" << value << "\" as int.";
+    message->SetExtension(phase2_merge_budget, v); return util::OkStatus();
+  }
+  if (name == "protected_pieces_file") {
+    message->SetExtension(protected_pieces_file, std::string(value));
+    return util::OkStatus();
+  }
   PARSE_STRING(pretokenization_delimiter);
   PARSE_BOOL(treat_whitespace_as_suffix);
   PARSE_BOOL(allow_whitespace_only_pieces);

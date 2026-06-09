@@ -306,12 +306,12 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
     auto split_into_pieces =
         [&](absl::string_view w) -> std::vector<absl::string_view> {
       if (trainer_spec_.split_by_whitespace() ||
-          trainer_spec_.split_by_interval() ||
-          trainer_spec_.split_by_barline()) {
+          trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
+          trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
         return SplitIntoWords(w, trainer_spec_.treat_whitespace_as_suffix(),
                               trainer_spec_.allow_whitespace_only_pieces(),
-                              trainer_spec_.split_by_interval(),
-                              trainer_spec_.split_by_barline());
+                              trainer_spec_.GetExtension(::sentencepiece::split_by_interval),
+                              trainer_spec_.GetExtension(::sentencepiece::split_by_barline));
       }
       return {w};
     };
@@ -652,12 +652,12 @@ util::Status Trainer::Train() {
 
   // Load protected pieces if specified.
   protected_pieces_.clear();
-  if (!trainer_spec_.protected_pieces_file().empty()) {
+  if (!trainer_spec_.GetExtension(::sentencepiece::protected_pieces_file).empty()) {
     auto input = filesystem::NewReadableFile(
-        trainer_spec_.protected_pieces_file());
+        trainer_spec_.GetExtension(::sentencepiece::protected_pieces_file));
     RET_CHECK(input->status().ok())
         << "Cannot open protected_pieces_file: "
-        << trainer_spec_.protected_pieces_file();
+        << trainer_spec_.GetExtension(::sentencepiece::protected_pieces_file);
     std::string line;
     while (input->ReadLine(&line)) {
       if (!line.empty()) {
@@ -692,8 +692,8 @@ util::Status Trainer::Train() {
   RETURN_IF_ERROR(model.SetSentencePieces(std::move(seed_sentencepieces)));
 
   if (trainer_spec_.split_by_whitespace() ||
-      trainer_spec_.split_by_interval() ||
-      trainer_spec_.split_by_barline()) {
+      trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
+      trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
     SplitSentencesByWhitespace();
   }
 

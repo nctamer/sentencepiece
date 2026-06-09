@@ -156,13 +156,13 @@ TEST(BPETrainerTest, ProgressiveConstraintTest) {
   trainer_spec.set_vocab_size(80);
   trainer_spec.set_model_prefix(model_prefix);
   trainer_spec.set_split_by_whitespace(false);
-  trainer_spec.set_split_by_barline(true);
+  trainer_spec.SetExtension(::sentencepiece::split_by_barline, true);
   trainer_spec.set_split_by_unicode_script(false);
   trainer_spec.set_split_by_number(false);
   trainer_spec.set_character_coverage(1.0);
   trainer_spec.set_max_sentence_length(500000);
-  trainer_spec.set_phase1_merge_budget(10);
-  trainer_spec.set_phase2_merge_budget(10);
+  trainer_spec.SetExtension(::sentencepiece::phase1_merge_budget, 10);
+  trainer_spec.SetExtension(::sentencepiece::phase2_merge_budget, 10);
 
   NormalizerSpec normalizer_spec;
   normalizer_spec.set_name("identity");

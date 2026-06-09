@@ -20,7 +20,7 @@ option optimize_for = LITE_RUNTIME;
 package sentencepiece;
 
 // TrainerSpec encodes a various parameters for SentencePiece training.
-// Next id: 60
+// Next id: 55
 message TrainerSpec {
   ///////////////////////////////////////////////////////////////////
   // General parameters
@@ -236,32 +236,37 @@ message TrainerSpec {
   // seed sentencepiece <tab> frequency per line.
   optional string seed_sentencepieces_file = 54 [default = ""];
 
+  // Customized extensions: the range of field numbers
+  // are open to third-party extensions.
+  extensions 200 to max;
+}
+
+// intermo extensions for TrainerSpec.
+// Uses the extension range (200+) to avoid conflicts with upstream Google changes.
+extend TrainerSpec {
   // Split only at whitespace followed by digit (0-9) or pipe (|).
   // For intermo music notation: interval/barline boundaries.
   // When true, split_by_whitespace must be false.
-  optional bool split_by_interval = 55 [default = false];
+  optional bool split_by_interval = 200 [default = false];
 
   // Split only at whitespace followed by pipe (|).
   // For intermo music notation: barline boundaries only.
   // When true, split_by_whitespace must be false.
-  optional bool split_by_barline = 56 [default = false];
+  optional bool split_by_barline = 201 [default = false];
 
   // Progressive BPE phase budgets (three-stage BPE).
   // phase1_merge_budget: merges that must respect whitespace boundary.
   // phase2_merge_budget: merges that must respect interval boundary.
   // Remaining merges respect barline boundary only.
   // Requires model_type=BPE and split_by_barline=true.
-  optional int32 phase1_merge_budget = 57 [default = 0];
-  optional int32 phase2_merge_budget = 58 [default = 0];
+  optional int32 phase1_merge_budget = 202 [default = 0];
+  optional int32 phase2_merge_budget = 203 [default = 0];
 
-  // Path to file of pieces to protect from pruning (unigram curriculum).
+  // Path to file of pieces to protect from pruning.
   // One piece per line. These pieces are guaranteed to survive EM pruning
   // and appear in the final model. Their probabilities are freely estimated.
-  optional string protected_pieces_file = 59 [default = ""];
-
-  // Customized extensions: the range of field numbers
-  // are open to third-party extensions.
-  extensions 200 to max;
+  // Works for both BPE and unigram model types.
+  optional string protected_pieces_file = 204 [default = ""];
 }
 
 // NormalizerSpec encodes a various parameters for string normalizaiton

@@ -253,11 +253,11 @@ bool TrainerInterface::IsValidSentencePiece(
     if (c == kWSChar) {
       // Interval/barline mode: reject pieces with internal boundary-crossing
       // whitespace (whitespace followed by digit/| at internal position).
-      if (trainer_spec_.split_by_interval() ||
-          trainer_spec_.split_by_barline()) {
+      if (trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
+          trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
         if (pos > 0 && pos + 1 < sentencepiece.size()) {
           const char32 next_c = sentencepiece[pos + 1];
-          if (trainer_spec_.split_by_barline()) {
+          if (trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
             if (next_c == '|') return false;
           } else {
             if ((next_c >= '0' && next_c <= '9') || next_c == '|')
@@ -609,8 +609,8 @@ void TrainerInterface::SplitSentencesByWhitespace() {
     for (const auto &w :
          SplitIntoWords(s.first, trainer_spec_.treat_whitespace_as_suffix(),
                         trainer_spec_.allow_whitespace_only_pieces(),
-                        trainer_spec_.split_by_interval(),
-                        trainer_spec_.split_by_barline())) {
+                        trainer_spec_.GetExtension(::sentencepiece::split_by_interval),
+                        trainer_spec_.GetExtension(::sentencepiece::split_by_barline))) {
       tokens[w] += s.second;
     }
   }

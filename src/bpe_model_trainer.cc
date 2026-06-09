@@ -233,8 +233,8 @@ util::Status Trainer::Train() {
   RETURN_IF_ERROR(LoadSentences());
 
   if (trainer_spec_.split_by_whitespace() ||
-      trainer_spec_.split_by_interval() ||
-      trainer_spec_.split_by_barline()) {
+      trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
+      trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
     SplitSentencesByWhitespace();
   }
 
@@ -283,8 +283,8 @@ util::Status Trainer::Train() {
   // Progressive constraint: symbols deferred in current phase.
   absl::flat_hash_set<uint64_t> phase_deferred;
   int current_phase = 0;
-  const int phase1 = trainer_spec_.phase1_merge_budget();
-  const int phase2 = trainer_spec_.phase2_merge_budget();
+  const int phase1 = trainer_spec_.GetExtension(::sentencepiece::phase1_merge_budget);
+  const int phase2 = trainer_spec_.GetExtension(::sentencepiece::phase2_merge_budget);
   const bool use_phases = (phase1 > 0 || phase2 > 0);
 
   auto crosses_phase_boundary = [&](const Symbol* sym, int phase) -> bool {
@@ -402,8 +402,8 @@ util::Status Trainer::TrainFast() {
   RETURN_IF_ERROR(LoadSentences());
 
   if (trainer_spec_.split_by_whitespace() ||
-      trainer_spec_.split_by_interval() ||
-      trainer_spec_.split_by_barline()) {
+      trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
+      trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
     SplitSentencesByWhitespace();
   }
 
