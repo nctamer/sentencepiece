@@ -275,10 +275,39 @@ util::Status Trainer::Train() {
       trainer_spec_.vocab_size() - meta_pieces_.size() - required_chars_.size();
   RET_CHECK_GE(vocab_size, 0);
 
+  // Load protected pieces if specified. These are pre-loaded into final_pieces_
+  // before the merge loop. BPE learns new merges alongside them.
+  // Skip pieces that are single characters (they'll be in required_chars_).
+  const std::string &protected_file =
+      trainer_spec_.GetExtension(::sentencepiece::protected_pieces_file);
+  if (!protected_file.empty()) {
+    absl::flat_hash_set<std::string> required_strs;
+    for (const auto &w : required_chars_) {
+      required_strs.insert(string_util::UnicodeCharToUTF8(w.first));
+    }
+    auto input = filesystem::NewReadableFile(protected_file);
+    RET_CHECK(input->status().ok())
+        << "Cannot open protected_pieces_file: " << protected_file;
+    std::string line;
+    while (input->ReadLine(&line)) {
+      if (!line.empty() && !required_strs.count(line)) {
+        final_pieces_.emplace_back(line,
+                                   -static_cast<float>(final_pieces_.size()));
+      }
+    }
+    LOG(INFO) << "Loaded " << final_pieces_.size()
+              << " protected pieces for BPE";
+  }
+
   // We may see duplicated pieces that are extracted with different path.
   // In real segmentation phase, we can consider them as one symbol.
   // e.g., "aaa" => "aa" + "a" or "a" + "aa".
   absl::flat_hash_set<std::string> dup;
+
+  // Pre-populate dup with protected pieces so BPE doesn't re-add them.
+  for (const auto &p : final_pieces_) {
+    dup.insert(p.first);
+  }
 
   // Progressive constraint: symbols deferred in current phase.
   absl::flat_hash_set<uint64_t> phase_deferred;
@@ -304,7 +333,7 @@ util::Status Trainer::Train() {
   };
 
   // Main loop.
-  RET_CHECK(final_pieces_.empty());
+  // Note: final_pieces_ may already contain protected pieces.
   while (final_pieces_.size() < static_cast<size_t>(vocab_size)) {
     // Check for phase transition (forward only).
     if (use_phases) {
