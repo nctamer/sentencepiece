@@ -13,15 +13,15 @@
     }
     ReleaseResultObject(resultobj);
   }
-  catch (const sentencepiece::util::Status &status) {
+  catch (const absl::Status &status) {
     SWIG_exception(ToSwigError(status.code()), status.ToString().c_str());
   }
 }
 
 %apply unsigned int { uint32_t }
 
-%ignore sentencepiece::util::Status;
-%ignore sentencepiece::util::StatusCode;
+%ignore absl::Status;
+%ignore absl::StatusCode;
 %ignore absl::string_view;
 %ignore std::string_view;
 %ignore sentencepiece::SentencePieceText;
@@ -107,7 +107,7 @@
 %ignore sentencepiece::io::SaveModelProto;
 
 %extend sentencepiece::SentencePieceProcessor {
-  sentencepiece::util::Status LoadFromFile(absl::string_view arg) {
+  absl::Status LoadFromFile(absl::string_view arg) {
     return $self->Load(arg);
   }
 
@@ -478,9 +478,9 @@
   }
 
   // override normalizer_spec
-  sentencepiece::util::Status _OverrideNormalizerSpec(
+  absl::Status _OverrideNormalizerSpec(
       const std::unordered_map<std::string, std::string> &args) {
-    sentencepiece::util::Status status;
+    absl::Status status;
     for (const auto &[key, value] : args) {
       status = sentencepiece::SentencePieceTrainer::SetProtoField(
           key, value,
@@ -1209,7 +1209,7 @@
 }
 
 %extend sentencepiece::SentencePieceNormalizer {
-  sentencepiece::util::Status LoadFromFile(absl::string_view arg) {
+  absl::Status LoadFromFile(absl::string_view arg) {
     return $self->Load(arg);
   }
 
@@ -1510,7 +1510,7 @@
   $result = MakePyOutputString(*$1, input_type);
 }
 
-%typemap(out) sentencepiece::util::Status {
+%typemap(out) absl::Status {
   if (!$1.ok()) {
     SWIG_exception(ToSwigError($1.code()), $1.ToString().c_str());
   }

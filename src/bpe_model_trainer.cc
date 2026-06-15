@@ -23,8 +23,10 @@
 #include "third_party/absl/container/flat_hash_set.h"
 #include "third_party/absl/flags/flag.h"
 #include "third_party/absl/hash/hash.h"
+#include "third_party/absl/status/status.h"
 #include "third_party/absl/strings/str_join.h"
 #include "third_party/absl/strings/str_replace.h"
+#include "third_party/absl/strings/string_view.h"
 #include "util.h"
 
 #ifdef SPM_NLCODEC_BPE
@@ -90,10 +92,10 @@ Trainer::Symbol* Trainer::GetPairSymbol(const Symbol* left,
 }
 
 void Trainer::ComputeFreq(Symbol* symbol) const {
-  if (symbol->freq > 0) {  // if freq == 0, re-computation is required.
+  if (!symbol->needs_recomputation) {
     return;
   }
-  CHECK_EQ(0, symbol->freq);
+  symbol->freq = 0;
   for (auto it = symbol->positions.begin(); it != symbol->positions.end();) {
     const Position pos = DecodePos(*it);
     // symbols_[sid][left] and symbols_[sid]right] must store
@@ -106,6 +108,7 @@ void Trainer::ComputeFreq(Symbol* symbol) const {
       ++it;
     }
   }
+  symbol->needs_recomputation = false;
 }
 
 int Trainer::GetNextIndex(int sid, int index) const {
@@ -128,8 +131,11 @@ void Trainer::AddNewPair(int sid, int left, int right) {
   if (left == -1 || right == -1) return;
   auto* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
   if (symbol != nullptr) {
-    active_symbols_.insert(symbol);
     symbol->positions.insert(EncodePos(sid, left, right));
+    if (!symbol->pending) {
+      symbol->pending = true;
+      pending_queue_.push_back(symbol);
+    }
   }
 }
 
@@ -137,11 +143,11 @@ void Trainer::ResetFreq(int sid, int left, int right, const Symbol* best) {
   if (left == -1 || right == -1) return;
   auto* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
   if (symbol != nullptr && symbol != best) {
-    symbol->freq = 0;
+    symbol->needs_recomputation = true;
   }
 }
 
-util::Status Trainer::AcceptSymbol(Symbol* symbol) {
+absl::Status Trainer::AcceptSymbol(Symbol* symbol) {
   // Add new bigrams which are created after symbol replacement.
   // We do not need to scan all characters, but scan the neighbors in
   // best_symbol.
@@ -175,44 +181,12 @@ util::Status Trainer::AcceptSymbol(Symbol* symbol) {
 
   // Removes best_symbol so it is not selected again.
   symbols_cache_.erase(symbol->fp);
-  active_symbols_.erase(symbol);
+  symbol->active = false;
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
-void Trainer::UpdateActiveSymbols() {
-  std::vector<Symbol*> symbols;
-  for (auto& it : symbols_cache_) {
-    Symbol* symbol = it.second;
-    if (symbol->IsBigram()) {
-      ComputeFreq(symbol);
-      symbols.push_back(symbol);
-    }
-  }
-
-  // At least kMinActiveSymbolsSize symbols must be in |active_symbols_|.
-  constexpr int kMinActiveSymbolsSize = 1000;
-
-  // Keeps top 5% frequent symbols.
-  constexpr float kTopFrequentRatio = 0.05;
-  const int size =
-      std::min<int>(std::max<int>(kMinActiveSymbolsSize,
-                                  symbols_cache_.size() * kTopFrequentRatio),
-                    symbols.size());
-
-  if (size > 0) {
-    std::partial_sort(
-        symbols.begin(), symbols.begin() + size, symbols.end(),
-        [](Symbol* s1, Symbol* s2) { return s1->freq > s2->freq; });
-    LOG(INFO) << "Updating active symbols. max_freq=" << symbols.front()->freq
-              << " min_freq=" << symbols.back()->freq;
-  }
-
-  active_symbols_.clear();
-  active_symbols_.insert(symbols.begin(), symbols.begin() + size);
-}
-
-util::Status Trainer::Train() {
+absl::Status Trainer::Train() {
   RETURN_IF_ERROR(status());
 
 #ifdef SPM_NLCODEC_BPE
@@ -227,7 +201,8 @@ util::Status Trainer::Train() {
   symbols_.clear();
   allocated_.clear();
   symbols_cache_.clear();
-  active_symbols_.clear();
+  pq_ = decltype(pq_)();
+  pending_queue_.clear();
 
   // Load all sentences
   RETURN_IF_ERROR(LoadSentences());
@@ -271,6 +246,13 @@ util::Status Trainer::Train() {
     }
   }
 
+  for (Symbol* symbol : pending_queue_) {
+    symbol->pending = false;
+    ComputeFreq(symbol);
+    pq_.push({symbol->freq, symbol});
+  }
+  pending_queue_.clear();
+
   const int vocab_size =
       trainer_spec_.vocab_size() - meta_pieces_.size() - required_chars_.size();
   RET_CHECK_GE(vocab_size, 0);
@@ -309,8 +291,13 @@ util::Status Trainer::Train() {
     dup.insert(p.first);
   }
 
-  // Progressive constraint: symbols deferred in current phase.
+  // Progressive constraint: symbols deferred in the current phase. Because the
+  // priority queue cannot skip its top without popping, deferred symbols are
+  // popped out of pq_ and parked in deferred_symbols until the phase advances.
+  // phase_deferred tracks their fingerprints to avoid parking the same symbol
+  // twice (it may be re-pushed via pending_queue_ after later merges).
   absl::flat_hash_set<uint64_t> phase_deferred;
+  std::vector<Symbol*> deferred_symbols;
   int current_phase = 0;
   const int phase1 = trainer_spec_.GetExtension(::sentencepiece::phase1_merge_budget);
   const int phase2 = trainer_spec_.GetExtension(::sentencepiece::phase2_merge_budget);
@@ -332,51 +319,81 @@ util::Status Trainer::Train() {
     return false;
   };
 
+  // Advances to a new phase: clears the deferral set and re-pushes every parked
+  // symbol back into the priority queue so it can be selected again.
+  auto advance_phase = [&](int new_phase) {
+    current_phase = new_phase;
+    phase_deferred.clear();
+    for (Symbol* symbol : deferred_symbols) {
+      if (symbol->active) {
+        ComputeFreq(symbol);
+        pq_.push({symbol->freq, symbol});
+      }
+    }
+    deferred_symbols.clear();
+  };
+
   // Main loop.
-  // Note: final_pieces_ may already contain protected pieces.
+  // Note: final_pieces_ may already contain protected pieces, so (unlike
+  // upstream) we do not RET_CHECK(final_pieces_.empty()) here.
   while (final_pieces_.size() < static_cast<size_t>(vocab_size)) {
-    // Check for phase transition (forward only).
+    // Budget-driven phase transition (forward only): once enough pieces have
+    // been learned, relax the constraint to the next phase. advance_phase()
+    // re-pushes any symbols parked by the previous phase.
     if (use_phases) {
       int new_phase = 2;
-      if (static_cast<int>(final_pieces_.size()) < phase1) new_phase = 0;
-      else if (static_cast<int>(final_pieces_.size()) < phase1 + phase2) new_phase = 1;
+      if (static_cast<int>(final_pieces_.size()) < phase1)
+        new_phase = 0;
+      else if (static_cast<int>(final_pieces_.size()) < phase1 + phase2)
+        new_phase = 1;
       if (new_phase > current_phase) {
-        LOG(INFO) << "Phase transition: " << current_phase << " -> "
-                  << new_phase << " at merge " << final_pieces_.size();
-        current_phase = new_phase;
-        phase_deferred.clear();
-        UpdateActiveSymbols();
+        LOG(INFO) << "Phase transition: " << current_phase << " -> " << new_phase
+                  << " at merge " << final_pieces_.size();
+        advance_phase(new_phase);
       }
     }
 
-    constexpr int kUpdateActiveSymbolsInterval = 100;
-    if (final_pieces_.size() % kUpdateActiveSymbolsInterval == 0) {
-      UpdateActiveSymbols();
-    }
-
-    // Scanning active symbols, finds the best_symbol with highest freq.
+    // Selects the highest-frequency active symbol from the priority queue,
+    // deferring any symbol that crosses the current phase boundary.
     Symbol* best_symbol = nullptr;
-    for (auto& it : active_symbols_) {
-      Symbol* symbol = it;
-      if (use_phases && phase_deferred.count(symbol->fp)) continue;
-      ComputeFreq(symbol);
-      if (best_symbol == nullptr ||
-          (symbol->freq > best_symbol->freq ||
-           (symbol->freq == best_symbol->freq &&
-            (symbol->chars.size() < best_symbol->chars.size() ||
-             (symbol->chars.size() == best_symbol->chars.size() &&
-              symbol->ToString() < best_symbol->ToString()))))) {
-        best_symbol = symbol;
+    while (!pq_.empty()) {
+      QueueEntry entry = pq_.top();
+      Symbol* symbol = entry.symbol;
+      if (!symbol->active) {
+        pq_.pop();
+        continue;
       }
+      if (entry.freq != symbol->freq) {
+        pq_.pop();
+        continue;
+      }
+      if (symbol->needs_recomputation) {
+        pq_.pop();
+        ComputeFreq(symbol);
+        pq_.push({symbol->freq, symbol});
+        continue;
+      }
+      // Progressive constraint: park symbols that cross the current phase
+      // boundary. They are re-pushed when the phase advances.
+      if (use_phases && crosses_phase_boundary(symbol, current_phase)) {
+        pq_.pop();
+        if (phase_deferred.insert(symbol->fp).second) {
+          deferred_symbols.push_back(symbol);
+        }
+        continue;
+      }
+      best_symbol = symbol;
+      pq_.pop();
+      break;
     }
 
     if (best_symbol == nullptr) {
+      // Nothing selectable in the current phase: advance (re-pushing parked
+      // symbols) and retry before giving up.
       if (use_phases && current_phase < 2) {
-        LOG(INFO) << "No valid symbol in phase " << current_phase
-                  << " at merge " << final_pieces_.size() << ", advancing phase";
-        current_phase++;
-        phase_deferred.clear();
-        UpdateActiveSymbols();
+        LOG(INFO) << "No valid symbol in phase " << current_phase << " at merge "
+                  << final_pieces_.size() << ", advancing phase";
+        advance_phase(current_phase + 1);
         continue;
       }
       LOG(WARNING) << "No valid symbol found";
@@ -384,15 +401,9 @@ util::Status Trainer::Train() {
     }
 
     if (!dup.insert(best_symbol->ToString()).second) {
+      // Removes best_symbol so it is not selected again.
       symbols_cache_.erase(best_symbol->fp);
-      active_symbols_.erase(best_symbol);
-      continue;
-    }
-
-    // Progressive constraint: check if merge crosses current phase boundary.
-    if (use_phases && crosses_phase_boundary(best_symbol, current_phase)) {
-      dup.erase(best_symbol->ToString());
-      phase_deferred.insert(best_symbol->fp);
+      best_symbol->active = false;
       continue;
     }
 
@@ -403,12 +414,20 @@ util::Status Trainer::Train() {
     if (final_pieces_.size() % 20 == 0) {
       LOG(INFO) << "Added: freq=" << best_symbol->freq
                 << " size=" << final_pieces_.size()
-                << " all=" << symbols_cache_.size()
-                << " active=" << active_symbols_.size()
+                << " all=" << symbols_cache_.size() << " active=" << pq_.size()
                 << " piece=" << best_symbol->ToString();
     }
 
     RETURN_IF_ERROR(AcceptSymbol(best_symbol));
+
+    for (Symbol* symbol : pending_queue_) {
+      symbol->pending = false;
+      if (symbol->active) {
+        ComputeFreq(symbol);
+        pq_.push({symbol->freq, symbol});
+      }
+    }
+    pending_queue_.clear();
   }  // end of main loop
 
   // Adds required_chars_
@@ -424,7 +443,7 @@ util::Status Trainer::Train() {
 }
 
 #ifdef SPM_NLCODEC_BPE
-util::Status Trainer::TrainFast() {
+absl::Status Trainer::TrainFast() {
   RET_CHECK(normalizer_spec_.escape_whitespaces());
   RET_CHECK_EQ(TrainerSpec::BPE, trainer_spec_.model_type());
 

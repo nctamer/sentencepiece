@@ -31,12 +31,14 @@
 #include "sentencepiece_trainer.h"
 #include "third_party/absl/container/flat_hash_map.h"
 #include "third_party/absl/random/random.h"
+#include "third_party/absl/status/status.h"
+#include "third_party/absl/strings/match.h"
 #include "third_party/absl/strings/numbers.h"
 #include "third_party/absl/strings/str_cat.h"
 #include "third_party/absl/strings/str_format.h"
 #include "third_party/absl/strings/str_join.h"
-#include "third_party/absl/strings/match.h"
 #include "third_party/absl/strings/str_split.h"
+#include "third_party/absl/strings/string_view.h"
 #include "unicode_script.h"
 #include "util.h"
 
@@ -52,7 +54,7 @@ const char32 TrainerInterface::kUPPBoundaryChar = L'\u0009';
 const char TrainerInterface::kUPPBoundaryStr[] = "\t";
 
 namespace {
-util::Status VerifySpec(const TrainerSpec &trainer_spec) {
+absl::Status VerifySpec(const TrainerSpec& trainer_spec) {
   RET_CHECK_GT(trainer_spec.vocab_size(), 0);
 
   if (trainer_spec.model_type() == TrainerSpec::UNIGRAM ||
@@ -93,7 +95,7 @@ util::Status VerifySpec(const TrainerSpec &trainer_spec) {
         << "PretokenizerForTraining is only supported in UNIGRAM or BPE mode.";
   }
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 bool is_unicode_decimal_number(char32 c) {
@@ -106,8 +108,8 @@ class SentenceSelector {
 
   static constexpr int64_t kTooBigSentencesSize = 1000000;
 
-  SentenceSelector(TrainerInterface::Sentences *sentences,
-                   const TrainerSpec &spec)
+  SentenceSelector(TrainerInterface::Sentences* sentences,
+                   const TrainerSpec& spec)
       : sentences_(sentences), spec_(&spec) {
     if (spec_->input_sentence_size() > 0) {
       if (spec_->shuffle_input_sentence()) {
@@ -134,7 +136,7 @@ class SentenceSelector {
     }
   }
 
-  bool Add(const std::pair<std::string, int64_t> &sentence) {
+  bool Add(const std::pair<std::string, int64_t>& sentence) {
     if (spec_->input_sentence_size() == 0) {
       sentences_->emplace_back(sentence);
     } else {
@@ -158,14 +160,14 @@ class SentenceSelector {
   }
 
  private:
-  TrainerInterface::Sentences *sentences_ = nullptr;
-  const TrainerSpec *spec_ = nullptr;
+  TrainerInterface::Sentences* sentences_ = nullptr;
+  const TrainerSpec* spec_ = nullptr;
   std::unique_ptr<Sampler> sampler_;
 };
 }  // namespace
 
 MultiFileSentenceIterator::MultiFileSentenceIterator(
-    const std::vector<std::string> &files)
+    const std::vector<std::string>& files)
     : files_(files) {
   Next();
 }
@@ -174,7 +176,7 @@ bool MultiFileSentenceIterator::done() const {
   return (!read_done_ && file_index_ == files_.size());
 }
 
-util::Status MultiFileSentenceIterator::status() const {
+absl::Status MultiFileSentenceIterator::status() const {
   RET_CHECK(fp_);
   return fp_->status();
 }
@@ -183,10 +185,10 @@ void MultiFileSentenceIterator::Next() {
   TryRead();
 
   if (!read_done_ && file_index_ < files_.size()) {
-    const auto &filename = files_[file_index_++];
+    const auto& filename = files_[file_index_++];
     fp_ = filesystem::NewReadableFile(filename);
     LOG(INFO) << "Loading corpus: " << filename;
-    if (fp_->status() != util::OkStatus()) {
+    if (fp_->status() != absl::OkStatus()) {
       file_index_ = files_.size();
       read_done_ = false;
       return;
@@ -200,9 +202,9 @@ void MultiFileSentenceIterator::TryRead() {
   read_done_ = fp_ && fp_->ReadLine(&value_);
 }
 
-TrainerInterface::TrainerInterface(const TrainerSpec &trainer_spec,
-                                   const NormalizerSpec &normalizer_spec,
-                                   const NormalizerSpec &denormalizer_spec)
+TrainerInterface::TrainerInterface(const TrainerSpec& trainer_spec,
+                                   const NormalizerSpec& normalizer_spec,
+                                   const NormalizerSpec& denormalizer_spec)
     : trainer_spec_(trainer_spec),
       normalizer_spec_(normalizer_spec),
       denormalizer_spec_(denormalizer_spec) {
@@ -213,7 +215,7 @@ TrainerInterface::TrainerInterface(const TrainerSpec &trainer_spec,
 TrainerInterface::~TrainerInterface() {}
 
 bool TrainerInterface::IsValidSentencePiece(
-    const string_util::UnicodeText &sentencepiece) const {
+    const string_util::UnicodeText& sentencepiece) const {
   // Returns false if the length of piece is invalid.
   if (sentencepiece.empty() ||
       sentencepiece.size() >
@@ -315,8 +317,8 @@ bool TrainerInterface::IsValidSentencePiece(
 }
 
 template <typename T>
-void AddDPNoise(const TrainerSpec &trainer_spec, absl::BitGen *generator,
-                T *to_update) {
+void AddDPNoise(const TrainerSpec& trainer_spec, absl::BitGen* generator,
+                T* to_update) {
   if (trainer_spec.differential_privacy_noise_level() > 0) {
     std::normal_distribution<float> dist(
         0.0f, trainer_spec.differential_privacy_noise_level());
@@ -330,7 +332,7 @@ void AddDPNoise(const TrainerSpec &trainer_spec, absl::BitGen *generator,
   }
 }
 
-util::Status TrainerInterface::LoadSentences() {
+absl::Status TrainerInterface::LoadSentences() {
   RETURN_IF_ERROR(status());
   RET_CHECK(sentences_.empty());
   RET_CHECK(required_chars_.empty());
@@ -430,7 +432,7 @@ END:
   {
     const normalizer::Normalizer normalizer(normalizer_spec_, trainer_spec_);
     std::set<absl::string_view> meta_pieces_set;
-    for (const auto &it : meta_pieces_) {
+    for (const auto& it : meta_pieces_) {
       LOG(INFO) << "Adding meta_piece: " << it.second.first;
       meta_pieces_set.insert(it.second.first);
     }
@@ -444,7 +446,7 @@ END:
         pool->Schedule([&, n]() {
           for (size_t i = n; i < sentences_.size();
                i += trainer_spec_.num_threads()) {
-            auto *s = &sentences_[i].first;
+            auto* s = &sentences_[i].first;
             *s = meta_pieces_matcher.GlobalReplace(normalizer.Normalize(*s),
                                                    kUPPBoundaryStr);
           }
@@ -453,7 +455,7 @@ END:
     }
 
     for (size_t i = 0; i < sentences_.size(); ++i) {
-      auto *s = &sentences_[i].first;
+      auto* s = &sentences_[i].first;
       RET_CHECK(s->find(" ") == std::string::npos)
           << "Normalized string must not include spaces";
       if (s->empty()) {
@@ -490,7 +492,7 @@ END:
       for (size_t n = 0; n < num_workers; ++n) {
         pool->Schedule([&, n]() {
           // One per thread generator.
-          auto *generator = random::GetRandomGenerator();
+          auto* generator = random::GetRandomGenerator();
           for (size_t i = n; i < sentences_.size(); i += num_workers) {
             AddDPNoise<int64_t>(trainer_spec_, generator,
                                 &(sentences_[i].second));
@@ -502,7 +504,7 @@ END:
     // Remove zero freq elements.
     const auto before_size = sentences_.size();
     auto it = std::remove_if(sentences_.begin(), sentences_.end(),
-                             [](const Sentence &s) { return s.second <= 0; });
+                             [](const Sentence& s) { return s.second <= 0; });
     const auto new_size = std::distance(sentences_.begin(), it);
     const int num_erased = before_size - new_size;
     sentences_.erase(it, sentences_.end());
@@ -525,7 +527,7 @@ END:
     }
     chars_count[c].first = true;  // is_required_character.
   }
-  for (const auto &w : sentences_) {
+  for (const auto& w : sentences_) {
     for (const char32 c : string_util::UTF8ToUnicodeText(w.first)) {
       if (!string_util::IsValidCodepoint(c)) continue;
       if (c == 0x0000) {
@@ -551,7 +553,7 @@ END:
   // Sorted() sorts the chars_count values in the decsending order of pair<>.
   // I.e. characters are sorted in the order of required characters and then
   // frequent characters.
-  for (const auto &w : Sorted(chars_count)) {
+  for (const auto& w : Sorted(chars_count)) {
     const float coverage = 1.0 * accumulated_chars_count / all_chars_count;
     if (!trainer_spec_.use_all_vocab() &&
         coverage >= trainer_spec_.character_coverage()) {
@@ -573,7 +575,7 @@ END:
 
   // Replaces rare characters (characters not included in required_chars_)
   // with kUNKChar.
-  for (auto &w : sentences_) {
+  for (auto& w : sentences_) {
     string_util::UnicodeText uw2;
     for (const char32 c : string_util::UTF8ToUnicodeText(w.first)) {
       if (port::ContainsKey(required_chars_, c)) {
@@ -598,15 +600,15 @@ END:
 
   LOG(INFO) << "Done! preprocessed " << sentences_.size() << " sentences.";
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 void TrainerInterface::SplitSentencesByWhitespace() {
   LOG(INFO) << "Tokenizing input sentences with whitespace: "
             << sentences_.size();
   absl::flat_hash_map<std::string, int64_t> tokens;
-  for (const auto &s : sentences_) {
-    for (const auto &w :
+  for (const auto& s : sentences_) {
+    for (const auto& w :
          SplitIntoWords(s.first, trainer_spec_.treat_whitespace_as_suffix(),
                         trainer_spec_.allow_whitespace_only_pieces(),
                         trainer_spec_.GetExtension(::sentencepiece::split_by_interval),
@@ -618,7 +620,7 @@ void TrainerInterface::SplitSentencesByWhitespace() {
   LOG(INFO) << "Done! " << sentences_.size();
 }
 
-util::Status TrainerInterface::Serialize(ModelProto *model_proto) const {
+absl::Status TrainerInterface::Serialize(ModelProto* model_proto) const {
   RETURN_IF_ERROR(status());
 
   // Duplicated sentencepiece is not allowed.
@@ -635,7 +637,7 @@ util::Status TrainerInterface::Serialize(ModelProto *model_proto) const {
   for (int id = 0; id < trainer_spec_.vocab_size(); ++id) {
     const auto it = meta_pieces_.find(id);
     if (it != meta_pieces_.end()) {
-      auto *sp = model_proto->add_pieces();
+      auto* sp = model_proto->add_pieces();
       sp->set_piece(it->second.first);
       sp->set_type(it->second.second);
       sp->set_score(0.0);
@@ -643,8 +645,8 @@ util::Status TrainerInterface::Serialize(ModelProto *model_proto) const {
       RET_CHECK_NE(ModelProto::SentencePiece::NORMAL, sp->type());
       CHECK_PIECE(sp->piece());
     } else if (fid < final_pieces_.size()) {
-      const auto &w = final_pieces_[fid++];
-      auto *sp = model_proto->add_pieces();
+      const auto& w = final_pieces_[fid++];
+      auto* sp = model_proto->add_pieces();
       sp->set_piece(w.first);
       sp->set_score(w.second);
       CHECK_PIECE(sp->piece());
@@ -678,19 +680,19 @@ util::Status TrainerInterface::Serialize(ModelProto *model_proto) const {
   if (!self_test_samples_.empty()) {
     SentencePieceProcessor sp;
     RETURN_IF_ERROR(sp.Load(*model_proto));
-    for (const auto &input : self_test_samples_) {
+    for (const auto& input : self_test_samples_) {
       std::vector<std::string> sps;
       RETURN_IF_ERROR(sp.Encode(input, &sps));
-      auto *sample = model_proto->mutable_self_test_data()->add_samples();
+      auto* sample = model_proto->mutable_self_test_data()->add_samples();
       sample->set_input(input);
       sample->set_expected(absl::StrJoin(sps, " "));
     }
   }
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
-util::Status TrainerInterface::SaveModel(absl::string_view filename) const {
+absl::Status TrainerInterface::SaveModel(absl::string_view filename) const {
   LOG(INFO) << "Saving model: " << filename;
   ModelProto model_proto;
 
@@ -699,17 +701,17 @@ util::Status TrainerInterface::SaveModel(absl::string_view filename) const {
   auto output = filesystem::NewWritableFile(filename.data(), true);
   RETURN_IF_ERROR(output->status());
   output->Write(model_proto.SerializeAsString());
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
-util::Status TrainerInterface::SaveVocab(absl::string_view filename) const {
+absl::Status TrainerInterface::SaveVocab(absl::string_view filename) const {
   LOG(INFO) << "Saving vocabs: " << filename;
   ModelProto model_proto;
   RETURN_IF_ERROR(Serialize(&model_proto));
   auto output = filesystem::NewWritableFile(filename);
   RETURN_IF_ERROR(output->status());
 
-  for (const auto &piece : model_proto.pieces()) {
+  for (const auto& piece : model_proto.pieces()) {
     if (piece.piece().find_first_of(" \t\r\n") != std::string::npos) {
       LOG(WARNING) << "The piece [" << piece.piece()
                    << "] contains escaped characters that break the format of "
@@ -718,35 +720,35 @@ util::Status TrainerInterface::SaveVocab(absl::string_view filename) const {
   }
 
   if (trainer_spec_.vocabulary_output_piece_score()) {
-    for (const auto &piece : model_proto.pieces()) {
+    for (const auto& piece : model_proto.pieces()) {
       std::ostringstream os;
       os << piece.piece() << "\t" << piece.score();
       RET_CHECK(output->WriteLine(os.str()));
     }
   } else {
-    for (const auto &piece : model_proto.pieces()) {
+    for (const auto& piece : model_proto.pieces()) {
       RET_CHECK(output->WriteLine(piece.piece()));
     }
   }
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
-util::Status TrainerInterface::Save() const {
+absl::Status TrainerInterface::Save() const {
   if (output_model_proto_) {
     RETURN_IF_ERROR(Serialize(output_model_proto_));
   } else {
     RETURN_IF_ERROR(SaveModel(trainer_spec_.model_prefix() + ".model"));
     RETURN_IF_ERROR(SaveVocab(trainer_spec_.model_prefix() + ".vocab"));
   }
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
-util::Status TrainerInterface::InitMetaPieces() {
+absl::Status TrainerInterface::InitMetaPieces() {
   RET_CHECK(meta_pieces_.empty());
   bool has_unk = false;
 
-  auto insert_id = [&has_unk, this](int id, const std::string &w) -> bool {
+  auto insert_id = [&has_unk, this](int id, const std::string& w) -> bool {
     if (id < 0) return true;
     if (id >= trainer_spec_.vocab_size() ||
         meta_pieces_.find(id) != meta_pieces_.end() ||
@@ -770,8 +772,8 @@ util::Status TrainerInterface::InitMetaPieces() {
 
   int id = 0;
   auto insert_meta_symbol =
-      [&id, &dup, this](const std::string &w,
-                        ModelProto::SentencePiece::Type type) -> util::Status {
+      [&id, &dup, this](const std::string& w,
+                        ModelProto::SentencePiece::Type type) -> absl::Status {
     if (!dup.insert(w).second) {
       return util::InternalError(absl::StrCat(
           w, " is already defined. duplicated symbols are not allowed."));
@@ -795,23 +797,23 @@ util::Status TrainerInterface::InitMetaPieces() {
       meta_pieces_[id] = std::make_pair(w, type);
     }
 
-    return util::OkStatus();
+    return absl::OkStatus();
   };
 
-  for (const auto &w : trainer_spec_.control_symbols()) {
+  for (const auto& w : trainer_spec_.control_symbols()) {
     RETURN_IF_ERROR(insert_meta_symbol(w, ModelProto::SentencePiece::CONTROL));
   }
 
-  for (const auto &w : trainer_spec_.user_defined_symbols()) {
+  for (const auto& w : trainer_spec_.user_defined_symbols()) {
     RETURN_IF_ERROR(
         insert_meta_symbol(w, ModelProto::SentencePiece::USER_DEFINED));
     if (trainer_spec_.model_type() == TrainerSpec::WORD &&
         normalizer_spec_.escape_whitespaces() &&
         !absl::StartsWith(w, TrainerInterface::kWSStr)) {
       // WORD model tokens include the escaped whitespace prefix.
-      RETURN_IF_ERROR(insert_meta_symbol(
-          absl::StrCat(TrainerInterface::kWSStr, w),
-          ModelProto::SentencePiece::USER_DEFINED));
+      RETURN_IF_ERROR(
+          insert_meta_symbol(absl::StrCat(TrainerInterface::kWSStr, w),
+                             ModelProto::SentencePiece::USER_DEFINED));
     }
   }
 
@@ -822,7 +824,7 @@ util::Status TrainerInterface::InitMetaPieces() {
     }
   }
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 }  // namespace sentencepiece

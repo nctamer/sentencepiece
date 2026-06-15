@@ -30,9 +30,11 @@
 #include "sentencepiece_trainer.h"
 #include "third_party/absl/container/flat_hash_set.h"
 #include "third_party/absl/container/flat_hash_map.h"
+#include "third_party/absl/status/status.h"
 #include "third_party/absl/strings/numbers.h"
 #include "third_party/absl/strings/str_replace.h"
 #include "third_party/absl/strings/str_split.h"
+#include "third_party/absl/strings/string_view.h"
 #include "third_party/esaxx/esa.hxx"  // Suffix array library.
 #include "trainer_interface.h"
 #include "unicode_script.h"
@@ -72,8 +74,8 @@ class BoundedPriorityQueue {
  public:
   explicit BoundedPriorityQueue(size_t size) : max_capacity_(size) {}
 
-  void Push(const std::string &key, int64_t score) {
-    auto &current_score = data_[key];  // initializes with 0 if not exists.
+  void Push(const std::string& key, int64_t score) {
+    auto& current_score = data_[key];  // initializes with 0 if not exists.
     if (score > current_score) {
       current_score = score;
     }
@@ -86,7 +88,7 @@ class BoundedPriorityQueue {
   std::vector<std::pair<std::string, int64_t>> Get() {
     std::vector<std::pair<std::string, int64_t>> results;
     results.reserve(data_.size());
-    for (auto &it : data_) results.emplace_back(std::move(it));
+    for (auto& it : data_) results.emplace_back(std::move(it));
     data_.clear();
 
     Sort(results);
@@ -103,7 +105,7 @@ class BoundedPriorityQueue {
     LOG(INFO) << "Running GC to shrink the candidate pieces";
     std::vector<std::pair<std::string, int64_t>> tmp;
     tmp.reserve(data_.size());
-    for (auto &it : data_) tmp.emplace_back(std::move(it));
+    for (auto& it : data_) tmp.emplace_back(std::move(it));
     Sort(tmp);
     data_.clear();
 
@@ -113,9 +115,9 @@ class BoundedPriorityQueue {
     }
   }
 
-  void Sort(std::vector<std::pair<std::string, int64_t>> &agenda) {
+  void Sort(std::vector<std::pair<std::string, int64_t>>& agenda) {
     std::sort(
-        agenda.begin(), agenda.end(), [](const auto &lhs, const auto &rhs) {
+        agenda.begin(), agenda.end(), [](const auto& lhs, const auto& rhs) {
           // Sort by score, length, and dictionary order.
           return std::forward_as_tuple(rhs.second, rhs.first.size(),
                                        lhs.first) <
@@ -128,17 +130,17 @@ class BoundedPriorityQueue {
 };
 }  // namespace
 
-TrainerModel::TrainerModel(const TrainerSpec &trainer_spec,
-                           const NormalizerSpec &normalizer_spec)
+TrainerModel::TrainerModel(const TrainerSpec& trainer_spec,
+                           const NormalizerSpec& normalizer_spec)
     : trainer_spec_(trainer_spec), normalizer_spec_(normalizer_spec) {}
 
 TrainerModel::~TrainerModel() {}
 
-const TrainerModel::SentencePieces &TrainerModel::GetSentencePieces() const {
+const TrainerModel::SentencePieces& TrainerModel::GetSentencePieces() const {
   return sentencepieces_;
 }
 
-util::Status TrainerModel::SetSentencePieces(SentencePieces &&sentencepieces) {
+absl::Status TrainerModel::SetSentencePieces(SentencePieces&& sentencepieces) {
   sentencepieces_ = std::move(sentencepieces);
 
   min_score_ = FLT_MAX;
@@ -152,7 +154,7 @@ util::Status TrainerModel::SetSentencePieces(SentencePieces &&sentencepieces) {
     RET_CHECK(!std::isnan(score));
     pieces.emplace_back(w, i);
     min_score_ = std::min(min_score_, score);
-    auto *piece = model_proto_data_.add_pieces();
+    auto* piece = model_proto_data_.add_pieces();
     piece->set_piece(w.data(), w.size());
     piece->set_score(score);
   }
@@ -176,13 +178,13 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
 
   // Pretokenizer applied only in training time.
   // Pretokenizer is used as a constraint of piece extractions.
-  const auto *pretokenizer = SentencePieceTrainer::GetPretokenizerForTraining();
+  const auto* pretokenizer = SentencePieceTrainer::GetPretokenizerForTraining();
 
-  auto pretokenize_or_rewrite = [&](std::pair<std::string, int64_t> *w) {
+  auto pretokenize_or_rewrite = [&](std::pair<std::string, int64_t>* w) {
     if (pretokenizer) {
       std::vector<char32> chars;
-      for (const auto &w : pretokenizer->PreTokenize(w->first)) {
-        for (const auto &c : string_util::UTF8ToUnicodeText(w)) {
+      for (const auto& w : pretokenizer->PreTokenize(w->first)) {
+        for (const auto& c : string_util::UTF8ToUnicodeText(w)) {
           chars.push_back(c);
         }
         chars.push_back(kSentenceBoundary);
@@ -194,8 +196,8 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
       // rewrite the original sentence.
       std::vector<char32> chars;
       absl::string_view delimiter = trainer_spec_.pretokenization_delimiter();
-      for (const auto &w : absl::StrSplit(w->first, delimiter)) {
-        for (const auto &c : string_util::UTF8ToUnicodeText(w)) {
+      for (const auto& w : absl::StrSplit(w->first, delimiter)) {
+        for (const auto& c : string_util::UTF8ToUnicodeText(w)) {
           chars.push_back(c);
         }
         chars.push_back(kSentenceBoundary);
@@ -213,9 +215,9 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
 
   const bool is_tsv = trainer_spec_.input_format() == "tsv";
 
-  for (auto &w : sentences_) {
+  for (auto& w : sentences_) {
     const auto ut = pretokenize_or_rewrite(&w);
-    for (const auto &c : ut) {
+    for (const auto& c : ut) {
       array.push_back(c);
       if (c != kUNKChar && c != kSentenceBoundary) {
         all_chars[string_util::UnicodeCharToUTF8(c)] += w.second;
@@ -228,14 +230,14 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
     // we can at least extract all pieces by copying the input because
     // the occurrence gets at least larger than or equals to 2.
     if (is_tsv) {
-      for (const auto &c : ut) array.push_back(c);
+      for (const auto& c : ut) array.push_back(c);
       array.push_back(kSentenceBoundary);
     }
   }
 
   // all_chars must be included in the seed sentencepieces.
   TrainerModel::SentencePieces seed_sentencepieces;
-  for (const auto &it : Sorted(all_chars)) {
+  for (const auto& it : Sorted(all_chars)) {
     seed_sentencepieces.emplace_back(it);
   }
 
@@ -251,7 +253,7 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
         LOG(ERROR) << "Format error: must be <piece> <tab> <freq>";
         return {};
       }
-      const auto &seed_sentencepiece = fields[0];
+      const auto& seed_sentencepiece = fields[0];
       if (!absl::SimpleAtoi(fields[1], &freq)) {
         LOG(ERROR) << "Could not parse the frequency; line: " << line;
         return {};
@@ -322,14 +324,14 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
       if (len <= 1 || offset >= array.size() || offset + len >= array.size()) {
         continue;
       }
-      const char32 *begin = &array[offset];
-      const char32 *end = &array[offset + len];
+      const char32* begin = &array[offset];
+      const char32* end = &array[offset + len];
       const uint64_t freq = R[i] - L[i];
 
       // Split by kSentenceBoundary, as some frequent phrases may cross
       // the sentence boundary.
       while (begin < end) {
-        const char32 *delim = std::find(begin, end, kSentenceBoundary);
+        const char32* delim = std::find(begin, end, kSentenceBoundary);
         const UnicodeText uw(begin, delim);
         begin = delim + 1;
         if (uw.size() <= 1) continue;
@@ -346,7 +348,7 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
       }
     }
 
-    for (auto &[w, score] : queue.Get()) {
+    for (auto& [w, score] : queue.Get()) {
       CHECK(!port::ContainsKey(all_chars, w));
       seed_sentencepieces.emplace_back(std::move(w), score);
     }
@@ -360,8 +362,8 @@ TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
   return seed_sentencepieces;
 }
 
-std::vector<float> Trainer::RunEStep(const TrainerModel &model, float *obj,
-                                     int64_t *num_tokens) const {
+std::vector<float> Trainer::RunEStep(const TrainerModel& model, float* obj,
+                                     int64_t* num_tokens) const {
   std::vector<std::vector<float>> expected(trainer_spec_.num_threads());
   std::vector<float> objs(trainer_spec_.num_threads(), 0.0);
   std::vector<int64_t> ntokens(trainer_spec_.num_threads(), 0.0);
@@ -369,7 +371,7 @@ std::vector<float> Trainer::RunEStep(const TrainerModel &model, float *obj,
   auto pool = std::make_unique<ThreadPool>(trainer_spec_.num_threads());
 
   int64_t all_sentence_freq = 0;
-  for (const auto &w : sentences_) {
+  for (const auto& w : sentences_) {
     all_sentence_freq += w.second;
   }
 
@@ -380,7 +382,7 @@ std::vector<float> Trainer::RunEStep(const TrainerModel &model, float *obj,
       expected[n].resize(model.GetPieceSize(), 0.0);
       for (size_t i = n; i < sentences_.size();
            i += trainer_spec_.num_threads()) {
-        const std::string &w = sentences_[i].first;
+        const std::string& w = sentences_[i].first;
         const int64_t freq = sentences_[i].second;
         lattice.SetSentence(w);
         model.PopulateNodes(&lattice);
@@ -411,8 +413,8 @@ std::vector<float> Trainer::RunEStep(const TrainerModel &model, float *obj,
 }
 
 TrainerModel::SentencePieces Trainer::RunMStep(
-    const TrainerModel &model, const std::vector<float> &expected) const {
-  const auto &sentencepieces = model.GetSentencePieces();
+    const TrainerModel& model, const std::vector<float>& expected) const {
+  const auto& sentencepieces = model.GetSentencePieces();
   CHECK_EQ(sentencepieces.size(), expected.size());
   TrainerModel::SentencePieces new_sentencepieces;
 
@@ -440,7 +442,7 @@ TrainerModel::SentencePieces Trainer::RunMStep(
   // https://cs.stanford.edu/~pliang/papers/tutorial-acl2007-talk.pdf
   // This modification will act as a sparse prior.
   const float logsum = Digamma(sum);
-  for (auto &w : new_sentencepieces) {
+  for (auto& w : new_sentencepieces) {
     w.second = Digamma(w.second) - logsum;
   }
 
@@ -448,8 +450,8 @@ TrainerModel::SentencePieces Trainer::RunMStep(
 }
 
 TrainerModel::SentencePieces Trainer::PruneSentencePieces(
-    const TrainerModel &model) const {
-  const auto &sentencepieces = model.GetSentencePieces();
+    const TrainerModel& model) const {
+  const auto& sentencepieces = model.GetSentencePieces();
 
   Lattice lattice;
   std::vector<bool> always_keep(sentencepieces.size(), true);
@@ -467,7 +469,7 @@ TrainerModel::SentencePieces Trainer::PruneSentencePieces(
       always_keep[i] = true;
       continue;
     }
-    const auto &w = sentencepieces[i];
+    const auto& w = sentencepieces[i];
     lattice.SetSentence(w.first);
     model.PopulateNodes(&lattice);
     const auto nbests = lattice.NBest(2, false, 0.0);
@@ -480,7 +482,7 @@ TrainerModel::SentencePieces Trainer::PruneSentencePieces(
       always_keep[i] = false;
     } else if (nbests[0].first.size() == 1) {
       always_keep[i] = true;
-      for (const auto *node : nbests[1].first) {
+      for (const auto* node : nbests[1].first) {
         alternatives[i].push_back(node->id);
       }
     }
@@ -500,10 +502,10 @@ TrainerModel::SentencePieces Trainer::PruneSentencePieces(
         Lattice lattice;
         for (size_t i = n; i < sentences_.size();
              i += trainer_spec_.num_threads()) {
-          const auto &w = sentences_[i];
+          const auto& w = sentences_[i];
           lattice.SetSentence(w.first);
           model.PopulateNodes(&lattice);
-          for (const auto *node : lattice.Viterbi().first) {
+          for (const auto* node : lattice.Viterbi().first) {
             if (node->id >= 0) {
               freqs[n][node->id] += w.second;
             }
@@ -575,7 +577,7 @@ TrainerModel::SentencePieces Trainer::PruneSentencePieces(
 
   // Keeps trainer_spec_.shrinking_factor * sentencepieces.size() pieces.
   // shrinking_factor is 0.75 by default.
-  for (const auto &w : Sorted(candidates)) {
+  for (const auto& w : Sorted(candidates)) {
     if (new_sentencepieces.size() == static_cast<size_t>(pruned_size)) {
       break;
     }
@@ -586,8 +588,8 @@ TrainerModel::SentencePieces Trainer::PruneSentencePieces(
 }
 
 TrainerModel::SentencePieces Trainer::FinalizeSentencePieces(
-    const TrainerModel &model) const {
-  const auto &sentencepieces = model.GetSentencePieces();
+    const TrainerModel& model) const {
+  const auto& sentencepieces = model.GetSentencePieces();
   absl::flat_hash_map<std::string, float> final_sentencepieces;
   absl::flat_hash_map<std::string, float> sp(sentencepieces.begin(),
                                              sentencepieces.end());
@@ -608,7 +610,7 @@ TrainerModel::SentencePieces Trainer::FinalizeSentencePieces(
   // required_chars_ must be included in the final sentencepieces.
   float min_score_penalty = 0.0;
   constexpr float kMinScorePenaltyDelta = 0.0001;
-  for (const auto &w : Sorted(required_chars_)) {
+  for (const auto& w : Sorted(required_chars_)) {
     const std::string s = string_util::UnicodeCharToUTF8(w.first);
     if (port::ContainsKey(sp, s)) {
       final_sentencepieces[s] = sp[s];
@@ -625,7 +627,7 @@ TrainerModel::SentencePieces Trainer::FinalizeSentencePieces(
   CHECK_GT(vocab_size_size, 0);
 
   // Then keeps sentencepieces with higher scores.
-  for (const auto &w : Sorted(sentencepieces)) {
+  for (const auto& w : Sorted(sentencepieces)) {
     if (port::ContainsKey(final_sentencepieces, w.first)) {
       continue;
     }
@@ -638,7 +640,7 @@ TrainerModel::SentencePieces Trainer::FinalizeSentencePieces(
   return Sorted(final_sentencepieces);
 }
 
-util::Status Trainer::Train() {
+absl::Status Trainer::Train() {
   RETURN_IF_ERROR(status());
 
   RET_CHECK_EQ(TrainerSpec::UNIGRAM, trainer_spec_.model_type());

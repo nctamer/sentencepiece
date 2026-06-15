@@ -10,14 +10,16 @@
 #include <thread>
 #include <vector>
 
+#include "third_party/absl/status/status.h"
+
 namespace {
 
-PyObject *kUnicodeInput = reinterpret_cast<PyObject *>(0x1);
-PyObject *kByteInput = reinterpret_cast<PyObject *>(0x2);
+PyObject* kUnicodeInput = reinterpret_cast<PyObject*>(0x1);
+PyObject* kByteInput = reinterpret_cast<PyObject*>(0x2);
 
 using BytesArray = std::vector<sentencepiece::util::bytes>;
 
-inline void ReleaseResultObject(PyObject *obj) {
+inline void ReleaseResultObject(PyObject* obj) {
   if (obj != nullptr && obj != kUnicodeInput && obj != kByteInput) {
     Py_XDECREF(obj);
   }
@@ -25,9 +27,9 @@ inline void ReleaseResultObject(PyObject *obj) {
 
 class PyInputString {
  public:
-  explicit PyInputString(PyObject *obj) {
+  explicit PyInputString(PyObject* obj) {
     if (PyUnicode_Check(obj)) {
-      str_ = const_cast<char *>(PyUnicode_AsUTF8AndSize(obj, &size_));
+      str_ = const_cast<char*>(PyUnicode_AsUTF8AndSize(obj, &size_));
       input_type_ = kUnicodeInput;
     } else if (PyBytes_Check(obj)) {
       PyBytes_AsStringAndSize(obj, &str_, &size_);
@@ -37,39 +39,39 @@ class PyInputString {
     }
   }
   absl::string_view str() const { return absl::string_view(data(), size()); }
-  const char *data() const { return str_; }
+  const char* data() const { return str_; }
   Py_ssize_t size() const { return size_; }
   bool IsAvalable() const { return str_ != nullptr; }
-  PyObject *input_type() const { return input_type_; }
+  PyObject* input_type() const { return input_type_; }
 
-  static bool IsUnicode(PyObject *resultobj) {
+  static bool IsUnicode(PyObject* resultobj) {
     return (resultobj == nullptr || resultobj == kUnicodeInput);
   }
 
  private:
-  PyObject *input_type_ = nullptr;
-  char *str_ = nullptr;
+  PyObject* input_type_ = nullptr;
+  char* str_ = nullptr;
   Py_ssize_t size_ = 0;
 };
 
-PyObject *MakePyOutputString(const std::string &output, PyObject *resultobj) {
+PyObject* MakePyOutputString(const std::string& output, PyObject* resultobj) {
   if (PyInputString::IsUnicode(resultobj)) {
     return PyUnicode_FromStringAndSize(output.data(), output.size());
   }
   return PyBytes_FromStringAndSize(output.data(), output.size());
 }
 
-PyObject *MakePyOutputBytes(const sentencepiece::util::bytes &output) {
+PyObject* MakePyOutputBytes(const sentencepiece::util::bytes& output) {
   return PyBytes_FromStringAndSize(output.data(), output.size());
 }
 
-int ToSwigError(sentencepiece::util::StatusCode code) {
+int ToSwigError(absl::StatusCode code) {
   switch (code) {
-    case sentencepiece::util::StatusCode::kNotFound:
+    case absl::StatusCode::kNotFound:
       return SWIG_IOError;
-    case sentencepiece::util::StatusCode::kOutOfRange:
+    case absl::StatusCode::kOutOfRange:
       return SWIG_IndexError;
-    case sentencepiece::util::StatusCode::kInvalidArgument:
+    case absl::StatusCode::kInvalidArgument:
       return SWIG_SyntaxError;
     default:
       return SWIG_RuntimeError;
@@ -86,7 +88,7 @@ class ScopedGILRelease {
   ~ScopedGILRelease() { PyEval_RestoreThread(save_); }
 
  private:
-  PyThreadState *save_;
+  PyThreadState* save_;
 };
 
 // RAII class to aquire GIL.
@@ -115,7 +117,7 @@ class ScopedGILAcquire {
 
 class PySentenceIterator : public sentencepiece::SentenceIterator {
  public:
-  PySentenceIterator(PyObject *iter) : iter_(iter) {
+  PySentenceIterator(PyObject* iter) : iter_(iter) {
     ScopedGILAcquire aquire;
     item_ = PyIter_Next(iter_);
     CopyValue();
@@ -133,9 +135,9 @@ class PySentenceIterator : public sentencepiece::SentenceIterator {
     CopyValue();
   }
 
-  const std::string &value() const override { return value_; }
+  const std::string& value() const override { return value_; }
 
-  sentencepiece::util::Status status() const override { return status_; }
+  absl::Status status() const override { return status_; }
 
  private:
   void CopyValue() {
@@ -151,19 +153,18 @@ class PySentenceIterator : public sentencepiece::SentenceIterator {
       }
       value_.assign(data.data(), data.size());
     } else {
-      status_ = sentencepiece::util::Status(
-          sentencepiece::util::StatusCode::kInternal, "Not a string.");
+      status_ = absl::Status(absl::StatusCode::kInternal, "Not a string.");
     }
     Py_XDECREF(item_);
   }
-  PyObject *iter_ = nullptr;
-  PyObject *item_ = nullptr;
+  PyObject* iter_ = nullptr;
+  PyObject* item_ = nullptr;
   std::string value_;
-  sentencepiece::util::Status status_;
+  absl::Status status_;
 };
 
-inline void RewriteIds(const sentencepiece::SentencePieceProcessor &sp,
-                       std::vector<int> *ids, bool add_bos, bool add_eos,
+inline void RewriteIds(const sentencepiece::SentencePieceProcessor& sp,
+                       std::vector<int>* ids, bool add_bos, bool add_eos,
                        bool reverse, bool emit_unk_piece) {
   if (!add_bos && !add_eos && !reverse) return;
   if (reverse) std::reverse(ids->begin(), ids->end());
@@ -171,16 +172,16 @@ inline void RewriteIds(const sentencepiece::SentencePieceProcessor &sp,
   if (add_eos) ids->push_back(sp.eos_id());
 }
 
-inline void RewriteIds(const sentencepiece::SentencePieceProcessor &sp,
-                       std::vector<std::string> *pieces, bool add_bos,
+inline void RewriteIds(const sentencepiece::SentencePieceProcessor& sp,
+                       std::vector<std::string>* pieces, bool add_bos,
                        bool add_eos, bool reverse, bool emit_unk_piece) {
   if (!add_bos && !add_eos && !reverse && !emit_unk_piece) return;
   if (reverse) std::reverse(pieces->begin(), pieces->end());
   if (add_bos) pieces->insert(pieces->begin(), sp.IdToPiece(sp.bos_id()));
   if (add_eos) pieces->push_back(sp.IdToPiece(sp.eos_id()));
   if (emit_unk_piece) {
-    const auto &unk = sp.IdToPiece(sp.unk_id());
-    for (auto &piece : *pieces) {
+    const auto& unk = sp.IdToPiece(sp.unk_id());
+    for (auto& piece : *pieces) {
       const int id = sp.PieceToId(piece);
       if (id == sp.unk_id()) {
         piece = unk;
@@ -189,59 +190,58 @@ inline void RewriteIds(const sentencepiece::SentencePieceProcessor &sp,
   }
 }
 
-inline void RewriteIds(const sentencepiece::SentencePieceProcessor &sp,
-                       sentencepiece::util::bytes *proto, bool add_bos,
+inline void RewriteIds(const sentencepiece::SentencePieceProcessor& sp,
+                       sentencepiece::util::bytes* proto, bool add_bos,
                        bool add_eos, bool reverse, bool emit_unk_piece) {
   if (add_bos || add_eos || reverse || emit_unk_piece) {
-    throw sentencepiece::util::Status(
-        sentencepiece::util::StatusCode::kUnimplemented,
+    throw absl::Status(
+        absl::StatusCode::kUnimplemented,
         "add_bos, add_eos, reverse, and emit_unk_piece is not supported in "
         "proto API");
   }
 }
 
-inline void RewriteIds(const sentencepiece::SentencePieceProcessor &sp,
-                       sentencepiece::ImmutableSentencePieceText *proto,
+inline void RewriteIds(const sentencepiece::SentencePieceProcessor& sp,
+                       sentencepiece::ImmutableSentencePieceText* proto,
                        bool add_bos, bool add_eos, bool reverse,
                        bool emit_unk_piece) {
   if (add_bos || add_eos || reverse || emit_unk_piece) {
-    throw sentencepiece::util::Status(
-        sentencepiece::util::StatusCode::kUnimplemented,
+    throw absl::Status(
+        absl::StatusCode::kUnimplemented,
         "add_bos, add_eos, reverse, and emit_unk_piece is not supported in "
         "proto API");
   }
 }
 
-inline void CheckIds(const std::vector<int> &ids, int num_pieces) {
+inline void CheckIds(const std::vector<int>& ids, int num_pieces) {
   for (int id : ids) {
     if (id < 0 || id >= num_pieces) {
-      throw sentencepiece::util::Status(
-          sentencepiece::util::StatusCode::kOutOfRange,
-          "piece id is out of range.");
+      throw absl::Status(absl::StatusCode::kOutOfRange,
+                         "piece id is out of range.");
     }
   }
 }
 
-inline void CheckIds(const std::vector<absl::string_view> &ids,
+inline void CheckIds(const std::vector<absl::string_view>& ids,
                      int num_pieces) {}
 
-inline void CheckIdsBatch(const std::vector<std::vector<int>> &ids,
+inline void CheckIdsBatch(const std::vector<std::vector<int>>& ids,
                           int num_pieces) {
-  for (const auto &v : ids) CheckIds(v, num_pieces);
+  for (const auto& v : ids) CheckIds(v, num_pieces);
 }
 
 template <typename T>
-inline void ConvertToUnicodeSpans(T *proto) {}
+inline void ConvertToUnicodeSpans(T* proto) {}
 
 template <>
 inline void ConvertToUnicodeSpans(
-    sentencepiece::ImmutableSentencePieceText *proto) {
+    sentencepiece::ImmutableSentencePieceText* proto) {
   proto->ConvertToUnicodeSpans();
 }
 
 template <>
 inline void ConvertToUnicodeSpans(
-    sentencepiece::ImmutableNBestSentencePieceText *proto) {
+    sentencepiece::ImmutableNBestSentencePieceText* proto) {
   proto->ConvertToUnicodeSpans();
 }
 
@@ -258,7 +258,7 @@ inline int GetNumThreads(int num_threads) {
   if (!thread_pool) {                                                     \
     pool_impl = std::make_unique<sentencepiece::ThreadPool>(num_threads); \
   }                                                                       \
-  auto *pool = thread_pool ? thread_pool : pool_impl.get();
+  auto* pool = thread_pool ? thread_pool : pool_impl.get();
 
 #define DEFINE_ENCODE_BATCH_FUNC_IMPL(FuncName, InType, OutType)              \
   std::vector<OutType> outs(ins.size());                                      \
@@ -273,10 +273,10 @@ inline int GetNumThreads(int num_threads) {
           RewriteIds(*self, &out, add_bos, add_eos, reverse, emit_unk_piece); \
           ConvertToUnicodeSpans(&out);                                        \
           outs[i] = std::move(out);                                           \
-        } catch (const sentencepiece::util::Status &s) {                      \
+        } catch (const absl::Status& s) {                                     \
           return s;                                                           \
         }                                                                     \
-        return sentencepiece::util::Status();                                 \
+        return absl::OkStatus();                                              \
       },                                                                      \
       *pool);                                                                 \
   if (!status.ok()) throw status;                                             \
@@ -291,10 +291,10 @@ inline int GetNumThreads(int num_threads) {
         try {                                                    \
           outs[i] = self->FuncName(ins[i]);                      \
           ConvertToUnicodeSpans(&outs[i]);                       \
-        } catch (const sentencepiece::util::Status &s) {         \
+        } catch (const absl::Status& s) {                        \
           return s;                                              \
         }                                                        \
-        return sentencepiece::util::Status();                    \
+        return absl::OkStatus();                                 \
       },                                                         \
       *pool);                                                    \
   if (!status.ok()) throw status;                                \

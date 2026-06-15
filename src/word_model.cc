@@ -14,12 +14,13 @@
 
 #include "word_model.h"
 
+#include "third_party/absl/strings/string_view.h"
 #include "util.h"
 
 namespace sentencepiece {
 namespace word {
 
-Model::Model(const ModelProto &model_proto) {
+Model::Model(const ModelProto& model_proto) {
   model_proto_ = &model_proto;
   InitializePieces();
 }
@@ -32,7 +33,7 @@ EncodeResult Model::Encode(absl::string_view normalized) const {
   }
 
   EncodeResult output;
-  for (const auto &w : SplitIntoWords(normalized)) {
+  for (const auto& w : SplitIntoWords(normalized)) {
     output.emplace_back(w, PieceToId(w));
   }
 

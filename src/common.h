@@ -21,6 +21,7 @@
 #include "third_party/absl/log/check.h"
 #include "third_party/absl/log/globals.h"
 #include "third_party/absl/log/log.h"
+#include "third_party/absl/status/status.h"
 #include "third_party/absl/strings/string_view.h"
 
 #if defined(_WIN32) && !defined(__CYGWIN__)
@@ -46,7 +47,7 @@ using char32 = uint32_t;
     if (!_status.ok()) return _status; \
   } while (0)
 
-// CHECK_OK must work on util::Status, not absl::Status.
+// CHECK_OK must work on absl::Status, not absl::Status.
 #if defined CHECK_OK
 #undef CHECK_OK
 #endif  // CHECK_OK

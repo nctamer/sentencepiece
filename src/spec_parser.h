@@ -19,9 +19,11 @@
 #include <vector>
 
 #include "sentencepiece_processor.h"
+#include "third_party/absl/status/status.h"
 #include "third_party/absl/strings/ascii.h"
 #include "third_party/absl/strings/numbers.h"
 #include "third_party/absl/strings/str_split.h"
+#include "third_party/absl/strings/string_view.h"
 #include "util.h"
 
 namespace sentencepiece {
@@ -29,79 +31,79 @@ namespace sentencepiece {
 #define PARSE_STRING(param_name)                           \
   if (name == #param_name) {                               \
     message->set_##param_name(value.data(), value.size()); \
-    return util::OkStatus();                               \
+    return absl::OkStatus();                               \
   }
 
 #define PARSE_REPEATED_STRING(param_name)                \
   if (name == #param_name) {                             \
-    for (const auto &val : util::StrSplitAsCSV(value)) { \
+    for (const auto& val : util::StrSplitAsCSV(value)) { \
       message->add_##param_name(val);                    \
     }                                                    \
-    return util::OkStatus();                             \
+    return absl::OkStatus();                             \
   }
 
 #define PARSE_BYTE(param_name)                             \
   if (name == #param_name) {                               \
     message->set_##param_name(value.data(), value.size()); \
-    return util::OkStatus();                               \
+    return absl::OkStatus();                               \
   }
 
 #define PARSE_INT32(param_name)                                               \
   if (name == #param_name) {                                                  \
     int32_t v;                                                                \
     if (!absl::SimpleAtoi(value, &v))                                         \
-      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC) \
+      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC) \
              << "cannot parse \"" << value << "\" as int.";                   \
     message->set_##param_name(v);                                             \
-    return util::OkStatus();                                                  \
+    return absl::OkStatus();                                                  \
   }
 
 #define PARSE_UINT64(param_name)                                              \
   if (name == #param_name) {                                                  \
     uint64_t v;                                                               \
     if (!absl::SimpleAtoi(value, &v))                                         \
-      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC) \
+      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC) \
              << "cannot parse \"" << value << "\" as int.";                   \
     message->set_##param_name(v);                                             \
-    return util::OkStatus();                                                  \
+    return absl::OkStatus();                                                  \
   }
 
 #define PARSE_DOUBLE(param_name)                                              \
   if (name == #param_name) {                                                  \
     double v;                                                                 \
     if (!absl::SimpleAtod(value, &v))                                         \
-      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC) \
+      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC) \
              << "cannot parse \"" << value << "\" as int.";                   \
     message->set_##param_name(v);                                             \
-    return util::OkStatus();                                                  \
+    return absl::OkStatus();                                                  \
   }
 
 #define PARSE_BOOL(param_name)                                                \
   if (name == #param_name) {                                                  \
     bool v;                                                                   \
     if (!absl::SimpleAtob(value.empty() ? "true" : value, &v))                \
-      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC) \
+      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC) \
              << "cannot parse \"" << value << "\" as bool.";                  \
     message->set_##param_name(v);                                             \
-    return util::OkStatus();                                                  \
+    return absl::OkStatus();                                                  \
   }
 
 #define PARSE_ENUM(param_name, map_name)                                      \
   if (name == #param_name) {                                                  \
     const auto it = map_name.find(absl::AsciiStrToUpper(value));              \
     if (it == map_name.end())                                                 \
-      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC) \
+      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC) \
              << "unknown enumeration value of \"" << value << "\" as "        \
              << #map_name;                                                    \
     message->set_##param_name(it->second);                                    \
-    return util::OkStatus();                                                  \
+    return absl::OkStatus();                                                  \
   }
 
 #define PRINT_PARAM(param_name) \
   os << "  " << #param_name << ": " << message.param_name() << "\n";
 
 #define PRINT_REPEATED_STRING(param_name)    \
-  for (const auto &v : message.param_name()) \
+  for (const auto& v : message.param_name()) \
     os << "  " << #param_name << ": " << v << "\n";
 
 #define PRINT_ENUM(param_name, map_name)               \
@@ -111,7 +113,7 @@ namespace sentencepiece {
   else                                                 \
     os << "  " << #param_name << ": " << it->second << "\n";
 
-inline std::string PrintProto(const TrainerSpec &message,
+inline std::string PrintProto(const TrainerSpec& message,
                               absl::string_view name) {
   std::ostringstream os;
 
@@ -180,7 +182,7 @@ inline std::string PrintProto(const TrainerSpec &message,
   return os.str();
 }
 
-inline std::string PrintProto(const NormalizerSpec &message,
+inline std::string PrintProto(const NormalizerSpec& message,
                               absl::string_view name) {
   std::ostringstream os;
 
@@ -197,9 +199,9 @@ inline std::string PrintProto(const NormalizerSpec &message,
   return os.str();
 }
 
-util::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
+absl::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
                                                  absl::string_view value,
-                                                 TrainerSpec *message) {
+                                                 TrainerSpec* message) {
   RET_CHECK(message);
 
   PARSE_REPEATED_STRING(input);
@@ -232,31 +234,31 @@ util::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_BOOL(split_digits);
   if (name == "split_by_interval") {
     bool v; if (!absl::SimpleAtob(value.empty() ? "true" : value, &v))
-      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC)
+      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
              << "cannot parse \"" << value << "\" as bool.";
-    message->SetExtension(split_by_interval, v); return util::OkStatus();
+    message->SetExtension(split_by_interval, v); return absl::OkStatus();
   }
   if (name == "split_by_barline") {
     bool v; if (!absl::SimpleAtob(value.empty() ? "true" : value, &v))
-      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC)
+      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
              << "cannot parse \"" << value << "\" as bool.";
-    message->SetExtension(split_by_barline, v); return util::OkStatus();
+    message->SetExtension(split_by_barline, v); return absl::OkStatus();
   }
   if (name == "phase1_merge_budget") {
     int32_t v; if (!absl::SimpleAtoi(value, &v))
-      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC)
+      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
              << "cannot parse \"" << value << "\" as int.";
-    message->SetExtension(phase1_merge_budget, v); return util::OkStatus();
+    message->SetExtension(phase1_merge_budget, v); return absl::OkStatus();
   }
   if (name == "phase2_merge_budget") {
     int32_t v; if (!absl::SimpleAtoi(value, &v))
-      return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC)
+      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
              << "cannot parse \"" << value << "\" as int.";
-    message->SetExtension(phase2_merge_budget, v); return util::OkStatus();
+    message->SetExtension(phase2_merge_budget, v); return absl::OkStatus();
   }
   if (name == "protected_pieces_file") {
     message->SetExtension(protected_pieces_file, std::string(value));
-    return util::OkStatus();
+    return absl::OkStatus();
   }
   PARSE_STRING(pretokenization_delimiter);
   PARSE_BOOL(treat_whitespace_as_suffix);
@@ -283,13 +285,13 @@ util::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_DOUBLE(differential_privacy_noise_level);
   PARSE_UINT64(differential_privacy_clipping_threshold);
 
-  return util::StatusBuilder(util::StatusCode::kNotFound, GTL_LOC)
+  return util::StatusBuilder(absl::StatusCode::kNotFound, GTL_LOC)
          << "unknown field name \"" << name << "\" in TrainerSpec.";
 }
 
-util::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
+absl::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
                                                  absl::string_view value,
-                                                 NormalizerSpec *message) {
+                                                 NormalizerSpec* message) {
   RET_CHECK(message);
 
   PARSE_STRING(name);
@@ -299,7 +301,7 @@ util::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_BOOL(escape_whitespaces);
   PARSE_STRING(normalization_rule_tsv);
 
-  return util::StatusBuilder(util::StatusCode::kNotFound, GTL_LOC)
+  return util::StatusBuilder(absl::StatusCode::kNotFound, GTL_LOC)
          << "unknown field name \"" << name << "\" in NormalizerSpec.";
 }
 

@@ -19,10 +19,12 @@
 #include <utility>
 
 #include "filesystem.h"
+#include "third_party/absl/status/status.h"
 #include "third_party/absl/strings/str_cat.h"
 #include "third_party/absl/strings/str_join.h"
 #include "third_party/absl/strings/str_replace.h"
 #include "third_party/absl/strings/str_split.h"
+#include "third_party/absl/strings/string_view.h"
 #include "third_party/absl/strings/strip.h"
 
 #ifdef ENABLE_NFKC_COMPILE
@@ -60,7 +62,7 @@ static constexpr absl::string_view kCompileError =
 #ifdef ENABLE_NFKC_COMPILE
 // Normalize `input` with ICU's normalizer with `mode`.
 Builder::Chars UnicodeNormalize(UNormalizationMode mode,
-                                const Builder::Chars &input) {
+                                const Builder::Chars& input) {
   const std::string utf8 = string_util::UnicodeTextToUTF8(input);
   CHECK(!utf8.empty());
 
@@ -76,19 +78,19 @@ Builder::Chars UnicodeNormalize(UNormalizationMode mode,
   return string_util::UTF8ToUnicodeText(normalized);
 }
 
-Builder::Chars ToNFKD(const Builder::Chars &input) {
+Builder::Chars ToNFKD(const Builder::Chars& input) {
   return UnicodeNormalize(UNORM_NFKD, input);
 }
 
-Builder::Chars ToNFKC(const Builder::Chars &input) {
+Builder::Chars ToNFKC(const Builder::Chars& input) {
   return UnicodeNormalize(UNORM_NFKC, input);
 }
 
-Builder::Chars ToNFC(const Builder::Chars &input) {
+Builder::Chars ToNFC(const Builder::Chars& input) {
   return UnicodeNormalize(UNORM_NFC, input);
 }
 
-Builder::Chars ToNFD(const Builder::Chars &input) {
+Builder::Chars ToNFD(const Builder::Chars& input) {
   return UnicodeNormalize(UNORM_NFD, input);
 }
 
@@ -96,17 +98,17 @@ Builder::Chars ToNFD(const Builder::Chars &input) {
 // normalized into the same `nfkd`. `norm2orig` is the normalized to
 // un-normalized character mapping.
 std::vector<Builder::Chars> ExpandUnnormalized(
-    const Builder::Chars &nfkd,
-    const std::map<char32, std::set<char32>> &norm2orig) {
+    const Builder::Chars& nfkd,
+    const std::map<char32, std::set<char32>>& norm2orig) {
   CHECK(!nfkd.empty());
   std::vector<Builder::Chars> results;
   for (const auto c : port::FindOrDie(norm2orig, nfkd[0])) {
     results.push_back({c});
   }
   for (size_t i = 1; i < nfkd.size(); ++i) {
-    const auto &orig = port::FindOrDie(norm2orig, nfkd[i]);
+    const auto& orig = port::FindOrDie(norm2orig, nfkd[i]);
     std::vector<Builder::Chars> new_results;
-    for (const auto &r : results) {
+    for (const auto& r : results) {
       for (const auto c : orig) {
         new_results.emplace_back(r);
         new_results.back().push_back(c);
@@ -121,8 +123,8 @@ std::vector<Builder::Chars> ExpandUnnormalized(
 
 // Normalizes `src` with `chars_map` and returns normalized Chars.
 // `max_len` specifies the maximum length of the key in `chars_map`.
-Builder::Chars Normalize(const Builder::CharsMap &chars_map,
-                         const Builder::Chars &src, int max_len) {
+Builder::Chars Normalize(const Builder::CharsMap& chars_map,
+                         const Builder::Chars& src, int max_len) {
   CHECK_GE(max_len, 1);
   Builder::Chars normalized;
 
@@ -153,7 +155,7 @@ Builder::Chars Normalize(const Builder::CharsMap &chars_map,
   return normalized;
 }
 
-util::Status IsValidNormalizerData(absl::string_view blob_data) {
+absl::Status IsValidNormalizerData(absl::string_view blob_data) {
   NormalizerSpec spec;
   spec.set_precompiled_charsmap(blob_data.data(), blob_data.size());
   const Normalizer normalizer(spec);
@@ -163,8 +165,8 @@ util::Status IsValidNormalizerData(absl::string_view blob_data) {
 }  // namespace
 
 // static
-util::Status Builder::CompileCharsMap(const CharsMap &chars_map,
-                                      std::string *output) {
+absl::Status Builder::CompileCharsMap(const CharsMap& chars_map,
+                                      std::string* output) {
   RET_CHECK(output);
   RET_CHECK(!chars_map.empty());
 
@@ -172,12 +174,12 @@ util::Status Builder::CompileCharsMap(const CharsMap &chars_map,
 
   // Aggregates the same target strings to save footprint.
   std::map<Chars, int> normalized2pos;
-  for (const auto &p : chars_map) {
+  for (const auto& p : chars_map) {
     normalized2pos[p.second] = 0;
   }
 
   std::string normalized;
-  for (auto &p : normalized2pos) {
+  for (auto& p : normalized2pos) {
     p.second = normalized.size();  // stores the pointer (position).
     const std::string utf8_out = string_util::UnicodeTextToUTF8(p.first);
     RET_CHECK(string_util::IsStructurallyValid(utf8_out));
@@ -186,7 +188,7 @@ util::Status Builder::CompileCharsMap(const CharsMap &chars_map,
   }
 
   std::vector<std::pair<std::string, int>> kv;  // key-value of Trie.
-  for (const auto &p : chars_map) {
+  for (const auto& p : chars_map) {
     // The value of Trie stores the pointer to the normalized string.
     const std::string utf8_in = string_util::UnicodeTextToUTF8(p.first);
     RET_CHECK(!utf8_in.empty());
@@ -195,7 +197,7 @@ util::Status Builder::CompileCharsMap(const CharsMap &chars_map,
   }
 
   std::sort(kv.begin(), kv.end());
-  std::vector<const char *> key(kv.size());
+  std::vector<const char*> key(kv.size());
   std::vector<int> value(kv.size());
   for (size_t i = 0; i < kv.size(); ++i) {
     key[i] = kv[i].first.c_str();
@@ -203,14 +205,14 @@ util::Status Builder::CompileCharsMap(const CharsMap &chars_map,
   }
 
   Darts::DoubleArray trie;
-  RET_CHECK_EQ(0, trie.build(key.size(), const_cast<char **>(&key[0]), nullptr,
+  RET_CHECK_EQ(0, trie.build(key.size(), const_cast<char**>(&key[0]), nullptr,
                              &value[0]))
       << "cannot build double-array";
 
   int max_nodes_size = 0;
   std::vector<Darts::DoubleArray::result_pair_type> results(
       2 * Normalizer::kMaxTrieResultsSize);
-  for (const char *str : key) {
+  for (const char* str : key) {
     const int num_nodes = trie.commonPrefixSearch(str, results.data(),
                                                   results.size(), strlen(str));
     max_nodes_size = std::max(num_nodes, max_nodes_size);
@@ -220,19 +222,19 @@ util::Status Builder::CompileCharsMap(const CharsMap &chars_map,
       << "The number of shared prefix must be less than "
       << Normalizer::kMaxTrieResultsSize;
 
-  absl::string_view trie_blob(static_cast<const char *>(trie.array()),
+  absl::string_view trie_blob(static_cast<const char*>(trie.array()),
                               trie.size() * trie.unit_size());
   *output = Normalizer::EncodePrecompiledCharsMap(trie_blob, normalized);
   RETURN_IF_ERROR(IsValidNormalizerData(*output));
 
   LOG(INFO) << "Generated normalizer blob. size=" << output->size();
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::DecompileCharsMap(absl::string_view blob,
-                                        Builder::CharsMap *chars_map) {
+absl::Status Builder::DecompileCharsMap(absl::string_view blob,
+                                        Builder::CharsMap* chars_map) {
   RET_CHECK(chars_map);
   chars_map->clear();
 
@@ -242,17 +244,23 @@ util::Status Builder::DecompileCharsMap(absl::string_view blob,
                                                         &normalized, &buf));
 
   Darts::DoubleArray trie;
-  trie.set_array(const_cast<char *>(trie_blob.data()),
+  trie.set_array(const_cast<char*>(trie_blob.data()),
                  trie_blob.size() / trie.unit_size());
 
+  if (!trie.validate()) {
+    return util::InternalError(
+        "Trie data contains out-of-bounds node references.");
+  }
+
   std::string key;
+  bool value_out_of_range = false;
   std::function<void(size_t, size_t)> traverse;
 
   // Given a Trie node at `node_pos` and the key position at `key_position`,
   // Expands children nodes from `node_pos`.
   // When leaf nodes are found, stores them into `chars_map`.
-  traverse = [&traverse, &key, &trie, &normalized, &chars_map](
-                 size_t node_pos, size_t key_pos) -> void {
+  traverse = [&traverse, &key, &trie, &normalized, &chars_map,
+              &value_out_of_range](size_t node_pos, size_t key_pos) -> void {
     for (int c = 0; c <= 255; ++c) {
       key.push_back(static_cast<char>(c));
       size_t copied_node_pos = node_pos;
@@ -263,13 +271,20 @@ util::Status Builder::DecompileCharsMap(absl::string_view blob,
           key.data(), copied_node_pos, copied_key_pos, key.size());
       if (result >= -1) {   // node exists.
         if (result >= 0) {  // has a value after transition.
-          const absl::string_view value = normalized.data() + result;
-          Chars key_chars, value_chars;
-          for (const auto c : string_util::UTF8ToUnicodeText(key))
-            key_chars.push_back(c);
-          for (const auto c : string_util::UTF8ToUnicodeText(value))
-            value_chars.push_back(c);
-          (*chars_map)[key_chars] = value_chars;
+          // The value is an offset into `normalized`. A crafted charsmap can
+          // store an offset that points past the block, so bound it before
+          // dereferencing.
+          if (static_cast<size_t>(result) >= normalized.size()) {
+            value_out_of_range = true;
+          } else {
+            const absl::string_view value = normalized.data() + result;
+            Chars key_chars, value_chars;
+            for (const auto c : string_util::UTF8ToUnicodeText(key))
+              key_chars.push_back(c);
+            for (const auto c : string_util::UTF8ToUnicodeText(value))
+              value_chars.push_back(c);
+            (*chars_map)[key_chars] = value_chars;
+          }
         }
         // Recursively traverse.
         traverse(copied_node_pos, copied_key_pos);
@@ -280,23 +295,28 @@ util::Status Builder::DecompileCharsMap(absl::string_view blob,
 
   traverse(0, 0);
 
-  return util::OkStatus();
+  if (value_out_of_range) {
+    return util::InternalError(
+        "Normalization rule value offset is out of range.");
+  }
+
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::GetPrecompiledCharsMap(absl::string_view name,
-                                             std::string *output) {
+absl::Status Builder::GetPrecompiledCharsMap(absl::string_view name,
+                                             std::string* output) {
   RET_CHECK(output);
 
   if (name == "identity") {
     output->clear();
-    return util::OkStatus();
+    return absl::OkStatus();
   }
 
   if (!std::all_of(name.begin(), name.end(), [](auto c) {
         return (c >= 'a' && c <= 'z') || c == '_' || c == '-';
       })) {
-    return util::StatusBuilder(util::StatusCode::kInvalidArgument, GTL_LOC)
+    return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
            << "Invalid charsmap name " << name;
   }
 
@@ -304,7 +324,7 @@ util::Status Builder::GetPrecompiledCharsMap(absl::string_view name,
 
 #ifndef DISABLE_EMBEDDED_DATA
   for (size_t i = 0; i < kNormalizationRules_size; ++i) {
-    const auto *blob = &kNormalizationRules_blob[i];
+    const auto* blob = &kNormalizationRules_blob[i];
     if (blob->name == name) {
       output->assign(blob->data, blob->size);
       return IsValidNormalizerData(*output);
@@ -322,17 +342,17 @@ util::Status Builder::GetPrecompiledCharsMap(absl::string_view name,
   }
 #endif  // DISABLE_EMBEDDED_DATA
 
-  return util::StatusBuilder(util::StatusCode::kNotFound, GTL_LOC)
+  return util::StatusBuilder(absl::StatusCode::kNotFound, GTL_LOC)
          << "No precompiled charsmap is found: " << name << " in "
          << GetDataDir();
 }
 
 #ifdef ENABLE_NFKC_COMPILE
 namespace {
-util::Status BuildMapInternal(
-    Builder::CharsMap *chars_map,
-    std::function<Builder::Chars(const Builder::Chars &)> composer,
-    std::function<Builder::Chars(const Builder::Chars &)> decomposer) {
+absl::Status BuildMapInternal(
+    Builder::CharsMap* chars_map,
+    std::function<Builder::Chars(const Builder::Chars&)> composer,
+    std::function<Builder::Chars(const Builder::Chars&)> decomposer) {
 #ifdef ENABLE_NFKC_COMPILE
   // Set of fully NFKD decomposed characters.
   std::set<Builder::Chars> nfkd_decomposed;
@@ -362,7 +382,7 @@ util::Status BuildMapInternal(
     }
   }
 
-  for (const auto &nfkd : nfkd_decomposed) {
+  for (const auto& nfkd : nfkd_decomposed) {
     const auto nfkc = composer(nfkd);
     // This case is already covered by single-character to NFKC mapping.
     if (nfkc == nfkd) {
@@ -370,7 +390,7 @@ util::Status BuildMapInternal(
     }
     // Expand all possible sequences which are normalized into the same
     // `nfkd`.
-    for (const auto &nfkd_orig : ExpandUnnormalized(nfkd, norm2orig)) {
+    for (const auto& nfkd_orig : ExpandUnnormalized(nfkd, norm2orig)) {
       if (nfkd_orig != nfkc) {
         nfkc_map[nfkd_orig] = nfkc;
       }
@@ -380,13 +400,13 @@ util::Status BuildMapInternal(
   RETURN_IF_ERROR(Builder::RemoveRedundantMap(&nfkc_map));
   *chars_map = std::move(nfkc_map);
 #endif  // ENABLE_NFKC_COMPILE
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 }  // namespace
 #endif  // ENABLE_NFKC_COMPILE
 
 // static
-util::Status Builder::BuildNFKCMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNFKCMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   LOG(INFO) << "Running BuildNFKCMap";
   BuildMapInternal(chars_map, ToNFKC, ToNFKD);
@@ -394,21 +414,21 @@ util::Status Builder::BuildNFKCMap(CharsMap *chars_map) {
   LOG(ERROR) << kCompileError;
 #endif
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::BuildNFCMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNFCMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   LOG(INFO) << "Running BuildNFCMap";
   BuildMapInternal(chars_map, ToNFC, ToNFD);
 #else
   LOG(ERROR) << kCompileError;
 #endif
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
-util::Status Builder::BuildNmtNFKCMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNmtNFKCMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   LOG(INFO) << "Running BuildNmtNFKCMap";
 
@@ -422,13 +442,13 @@ util::Status Builder::BuildNmtNFKCMap(CharsMap *chars_map) {
   LOG(ERROR) << kCompileError;
 #endif
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::MergeUnicodeCaseFoldMap(Builder::CharsMap *chars_map) {
+absl::Status Builder::MergeUnicodeCaseFoldMap(Builder::CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
-  for (auto &c : *chars_map) {
+  for (auto& c : *chars_map) {
     std::vector<char32> trg;
     trg.reserve(c.second.size());
     for (char32 c : c.second) trg.push_back(u_foldCase(c, U_FOLD_CASE_DEFAULT));
@@ -448,11 +468,11 @@ util::Status Builder::MergeUnicodeCaseFoldMap(Builder::CharsMap *chars_map) {
   RETURN_IF_ERROR(RemoveRedundantMap(chars_map));
 #endif
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::MergeNmtMap(Builder::CharsMap *chars_map) {
+absl::Status Builder::MergeNmtMap(Builder::CharsMap* chars_map) {
   // Other code points considered as whitespace.
   (*chars_map)[{0x0009}] = {0x20};  // TAB
   (*chars_map)[{0x000A}] = {0x20};  // LINE FEED
@@ -508,11 +528,11 @@ util::Status Builder::MergeNmtMap(Builder::CharsMap *chars_map) {
   // and HALF_WIDTH TILDE are used differently in Japanese.
   (*chars_map).erase({0xFF5E});
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::BuildNFKC_CFMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNFKC_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfkc_map;
   RETURN_IF_ERROR(Builder::BuildNFKCMap(&nfkc_map));
@@ -522,11 +542,11 @@ util::Status Builder::BuildNFKC_CFMap(CharsMap *chars_map) {
   LOG(ERROR) << kCompileError;
 #endif
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 //  static
-util::Status Builder::BuildNmtNFKC_CFMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNmtNFKC_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfkc_map;
   RETURN_IF_ERROR(Builder::BuildNmtNFKCMap(&nfkc_map));
@@ -536,11 +556,11 @@ util::Status Builder::BuildNmtNFKC_CFMap(CharsMap *chars_map) {
   LOG(ERROR) << kCompileError;
 #endif
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::BuildNFKDMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNFKDMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   constexpr int kMaxUnicode = 0x10FFFF;
   for (char32 cp = 1; cp <= kMaxUnicode; ++cp) {
@@ -555,11 +575,11 @@ util::Status Builder::BuildNFKDMap(CharsMap *chars_map) {
 #else
   LOG(ERROR) << kCompileError;
 #endif
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::BuildNFDMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNFDMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   constexpr int kMaxUnicode = 0x10FFFF;
   for (char32 cp = 1; cp <= kMaxUnicode; ++cp) {
@@ -575,11 +595,11 @@ util::Status Builder::BuildNFDMap(CharsMap *chars_map) {
 #else
   LOG(ERROR) << kCompileError;
 #endif
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::BuildNFKD_CFMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNFKD_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfkd_map;
   RETURN_IF_ERROR(Builder::BuildNFKDMap(&nfkd_map));
@@ -588,11 +608,11 @@ util::Status Builder::BuildNFKD_CFMap(CharsMap *chars_map) {
 #else
   LOG(ERROR) << kCompileError;
 #endif
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::BuildNFC_CFMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNFC_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfc_map;
   RETURN_IF_ERROR(Builder::BuildNFKDMap(&nfc_map));
@@ -601,11 +621,11 @@ util::Status Builder::BuildNFC_CFMap(CharsMap *chars_map) {
 #else
   LOG(ERROR) << kCompileError;
 #endif
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::BuildNFD_CFMap(CharsMap *chars_map) {
+absl::Status Builder::BuildNFD_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfd_map;
   RETURN_IF_ERROR(Builder::BuildNFDMap(&nfd_map));
@@ -614,12 +634,12 @@ util::Status Builder::BuildNFD_CFMap(CharsMap *chars_map) {
 #else
   LOG(ERROR) << kCompileError;
 #endif
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::LoadCharsMap(absl::string_view filename,
-                                   CharsMap *chars_map) {
+absl::Status Builder::LoadCharsMap(absl::string_view filename,
+                                   CharsMap* chars_map) {
   LOG(INFO) << "Loading mapping file: " << filename.data();
   RET_CHECK(chars_map);
 
@@ -649,16 +669,16 @@ util::Status Builder::LoadCharsMap(absl::string_view filename,
     (*chars_map)[src] = trg;
   }
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::SaveCharsMap(absl::string_view filename,
-                                   const Builder::CharsMap &chars_map) {
+absl::Status Builder::SaveCharsMap(absl::string_view filename,
+                                   const Builder::CharsMap& chars_map) {
   auto output = filesystem::NewWritableFile(filename);
   RETURN_IF_ERROR(output->status());
 
-  for (const auto &c : chars_map) {
+  for (const auto& c : chars_map) {
     std::vector<std::string> src, trg;
     string_util::UnicodeText srcu, trgu;
     for (char32 v : c.first) {
@@ -679,16 +699,16 @@ util::Status Builder::SaveCharsMap(absl::string_view filename,
     output->WriteLine(line);
   }
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 
 // static
-util::Status Builder::RemoveRedundantMap(CharsMap *chars_map) {
+absl::Status Builder::RemoveRedundantMap(CharsMap* chars_map) {
   RET_CHECK(chars_map);
 
   CharsMap new_chars_map;
   size_t max_len = 0;
-  for (const auto &p : *chars_map) {
+  for (const auto& p : *chars_map) {
     max_len = std::max(p.first.size(), max_len);
     if (p.first.size() == 1) {
       new_chars_map.insert(p);
@@ -699,7 +719,7 @@ util::Status Builder::RemoveRedundantMap(CharsMap *chars_map) {
   // Checks whether the rules with size of `len` can be normalized by
   // the rules with size of [1 .. len - 1].
   for (size_t len = 2; len <= max_len; ++len) {
-    for (const auto &p : *chars_map) {
+    for (const auto& p : *chars_map) {
       if (p.first.size() == len &&
           p.second != Normalize(new_chars_map, p.first, len - 1)) {
         new_chars_map.insert(p);
@@ -708,13 +728,13 @@ util::Status Builder::RemoveRedundantMap(CharsMap *chars_map) {
   }
 
   // Verify all characters in `chars_map` are normalized by `new_chars_map`.
-  for (const auto &p : *chars_map) {
+  for (const auto& p : *chars_map) {
     RET_CHECK_EQ(p.second, Normalize(new_chars_map, p.first, max_len));
   }
 
   *chars_map = std::move(new_chars_map);
 
-  return util::OkStatus();
+  return absl::OkStatus();
 }
 }  // namespace normalizer
 }  // namespace sentencepiece

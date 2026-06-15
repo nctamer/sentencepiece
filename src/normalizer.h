@@ -24,6 +24,7 @@
 #include "common.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
+#include "third_party/absl/status/status.h"
 #include "third_party/absl/strings/string_view.h"
 #include "third_party/darts_clone/darts.h"
 
@@ -35,13 +36,13 @@ namespace normalizer {
 class PrefixMatcher {
  public:
   // Initializes the PrefixMatcher with `dic`.
-  explicit PrefixMatcher(const std::set<absl::string_view> &dic);
+  explicit PrefixMatcher(const std::set<absl::string_view>& dic);
 
   // Finds the longest string in dic, which is a prefix of `w`.
   // Returns the UTF8 byte length of matched string.
   // `found` is set if a prefix match exists.
   // If no entry is found, consumes one Unicode character.
-  int PrefixMatch(absl::string_view w, bool *found = nullptr) const;
+  int PrefixMatch(absl::string_view w, bool* found = nullptr) const;
 
   // Replaces entries in `w` with `out`.
   std::string GlobalReplace(absl::string_view w, absl::string_view out) const;
@@ -64,17 +65,17 @@ class Normalizer {
  public:
   // Instantiates Normalizer with |spec|.
   // |spec| should not be deleted until Normalizer is destroyed.
-  explicit Normalizer(const NormalizerSpec &spec);
-  Normalizer(const NormalizerSpec &spec, const TrainerSpec &trainer_Spec);
+  explicit Normalizer(const NormalizerSpec& spec);
+  Normalizer(const NormalizerSpec& spec, const TrainerSpec& trainer_Spec);
   virtual ~Normalizer();
 
-  virtual void SetPrefixMatcher(const PrefixMatcher *matcher) {
+  virtual void SetPrefixMatcher(const PrefixMatcher* matcher) {
     matcher_ = matcher;
   }
 
   // Returns Status.
   // Normalizes function is valid only when status is OK.
-  virtual util::Status status() const { return status_; }
+  virtual absl::Status status() const { return status_; }
 
   // Normalizes a plain utf8 string into an internal representation for
   // Sentencepiece model. |norm_to_orig| stores the byte-alignment from
@@ -85,9 +86,9 @@ class Normalizer {
   // - Adds a prefix space.
   // - Replaces a space with a meta symbol.
   // - Removing heading, tailing and other redundant spaces.
-  virtual util::Status Normalize(absl::string_view input,
-                                 std::string *normalized,
-                                 std::vector<size_t> *norm_to_orig) const;
+  virtual absl::Status Normalize(absl::string_view input,
+                                 std::string* normalized,
+                                 std::vector<size_t>* norm_to_orig) const;
 
   // Returns a normalized string without alignments.
   // This function is used in sentencepiece training.
@@ -97,6 +98,7 @@ class Normalizer {
 
  private:
   FRIEND_TEST(NormalizerTest, EncodeDecodePrecompiledCharsMapTest);
+  FRIEND_TEST(NormalizerTest, ManySharedPrefixesTest);
 
   void Init();
 
@@ -120,10 +122,10 @@ class Normalizer {
                                                absl::string_view normalized);
 
   // Decodes blob into trie_blob and normalized string.
-  static util::Status DecodePrecompiledCharsMap(absl::string_view blob,
-                                                absl::string_view *trie_blob,
-                                                absl::string_view *normalized,
-                                                std::string *buffer);
+  static absl::Status DecodePrecompiledCharsMap(absl::string_view blob,
+                                                absl::string_view* trie_blob,
+                                                absl::string_view* normalized,
+                                                std::string* buffer);
 
   // Maximum size of the return value of Trie, which corresponds
   // to the maximum size of shared common prefix in the chars map.
@@ -137,10 +139,10 @@ class Normalizer {
   absl::string_view normalized_;
 
   // Spec for normalization.
-  const NormalizerSpec *spec_;
+  const NormalizerSpec* spec_;
 
   // Prefix matcher;
-  const PrefixMatcher *matcher_ = nullptr;
+  const PrefixMatcher* matcher_ = nullptr;
 
   // Split hello world into "hello_" and "world_" instead of
   // "_hello" and "_world".
@@ -150,7 +152,7 @@ class Normalizer {
   std::string precompiled_charsmap_buffer_;
 
   // Normalizer's status.
-  util::Status status_;
+  absl::Status status_;
 };
 }  // namespace normalizer
 }  // namespace sentencepiece

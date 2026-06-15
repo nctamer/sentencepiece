@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.!
 
+list(APPEND SPM_LIBS absl::status)
 list(APPEND SPM_LIBS absl::strings)
 list(APPEND SPM_LIBS absl::flags)
 list(APPEND SPM_LIBS absl::flags_parse)
@@ -98,7 +99,6 @@ set(SPM_SRCS
   unigram_model.h
   bpe_model.cc
   char_model.cc
-  error.cc
   filesystem.cc
   init.cc
   model_factory.cc
@@ -221,8 +221,8 @@ if (SPM_ENABLE_SHARED)
   add_library(sentencepiece SHARED ${SPM_SRCS})
   add_library(sentencepiece_train SHARED ${SPM_TRAIN_SRCS})
   if (ANDROID)
-    target_link_libraries(sentencepiece log)
-    target_link_libraries(sentencepiece_train log)
+    target_link_libraries(sentencepiece PRIVATE log)
+    target_link_libraries(sentencepiece_train PRIVATE log)
   endif()
 endif()
 
@@ -233,8 +233,8 @@ target_link_libraries(sentencepiece-static INTERFACE ${SPM_LIBS})
 target_link_libraries(sentencepiece_train-static INTERFACE sentencepiece-static ${SPM_LIBS})
 
 if (SPM_ENABLE_SHARED)
-  target_link_libraries(sentencepiece ${SPM_LIBS})
-  target_link_libraries(sentencepiece_train ${SPM_LIBS} sentencepiece)
+  target_link_libraries(sentencepiece PUBLIC ${SPM_LIBS})
+  target_link_libraries(sentencepiece_train PUBLIC ${SPM_LIBS} sentencepiece)
   set(SPM_INSTALLTARGETS sentencepiece sentencepiece_train sentencepiece-static sentencepiece_train-static)
   set_target_properties(sentencepiece sentencepiece_train PROPERTIES SOVERSION 0 VERSION 0.0.0)
   set_target_properties(sentencepiece PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS YES)
@@ -301,7 +301,34 @@ install(TARGETS ${SPM_INSTALLTARGETS}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
-install(FILES sentencepiece_trainer.h sentencepiece_processor.h
+# Generate modified headers for installation
+set(GENERATED_HEADERS_DIR "${CMAKE_CURRENT_BINARY_DIR}/installed_headers")
+set(MODIFIER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/modify_headers.cmake")
+
+add_custom_command(
+  OUTPUT "${GENERATED_HEADERS_DIR}/sentencepiece_processor.h"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/sentencepiece_processor.h" "${MODIFIER_SCRIPT}"
+  COMMAND ${CMAKE_COMMAND} -DINPUT_FILE="${CMAKE_CURRENT_SOURCE_DIR}/sentencepiece_processor.h"
+                           -DOUTPUT_FILE="${GENERATED_HEADERS_DIR}/sentencepiece_processor.h"
+                           -P "${MODIFIER_SCRIPT}"
+  COMMENT "Generating modified sentencepiece_processor.h for installation"
+)
+
+add_custom_command(
+  OUTPUT "${GENERATED_HEADERS_DIR}/sentencepiece_trainer.h"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/sentencepiece_trainer.h" "${MODIFIER_SCRIPT}"
+  COMMAND ${CMAKE_COMMAND} -DINPUT_FILE="${CMAKE_CURRENT_SOURCE_DIR}/sentencepiece_trainer.h"
+                           -DOUTPUT_FILE="${GENERATED_HEADERS_DIR}/sentencepiece_trainer.h"
+                           -P "${MODIFIER_SCRIPT}"
+  COMMENT "Generating modified sentencepiece_trainer.h for installation"
+)
+
+add_custom_target(generate_installed_headers ALL
+  DEPENDS "${GENERATED_HEADERS_DIR}/sentencepiece_processor.h"
+          "${GENERATED_HEADERS_DIR}/sentencepiece_trainer.h"
+)
+
+install(FILES "${GENERATED_HEADERS_DIR}/sentencepiece_trainer.h" "${GENERATED_HEADERS_DIR}/sentencepiece_processor.h"
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if (NOT SPM_PROTOBUF_PROVIDER STREQUAL "internal")
   install(FILES ${SPM_PROTO_HDRS} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

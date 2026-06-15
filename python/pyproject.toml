@@ -44,7 +44,7 @@ testpaths = ["test"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-sentencepiece = ["*.bin"]
+sentencepiece = ["*.bin", "*.pyi", "py.typed"]
 
 [tool.cibuildwheel]
 test-requires = ["pytest"]

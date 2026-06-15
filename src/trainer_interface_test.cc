@@ -20,6 +20,7 @@
 #include "testharness.h"
 #include "third_party/absl/strings/str_cat.h"
 #include "third_party/absl/strings/str_format.h"
+#include "third_party/absl/strings/string_view.h"
 #include "util.h"
 
 namespace sentencepiece {
@@ -45,7 +46,7 @@ TEST(TrainerInterfaceTest, IsValidSentencePieceTest) {
   EXPECT_TRUE(trainer.Train().ok());
 
   auto IsValid = [&trainer_spec, &normalizer_spec,
-                  &denormalizer_spec](const std::string &str) {
+                  &denormalizer_spec](const std::string& str) {
     TrainerInterface trainer(trainer_spec, normalizer_spec, denormalizer_spec);
     const string_util::UnicodeText text = string_util::UTF8ToUnicodeText(str);
     return trainer.IsValidSentencePiece(text);
@@ -435,7 +436,7 @@ TEST(TrainerInterfaceTest, BytePiecesTest) {
 
   // Byte pieces come after control symbols and user-defined symbols.
   for (int i = 0; i < 256; ++i) {
-    const auto &piece = trainer.meta_pieces_[i + 7];
+    const auto& piece = trainer.meta_pieces_[i + 7];
     EXPECT_EQ(absl::StrFormat("<0x%02X>", i), piece.first);
     EXPECT_EQ(ModelProto::SentencePiece::BYTE, piece.second);
   }

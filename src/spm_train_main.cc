@@ -22,6 +22,7 @@
 #include "third_party/absl/strings/ascii.h"
 #include "third_party/absl/strings/str_join.h"
 #include "third_party/absl/strings/str_split.h"
+#include "third_party/absl/strings/string_view.h"
 #include "util.h"
 
 using sentencepiece::NormalizerSpec;
@@ -172,7 +173,7 @@ ABSL_FLAG(std::uint64_t, differential_privacy_clipping_threshold, 0,
           "Threshold for"
           " clipping the counts for DP");
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
   sentencepiece::ScopedResourceDestructor cleaner;
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
 
@@ -212,7 +213,7 @@ int main(int argc, char *argv[]) {
 
 #define SetRepeatedTrainerSpecFromFlag(name)                                \
   if (!absl::GetFlag(FLAGS_##name).empty()) {                               \
-    for (const auto &v :                                                    \
+    for (const auto& v :                                                    \
          sentencepiece::util::StrSplitAsCSV(absl::GetFlag(FLAGS_##name))) { \
       trainer_spec.add_##name(v);                                           \
     }                                                                       \
@@ -220,7 +221,7 @@ int main(int argc, char *argv[]) {
 
 #define SetRepeatedTrainerSpecFromFile(name)                               \
   if (!absl::GetFlag(FLAGS_##name##_file).empty()) {                       \
-    for (const auto &v : load_lines(absl::GetFlag(FLAGS_##name##_file))) { \
+    for (const auto& v : load_lines(absl::GetFlag(FLAGS_##name##_file))) { \
       trainer_spec.add_##name(v);                                          \
     }                                                                      \
   }

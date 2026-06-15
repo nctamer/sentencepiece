@@ -26,6 +26,7 @@
 #include "third_party/absl/flags/flag.h"
 #include "third_party/absl/strings/str_cat.h"
 #include "third_party/absl/strings/str_join.h"
+#include "third_party/absl/strings/string_view.h"
 #include "trainer_interface.h"
 
 ABSL_FLAG(std::string, model, "", "model file name");
@@ -52,7 +53,7 @@ ABSL_FLAG(int32_t, vocabulary_threshold, 0,
 ABSL_FLAG(bool, generate_vocabulary, false,
           "Generates vocabulary file instead of segmentation");
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
   sentencepiece::ScopedResourceDestructor cleaner;
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
   std::vector<std::string> rest_args;
@@ -104,7 +105,7 @@ int main(int argc, char *argv[]) {
   if (absl::GetFlag(FLAGS_generate_vocabulary)) {
     process = [&](absl::string_view line) {
       QCHECK_OK(sp.Encode(line, &spt));
-      for (const auto &piece : spt.pieces()) {
+      for (const auto& piece : spt.pieces()) {
         if (!sp.IsUnknown(piece.id()) && !sp.IsControl(piece.id()))
           vocab[piece.piece()]++;
       }
@@ -138,14 +139,14 @@ int main(int argc, char *argv[]) {
   } else if (absl::GetFlag(FLAGS_output_format) == "nbest_piece") {
     process = [&](absl::string_view line) {
       QCHECK_OK(sp.NBestEncode(line, nbest_size, &nbest_sps));
-      for (const auto &result : nbest_sps) {
+      for (const auto& result : nbest_sps) {
         output->WriteLine(absl::StrJoin(result, " "));
       }
     };
   } else if (absl::GetFlag(FLAGS_output_format) == "nbest_id") {
     process = [&](absl::string_view line) {
       QCHECK_OK(sp.NBestEncode(line, nbest_size, &nbest_ids));
-      for (const auto &result : nbest_ids) {
+      for (const auto& result : nbest_ids) {
         output->WriteLine(absl::StrJoin(result, " "));
       }
     };
@@ -158,7 +159,7 @@ int main(int argc, char *argv[]) {
                << absl::GetFlag(FLAGS_output_format);
   }
 
-  for (const auto &filename : rest_args) {
+  for (const auto& filename : rest_args) {
     auto input = sentencepiece::filesystem::NewReadableFile(filename);
     QCHECK_OK(input->status());
     while (input->ReadLine(&line)) {
@@ -167,7 +168,7 @@ int main(int argc, char *argv[]) {
   }
 
   if (absl::GetFlag(FLAGS_generate_vocabulary)) {
-    for (const auto &it : sentencepiece::Sorted(vocab)) {
+    for (const auto& it : sentencepiece::Sorted(vocab)) {
       output->WriteLine(it.first + "\t" +
                         sentencepiece::string_util::SimpleItoa(it.second));
     }

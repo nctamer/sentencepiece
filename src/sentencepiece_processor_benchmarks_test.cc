@@ -25,6 +25,7 @@
 #include "testharness.h"
 #include "third_party/absl/log/check.h"
 #include "third_party/absl/log/flags.h"
+#include "third_party/absl/status/status.h"
 #include "third_party/absl/strings/str_split.h"
 #include "third_party/absl/strings/string_view.h"
 #include "third_party/benchmark/include/benchmark/benchmark.h"
@@ -81,7 +82,7 @@ void BM_Encode(benchmark::State& state, absl::string_view model_filename,
   for (auto s : state) {
     benchmark::DoNotOptimize(input);
 
-    util::Status result;
+    absl::Status result;
     if constexpr (kMode == BenchmarkMode::kParallel) {
       result = processor.ParallelEncode(input, kChunkLength, thread_pool, &ids);
     } else {
@@ -112,7 +113,7 @@ void BM_Encode_ShortLines(benchmark::State& state,
   std::string input = LoadInput(input_fullpath);
   std::vector<absl::string_view> lines = absl::StrSplit(input, '\n');
   std::vector<int> ids;
-  sentencepiece::util::Status result;
+  absl::Status result;
   for (auto s : state) {
     benchmark::DoNotOptimize(lines);
     for (const auto& line : lines) {

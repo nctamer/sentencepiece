@@ -69,17 +69,32 @@ def get_cflags_and_libs(root):
   return cflags, libs
 
 
+def find_absl_include(is_msvc=True):
+  paths = []
+  if os.path.exists(os.path.join('..', 'third_party', 'abseil-cpp')):
+    paths.append(os.path.join('..', 'third_party', 'abseil-cpp'))
+    paths.append('..')
+  if os.path.exists(os.path.join('.', 'sentencepiece', 'third_party', 'abseil-cpp')):
+    paths.append(os.path.join('.', 'sentencepiece', 'third_party', 'abseil-cpp'))
+    paths.append(os.path.join('.', 'sentencepiece'))
+
+  prefix = '/I' if is_msvc else '-I'
+  return [prefix + os.path.normpath(p) for p in paths]
+
+
 class build_ext_unix(_build_ext):
   """Override build_extension to run cmake."""
 
   def build_extension(self, ext):
     cflags, libs = get_cflags_and_libs('../build/root')
     abseil_libs = find_abseil_lib('../build/third_party')
+    cflags.extend(find_absl_include(is_msvc=False))
 
     if len(libs) == 0:
       subprocess.check_call(['./build_bundled.sh', __version__])
       cflags, libs = get_cflags_and_libs('./build/root')
       abseil_libs = find_abseil_lib('./build/third_party')
+      cflags.extend(find_absl_include(is_msvc=False))
 
     # Fix compile on some versions of Mac OSX
     # See: https://github.com/neulab/xnmt/issues/199
@@ -180,6 +195,8 @@ class build_ext_win(_build_ext):
           '.\\build\\root\\lib\\sentencepiece_train.lib',
       ]
       libs.extend(find_abseil_lib('.\\build\\third_party'))
+
+    cflags.extend(find_absl_include(is_msvc=True))
 
     # on Windows, GIL flag is not set automatically.
     # https://docs.python.org/3/howto/free-threading-python.html

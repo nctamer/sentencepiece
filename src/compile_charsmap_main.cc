@@ -23,6 +23,7 @@
 #include "init.h"
 #include "sentencepiece_processor.h"
 #include "third_party/absl/flags/flag.h"
+#include "third_party/absl/status/status.h"
 #include "third_party/absl/strings/str_cat.h"
 #include "third_party/absl/strings/string_view.h"
 
@@ -37,8 +38,8 @@ namespace sentencepiece {
 namespace {
 
 std::string ToHexUInt64Array(
-    const std::vector<std::pair<std::string, std::string>> &data,
-    std::vector<size_t> *offset) {
+    const std::vector<std::pair<std::string, std::string>>& data,
+    std::vector<size_t>* offset) {
   std::stringstream os;
   os.setf(std::ios_base::hex, std::ios_base::basefield);
   os.setf(std::ios_base::uppercase);
@@ -47,14 +48,14 @@ std::string ToHexUInt64Array(
   os.unsetf(std::ios_base::showbase);
 
   size_t num = 0;
-  for (const auto &p : data) {
-    const char *begin = p.second.data();
-    const char *end = p.second.data() + p.second.size();
+  for (const auto& p : data) {
+    const char* begin = p.second.data();
+    const char* end = p.second.data() + p.second.size();
 
     offset->push_back(num);
     while (begin < end) {
       unsigned long long int n = 0;
-      unsigned char *buf = reinterpret_cast<unsigned char *>(&n);
+      unsigned char* buf = reinterpret_cast<unsigned char*>(&n);
       const size_t size = std::min<size_t>(end - begin, sizeof(n));
       for (size_t i = 0; i < size; ++i) {
         buf[i] = static_cast<unsigned char>(begin[i]);
@@ -71,8 +72,8 @@ std::string ToHexUInt64Array(
 }
 
 std::string ToHexData(absl::string_view data) {
-  const char *begin = data.data();
-  const char *end = data.data() + data.size();
+  const char* begin = data.data();
+  const char* end = data.data() + data.size();
   constexpr absl::string_view kHex = "0123456789ABCDEF";
   constexpr size_t kNumOfBytesOnOneLine = 20;
 
@@ -101,7 +102,7 @@ std::string ToHexData(absl::string_view data) {
 }
 
 std::string MakeHeader(
-    const std::vector<std::pair<std::string, std::string>> &data) {
+    const std::vector<std::pair<std::string, std::string>>& data) {
   constexpr char kHeader[] =
       R"(#ifndef NORMALIZATION_RULE_H_
 #define NORMALIZATION_RULE_H_
@@ -159,13 +160,12 @@ struct BinaryBlob {
 }  // namespace
 }  // namespace sentencepiece
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   sentencepiece::ScopedResourceDestructor cleaner;
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
 
-  const std::vector<std::pair<
-      std::string,
-      std::function<sentencepiece::util::Status(Builder::CharsMap *)>>>
+  const std::vector<
+      std::pair<std::string, std::function<absl::Status(Builder::CharsMap*)>>>
       kRuleList = {{"nfkc", Builder::BuildNFKCMap},
                    {"nmt_nfkc", Builder::BuildNmtNFKCMap},
                    {"nfkc_cf", Builder::BuildNFKC_CFMap},
@@ -178,7 +178,7 @@ int main(int argc, char **argv) {
                    {"nfd_cf", Builder::BuildNFD_CFMap}};
 
   std::vector<std::pair<std::string, std::string>> data;
-  for (const auto &[name, func] : kRuleList) {
+  for (const auto& [name, func] : kRuleList) {
     Builder::CharsMap normalized_map;
     QCHECK_OK(func(&normalized_map));
 
@@ -208,7 +208,7 @@ int main(int argc, char **argv) {
   }
 
   if (absl::GetFlag(FLAGS_output_precompiled_data)) {
-    for (const auto &[name, index] : data) {
+    for (const auto& [name, index] : data) {
       const auto filename = absl::StrCat(name, ".bin");
       auto output = sentencepiece::filesystem::NewWritableFile(
           filename, true /* is_binary */);

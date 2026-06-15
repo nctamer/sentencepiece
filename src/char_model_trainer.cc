@@ -17,12 +17,13 @@
 #include <cmath>
 
 #include "char_model.h"
+#include "third_party/absl/status/status.h"
 #include "util.h"
 
 namespace sentencepiece {
 namespace character {
 
-util::Status Trainer::Train() {
+absl::Status Trainer::Train() {
   RETURN_IF_ERROR(status());
 
   RET_CHECK(normalizer_spec_.escape_whitespaces());
@@ -34,14 +35,14 @@ util::Status Trainer::Train() {
   RET_CHECK_GE(vocab_size, 0);
 
   uint64_t sum = 0;
-  for (const auto &it : required_chars_) {
+  for (const auto& it : required_chars_) {
     sum += it.second;
   }
 
   const auto logsum = std::log(static_cast<float>(sum));
 
   RET_CHECK(final_pieces_.empty());
-  for (const auto &it : Sorted(required_chars_)) {
+  for (const auto& it : Sorted(required_chars_)) {
     if (!trainer_spec_.use_all_vocab() &&
         final_pieces_.size() == static_cast<size_t>(vocab_size)) {
       break;

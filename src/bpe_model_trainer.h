@@ -17,12 +17,14 @@
 
 #include <cstdint>
 #include <limits>
+#include <queue>
 #include <string>
 #include <vector>
 
 #include "sentencepiece_model.pb.h"
 #include "third_party/absl/container/btree_set.h"
 #include "third_party/absl/container/flat_hash_map.h"
+#include "third_party/absl/status/status.h"
 #include "trainer_interface.h"
 
 namespace sentencepiece {
@@ -31,31 +33,35 @@ namespace bpe {
 // Trainer class for BPE model.
 class Trainer : public TrainerInterface {
  public:
-  Trainer(const TrainerSpec &trainer_spec,
-          const NormalizerSpec &normalizer_spec,
-          const NormalizerSpec &denormalizer_spec)
+  Trainer(const TrainerSpec& trainer_spec,
+          const NormalizerSpec& normalizer_spec,
+          const NormalizerSpec& denormalizer_spec)
       : TrainerInterface::TrainerInterface(trainer_spec, normalizer_spec,
                                            denormalizer_spec) {}
 
-  util::Status Train() override;
+  absl::Status Train() override;
 
 #ifdef SPM_NLCODEC_BPE
   // Fast BPE training using nlcodec's max-heap + linked-list algorithm.
   // Based on nlcodec by Thamme Gowda (https://github.com/isi-nlp/nlcodec)
   // "Many-to-English Machine Translation Tools, Data, and Pretrained Models"
   // Gowda et al., ACL 2021. https://arxiv.org/abs/2104.00290v2
-  util::Status TrainFast();
+  absl::Status TrainFast();
 #endif  // SPM_NLCODEC_BPE
 
  private:
   // Symbol represents a character or symbol bigram.
   struct Symbol {
-    const Symbol *left;              // left symbol in bigram
-    const Symbol *right;             // right symbol in bigram
+    const Symbol* left = nullptr;    // left symbol in bigram
+    const Symbol* right = nullptr;   // right symbol in bigram
     string_util::UnicodeText chars;  // all flattend chracter sequence
-    bool is_unk;                     // true if this symbol is unknown.
-    uint64_t fp;                     // fingerprint of this symbol.
-    uint64_t freq;                   // frequency of this symbol.
+    uint64_t fp = 0;                 // fingerprint of this symbol.
+    uint64_t freq = 0;               // frequency of this symbol.
+    bool is_unk = false;             // true if this symbol is unknown.
+    bool active = true;              // true if this symbol is active.
+    bool pending = false;            // true if this symbol is pending push.
+    bool needs_recomputation =
+        true;  // true if this symbol needs recomputation.
 
     // Position list. Use set so that we can keep the order of occurrence.
     // See EncodePos/DecodePos.
@@ -63,7 +69,7 @@ class Trainer : public TrainerInterface {
 
     bool IsBigram() const { return left != nullptr && right != nullptr; }
     std::string ToString() const;
-    Symbol() : left(nullptr), right(nullptr), is_unk(false), fp(0), freq(0) {}
+    Symbol() = default;
   };
 
   struct Position {
@@ -95,13 +101,13 @@ class Trainer : public TrainerInterface {
 
   // Gets unary (character) symbol from the char code |c|.
   // The return value is cached.
-  Symbol *GetCharSymbol(char32 c);
+  Symbol* GetCharSymbol(char32 c);
 
   // Gets symbol pair from left/right symbols. The return value is cached.
-  Symbol *GetPairSymbol(const Symbol *left, const Symbol *right);
+  Symbol* GetPairSymbol(const Symbol* left, const Symbol* right);
 
   // Computes the frequency of |symbol| and update symbol->freq field.
-  void ComputeFreq(Symbol *symbol) const;
+  void ComputeFreq(Symbol* symbol) const;
 
   // Returns the valid index before symbols_[sid][index].
   int GetNextIndex(int sid, int index) const;
@@ -115,25 +121,39 @@ class Trainer : public TrainerInterface {
 
   // Resets the fequency of bigram [symbols_[sid][left] symbols_[sid][right]],
   // if this bigram is not |best|.
-  void ResetFreq(int sid, int left, int right, const Symbol *best);
+  void ResetFreq(int sid, int left, int right, const Symbol* best);
 
-  util::Status AcceptSymbol(Symbol *symbol);
-
-  // Updates |active_symbols_| by copying the top 5% frequent symbols in
-  // symbols_cache_.
-  void UpdateActiveSymbols();
+  absl::Status AcceptSymbol(Symbol* symbol);
 
   // All unique symbols. Key is a fingerprint of Symbol.
-  absl::flat_hash_map<uint64_t, Symbol *> symbols_cache_;
+  absl::flat_hash_map<uint64_t, Symbol*> symbols_cache_;
 
-  // Set of symbols from which we find the best symbol in each iteration.
-  absl::btree_set<Symbol *> active_symbols_;
+  struct QueueEntry {
+    uint64_t freq;
+    Symbol* symbol;
+  };
+
+  struct QueueEntryComparator {
+    bool operator()(const QueueEntry& e1, const QueueEntry& e2) const {
+      if (e1.freq != e2.freq) {
+        return e1.freq < e2.freq;
+      }
+      if (e1.symbol->chars.size() != e2.symbol->chars.size()) {
+        return e1.symbol->chars.size() > e2.symbol->chars.size();
+      }
+      return e1.symbol->chars > e2.symbol->chars;
+    }
+  };
+
+  std::priority_queue<QueueEntry, std::vector<QueueEntry>, QueueEntryComparator>
+      pq_;
+  std::vector<Symbol*> pending_queue_;
 
   // Stores symbols allocated in heap so that we can delete them at onece.
-  std::vector<Symbol *> allocated_;
+  std::vector<Symbol*> allocated_;
 
   // Sentences. symbols_[sid][index] stores a symbol in sentence_[sid][index].
-  std::vector<std::vector<Symbol *>> symbols_;
+  std::vector<std::vector<Symbol*>> symbols_;
 };
 }  // namespace bpe
 }  // namespace sentencepiece
