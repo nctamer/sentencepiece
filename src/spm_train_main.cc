@@ -85,10 +85,6 @@ ABSL_FLAG(bool, split_by_interval, false,
           "split only at whitespace followed by digit or | (intermo interval/barline)");
 ABSL_FLAG(bool, split_by_barline, false,
           "split only at whitespace followed by | (intermo barline only)");
-ABSL_FLAG(int32_t, phase1_merge_budget, 0,
-          "BPE phase 1: merges constrained to within-whitespace");
-ABSL_FLAG(int32_t, phase2_merge_budget, 0,
-          "BPE phase 2: merges constrained to within-interval");
 ABSL_FLAG(std::string, protected_pieces_file, "",
           "unigram: pieces to protect from pruning (one per line)");
 ABSL_FLAG(std::string, pretokenization_delimiter,
@@ -251,10 +247,6 @@ int main(int argc, char* argv[]) {
                             absl::GetFlag(FLAGS_split_by_interval));
   trainer_spec.SetExtension(::sentencepiece::split_by_barline,
                             absl::GetFlag(FLAGS_split_by_barline));
-  trainer_spec.SetExtension(::sentencepiece::phase1_merge_budget,
-                            absl::GetFlag(FLAGS_phase1_merge_budget));
-  trainer_spec.SetExtension(::sentencepiece::phase2_merge_budget,
-                            absl::GetFlag(FLAGS_phase2_merge_budget));
   trainer_spec.SetExtension(::sentencepiece::protected_pieces_file,
                             absl::GetFlag(FLAGS_protected_pieces_file));
   SetTrainerSpecFromFlag(pretokenization_delimiter);

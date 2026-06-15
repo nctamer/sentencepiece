@@ -149,8 +149,6 @@ inline std::string PrintProto(const TrainerSpec& message,
   PRINT_PARAM(split_digits);
   os << "  split_by_interval: " << message.GetExtension(split_by_interval) << "\n";
   os << "  split_by_barline: " << message.GetExtension(split_by_barline) << "\n";
-  os << "  phase1_merge_budget: " << message.GetExtension(phase1_merge_budget) << "\n";
-  os << "  phase2_merge_budget: " << message.GetExtension(phase2_merge_budget) << "\n";
   os << "  protected_pieces_file: " << message.GetExtension(protected_pieces_file) << "\n";
   PRINT_PARAM(pretokenization_delimiter);
   PRINT_PARAM(treat_whitespace_as_suffix);
@@ -243,18 +241,6 @@ absl::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
       return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
              << "cannot parse \"" << value << "\" as bool.";
     message->SetExtension(split_by_barline, v); return absl::OkStatus();
-  }
-  if (name == "phase1_merge_budget") {
-    int32_t v; if (!absl::SimpleAtoi(value, &v))
-      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
-             << "cannot parse \"" << value << "\" as int.";
-    message->SetExtension(phase1_merge_budget, v); return absl::OkStatus();
-  }
-  if (name == "phase2_merge_budget") {
-    int32_t v; if (!absl::SimpleAtoi(value, &v))
-      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
-             << "cannot parse \"" << value << "\" as int.";
-    message->SetExtension(phase2_merge_budget, v); return absl::OkStatus();
   }
   if (name == "protected_pieces_file") {
     message->SetExtension(protected_pieces_file, std::string(value));

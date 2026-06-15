@@ -254,13 +254,12 @@ extend TrainerSpec {
   // When true, split_by_whitespace must be false.
   optional bool split_by_barline = 201 [default = false];
 
-  // Progressive BPE phase budgets (three-stage BPE).
-  // phase1_merge_budget: merges that must respect whitespace boundary.
-  // phase2_merge_budget: merges that must respect interval boundary.
-  // Remaining merges respect barline boundary only.
-  // Requires model_type=BPE and split_by_barline=true.
-  optional int32 phase1_merge_budget = 202 [default = 0];
-  optional int32 phase2_merge_budget = 203 [default = 0];
+  // Field numbers 202/203 were the progressive BPE phase budgets
+  // (phase1_merge_budget / phase2_merge_budget), removed in favor of the
+  // simpler split_by_interval / split_by_barline pretokenization constraints.
+  // Reserved so the numbers are never reused. The checked-in builtin_pb still
+  // carries the (now inert) generated accessors; that is harmless.
+  reserved 202, 203;
 
   // Path to file of pieces to protect from pruning.
   // One piece per line. These pieces are guaranteed to survive EM pruning

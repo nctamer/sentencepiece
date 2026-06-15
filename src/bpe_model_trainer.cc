@@ -291,70 +291,10 @@ absl::Status Trainer::Train() {
     dup.insert(p.first);
   }
 
-  // Progressive constraint: symbols deferred in the current phase. Because the
-  // priority queue cannot skip its top without popping, deferred symbols are
-  // popped out of pq_ and parked in deferred_symbols until the phase advances.
-  // phase_deferred tracks their fingerprints to avoid parking the same symbol
-  // twice (it may be re-pushed via pending_queue_ after later merges).
-  absl::flat_hash_set<uint64_t> phase_deferred;
-  std::vector<Symbol*> deferred_symbols;
-  int current_phase = 0;
-  const int phase1 = trainer_spec_.GetExtension(::sentencepiece::phase1_merge_budget);
-  const int phase2 = trainer_spec_.GetExtension(::sentencepiece::phase2_merge_budget);
-  const bool use_phases = (phase1 > 0 || phase2 > 0);
-
-  auto crosses_phase_boundary = [&](const Symbol* sym, int phase) -> bool {
-    if (phase == 0) {
-      for (size_t i = 1; i < sym->chars.size(); ++i) {
-        if (sym->chars[i] == kWSChar) return true;
-      }
-    } else if (phase == 1) {
-      for (size_t i = 1; i + 1 < sym->chars.size(); ++i) {
-        if (sym->chars[i] == kWSChar) {
-          const char32 next = sym->chars[i + 1];
-          if ((next >= '0' && next <= '9') || next == '|') return true;
-        }
-      }
-    }
-    return false;
-  };
-
-  // Advances to a new phase: clears the deferral set and re-pushes every parked
-  // symbol back into the priority queue so it can be selected again.
-  auto advance_phase = [&](int new_phase) {
-    current_phase = new_phase;
-    phase_deferred.clear();
-    for (Symbol* symbol : deferred_symbols) {
-      if (symbol->active) {
-        ComputeFreq(symbol);
-        pq_.push({symbol->freq, symbol});
-      }
-    }
-    deferred_symbols.clear();
-  };
-
   // Main loop.
   // Note: final_pieces_ may already contain protected pieces, so (unlike
   // upstream) we do not RET_CHECK(final_pieces_.empty()) here.
   while (final_pieces_.size() < static_cast<size_t>(vocab_size)) {
-    // Budget-driven phase transition (forward only): once enough pieces have
-    // been learned, relax the constraint to the next phase. advance_phase()
-    // re-pushes any symbols parked by the previous phase.
-    if (use_phases) {
-      int new_phase = 2;
-      if (static_cast<int>(final_pieces_.size()) < phase1)
-        new_phase = 0;
-      else if (static_cast<int>(final_pieces_.size()) < phase1 + phase2)
-        new_phase = 1;
-      if (new_phase > current_phase) {
-        LOG(INFO) << "Phase transition: " << current_phase << " -> " << new_phase
-                  << " at merge " << final_pieces_.size();
-        advance_phase(new_phase);
-      }
-    }
-
-    // Selects the highest-frequency active symbol from the priority queue,
-    // deferring any symbol that crosses the current phase boundary.
     Symbol* best_symbol = nullptr;
     while (!pq_.empty()) {
       QueueEntry entry = pq_.top();
@@ -373,29 +313,12 @@ absl::Status Trainer::Train() {
         pq_.push({symbol->freq, symbol});
         continue;
       }
-      // Progressive constraint: park symbols that cross the current phase
-      // boundary. They are re-pushed when the phase advances.
-      if (use_phases && crosses_phase_boundary(symbol, current_phase)) {
-        pq_.pop();
-        if (phase_deferred.insert(symbol->fp).second) {
-          deferred_symbols.push_back(symbol);
-        }
-        continue;
-      }
       best_symbol = symbol;
       pq_.pop();
       break;
     }
 
     if (best_symbol == nullptr) {
-      // Nothing selectable in the current phase: advance (re-pushing parked
-      // symbols) and retry before giving up.
-      if (use_phases && current_phase < 2) {
-        LOG(INFO) << "No valid symbol in phase " << current_phase << " at merge "
-                  << final_pieces_.size() << ", advancing phase";
-        advance_phase(current_phase + 1);
-        continue;
-      }
       LOG(WARNING) << "No valid symbol found";
       break;
     }
