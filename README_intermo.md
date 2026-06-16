@@ -43,6 +43,48 @@ Phase 3 (BarPiece, protect stage2_pieces.txt)
 
 ---
 
+## Corpus format: deduplicate to TSV (do NOT sample)
+
+**Always feed the trainer a deduplicated TSV corpus**, for both BPE and unigram.
+Music moments repeat heavily (~5–8×), so writing one moment per line wastes the
+whole pipeline on duplicates: a 34M-line corpus (713M chars) makes the unigram
+suffix array explode to ~635M nodes and — worse — makes EM re-scan all 34M lines
+on every one of its ~40 sub-iterations (hours).
+
+Instead, count unique moments and emit `<moment>\t<count>` (one tab per line,
+`count` an integer ≥ 1), then pass `--input_format=tsv`. This is **lossless**:
+both BPE pair-counts and unigram EM weight by the `count` field, so the learned
+vocabulary is identical to the raw repeated corpus — just ~5× fewer rows
+(e.g. 34M → 6.65M), unigram suffix nodes 635M → 306M, and EM ~5× faster. The
+same TSV corpus is reused for all three phases.
+
+Build it with a few lines of Python:
+```python
+from collections import Counter
+import re
+def split_moments(t):  # one moment per element; strip timestamps first if any
+    segs = (s.strip().replace('\t', ' ').replace('\r', ' ')
+            for s in re.split(r'\s+(?=[|\d])', t))
+    return [s for s in segs if s]                    # no tab/CR inside a moment
+counts = Counter()
+for line in open('raw_moments_or_jsonl'):            # accumulate over your source
+    counts.update(split_moments(line))
+with open('corpus.tsv', 'w') as f:
+    for moment, c in counts.items():
+        f.write(f"{moment}\t{c}\n")
+```
+
+> **Do not use `--input_sentence_size` / `--shuffle_input_sentence` to tame a
+> large corpus** — that randomly *discards* data (and silently changes the
+> model). Dedup keeps every moment and its true frequency.
+>
+> Also keep lines at the **moment level** (split at `\s+(?=[|\d])`), not bar- or
+> piece-level. Longer lines re-inflate the unigram suffix array because
+> `split_by_unicode_script=false` and `split_by_number=false` disable the
+> candidate pruning that keeps standard NLP tokenization fast on long sentences.
+
+---
+
 ## BPE — All Three Phases
 
 ### Phase 1: EventPiece (BPE)
@@ -50,7 +92,8 @@ Phase 3 (BarPiece, protect stage2_pieces.txt)
 ```bash
 spm_train \
   --model_type=bpe \
-  --input=corpus.txt \
+  --input=corpus.tsv \
+  --input_format=tsv \
   --model_prefix=bpe_stage1 \
   --vocab_size=500 \
   --split_by_whitespace=true \
@@ -70,7 +113,8 @@ awk -F'\t' 'NR>3 {print $1}' bpe_stage1.vocab > stage1_pieces.txt
 ```bash
 spm_train \
   --model_type=bpe \
-  --input=corpus.txt \
+  --input=corpus.tsv \
+  --input_format=tsv \
   --model_prefix=bpe_stage2 \
   --vocab_size=3000 \
   --split_by_whitespace=false \
@@ -92,7 +136,8 @@ awk -F'\t' 'NR>3 {print $1}' bpe_stage2.vocab > stage2_pieces.txt
 ```bash
 spm_train \
   --model_type=bpe \
-  --input=corpus.txt \
+  --input=corpus.tsv \
+  --input_format=tsv \
   --model_prefix=bpe_stage3 \
   --vocab_size=4096 \
   --split_by_whitespace=false \
@@ -113,7 +158,8 @@ spm_train \
 ```bash
 spm_train \
   --model_type=unigram \
-  --input=corpus.txt \
+  --input=corpus.tsv \
+  --input_format=tsv \
   --model_prefix=unigram_stage1 \
   --vocab_size=500 \
   --split_by_whitespace=true \
@@ -134,7 +180,8 @@ awk -F'\t' 'NR>3 {print $1}' unigram_stage1.vocab > stage1_pieces.txt
 ```bash
 spm_train \
   --model_type=unigram \
-  --input=corpus.txt \
+  --input=corpus.tsv \
+  --input_format=tsv \
   --model_prefix=unigram_stage2 \
   --vocab_size=3000 \
   --split_by_whitespace=false \
@@ -157,7 +204,8 @@ awk -F'\t' 'NR>3 {print $1}' unigram_stage2.vocab > stage2_pieces.txt
 ```bash
 spm_train \
   --model_type=unigram \
-  --input=corpus.txt \
+  --input=corpus.tsv \
+  --input_format=tsv \
   --model_prefix=unigram_stage3 \
   --vocab_size=4096 \
   --split_by_whitespace=false \
