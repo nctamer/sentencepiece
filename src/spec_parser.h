@@ -233,13 +233,13 @@ absl::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_BOOL(split_digits);
   if (name == "split_by_interval") {
     bool v; if (!absl::SimpleAtob(value.empty() ? "true" : value, &v))
-      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
+      return absl::StatusBuilder(absl::StatusCode::kInvalidArgument)
              << "cannot parse \"" << value << "\" as bool.";
     message->SetExtension(split_by_interval, v); return absl::OkStatus();
   }
   if (name == "split_by_barline") {
     bool v; if (!absl::SimpleAtob(value.empty() ? "true" : value, &v))
-      return util::StatusBuilder(absl::StatusCode::kInvalidArgument, GTL_LOC)
+      return absl::StatusBuilder(absl::StatusCode::kInvalidArgument)
              << "cannot parse \"" << value << "\" as bool.";
     message->SetExtension(split_by_barline, v); return absl::OkStatus();
   }

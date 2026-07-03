@@ -262,7 +262,7 @@ bool TrainerInterface::IsValidSentencePiece(
       if (trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
           trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
         if (pos > 0 && pos + 1 < sentencepiece.size()) {
-          const char32 next_c = sentencepiece[pos + 1];
+          const char32_t next_c = sentencepiece[pos + 1];
           if (trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
             if (next_c == '|') return false;
           } else {
