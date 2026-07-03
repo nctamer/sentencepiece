@@ -35,6 +35,12 @@ namespace sentencepiece {
 namespace bpe {
 namespace {
 
+// Limit recursion depth to prevent stack overflow on malicious models
+// with extremely deep BPE merge chains.
+// Must be at namespace scope (not local scope) to avoid MSVC lambda capture
+// bugs (C3493) in SampleEncode.
+constexpr int kMaxBpeResegmentDepth = 100;
+
 struct SymbolPair {
   union {
     float score;  // score of this pair. large is better.
@@ -95,6 +101,10 @@ struct Symbol {
 
 Model::Model(const ModelProto& model_proto) {
   model_proto_ = &model_proto;
+  // BPE model prevents control symbols from being merged by placing them in
+  // reserved_id_map_ (which BPE merge ignores).
+  // We use PieceToIdNoReserved() during inference to bypass reserved_id_map_
+  // for performance.
   InitializePieces(/* use_reserved_id_map= */ false);
 }
 
@@ -149,16 +159,24 @@ std::vector<std::pair<absl::string_view, int>> Model::SampleEncode(
       const absl::string_view piece(
           symbol_left->piece.data(),
           symbol_left->piece.size() + symbol_right->piece.size());
-      const auto it = pieces_.find(piece);
-      if (it == pieces_.end()) continue;
+      // Use PieceToIdNoReserved() instead of PieceToId() to bypass
+      // reserved_id_map_ lookup. This is both an optimization and a design
+      // constraint to prevent CONTROL symbols (which are in reserved_id_map_)
+      // from being merged.
+      const int id = PieceToIdNoReserved(piece);
+      // PieceToIdNoReserved() returns unk_id_ on lookup failure (not found in
+      // pieces_). Comparing directly with unk_id_ is a fast way to check if the
+      // piece is not a mergeable normal piece, avoiding memory access overhead
+      // of IsUnknown().
+      if (id == unk_id_ || IsReservedId(id)) continue;
       SymbolPair& h = agenda_vec.emplace_back();
       h.left = left;
       h.right = right;
-      h.score = GetScoreInlined(it->second);
+      h.score = GetScoreInlined(id);
       h.size = piece.size();
 
       // Makes `rev_merge` for resegmentation.
-      if (IsUnusedInlined(it->second))
+      if (IsUnusedInlined(id))
         rev_merge[piece] =
             std::make_pair(symbol_left->piece, symbol_right->piece);
     }
@@ -180,11 +198,16 @@ std::vector<std::pair<absl::string_view, int>> Model::SampleEncode(
       const absl::string_view piece(
           left_symbol.piece.data(),
           left_symbol.piece.size() + right_symbol.piece.size());
-      const auto it = pieces_.find(piece);
-      if (it == pieces_.end()) {
+      // Use PieceToIdNoReserved() instead of PieceToId() to bypass
+      // reserved_id_map_ lookup. This is both an optimization and a design
+      // constraint to prevent CONTROL symbols (which are in reserved_id_map_)
+      // from being merged.
+      const int id = PieceToIdNoReserved(piece);
+      // PieceToIdNoReserved() returns unk_id_ on lookup failure.
+      // See explanation above for why we compare directly with unk_id_.
+      if (id == unk_id_ || IsReservedId(id)) {
         return;
       }
-      const int id = it->second;
       SymbolPair h;
       h.left = left;
       h.right = right;
@@ -201,7 +224,6 @@ std::vector<std::pair<absl::string_view, int>> Model::SampleEncode(
     const bool use_dropout = alpha > 0.0;
     absl::BitGen* rand_gen =
         use_dropout ? random::GetRandomGenerator() : nullptr;
-    std::bernoulli_distribution dropout(alpha);
 
     // Main loop.
     while (!agenda.empty()) {
@@ -223,7 +245,7 @@ std::vector<std::pair<absl::string_view, int>> Model::SampleEncode(
       // are pre computed, but here we randomly skip merge operation inside this
       // loop. This implementation is theoretically equivalent to the original
       // one. BPE-dropout: https://arxiv.org/pdf/1910.13267.pdf
-      if (use_dropout && dropout(*rand_gen)) continue;
+      if (use_dropout && absl::Bernoulli(*rand_gen, alpha)) continue;
 
       Symbol& left_symbol = symbols[top.left];
       Symbol& right_symbol = symbols[top.right];
@@ -246,9 +268,18 @@ std::vector<std::pair<absl::string_view, int>> Model::SampleEncode(
     }
   }
 
+  // Limit recursion depth to prevent stack overflow on malicious models
+  // with extremely deep BPE merge chains.
+
   auto resegment = [this, &rev_merge](auto& self, absl::string_view w,
-                                      EncodeResult* output) -> void {
+                                      EncodeResult* output, int depth) -> void {
     const int id = PieceToIdNoReserved(w);
+    if (depth > kMaxBpeResegmentDepth) {
+      // Gracefully stop recursion and output the merged piece as-is to avoid
+      // stack overflow.
+      output->emplace_back(w, id);
+      return;
+    }
     if (id == -1 || !IsUnusedInlined(id)) {
       output->emplace_back(w, id);
       return;
@@ -259,15 +290,15 @@ std::vector<std::pair<absl::string_view, int>> Model::SampleEncode(
       return;
     }
     // Direct recursive calls
-    self(self, p->second.first, output);
-    self(self, p->second.second, output);
+    self(self, p->second.first, output, depth + 1);
+    self(self, p->second.second, output, depth + 1);
   };
 
   EncodeResult output;
   output.reserve(symbols.size());
   for (int index = 0; index != -1; index = symbols[index].next) {
     if (index >= 0 && index < static_cast<int>(symbols.size())) {
-      resegment(resegment, symbols[index].piece, &output);
+      resegment(resegment, symbols[index].piece, &output, 0);
     }
   }
 

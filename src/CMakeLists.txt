@@ -13,6 +13,7 @@
 # limitations under the License.!
 
 list(APPEND SPM_LIBS absl::status)
+list(APPEND SPM_LIBS absl::status_builder)
 list(APPEND SPM_LIBS absl::strings)
 list(APPEND SPM_LIBS absl::flags)
 list(APPEND SPM_LIBS absl::flags_parse)
@@ -20,6 +21,7 @@ list(APPEND SPM_LIBS absl::log)
 list(APPEND SPM_LIBS absl::log_initialize)
 list(APPEND SPM_LIBS absl::check)
 list(APPEND SPM_LIBS absl::random_random)
+list(APPEND SPM_LIBS absl::time)
 
 if (SPM_PROTOBUF_PROVIDER STREQUAL "internal")
   set(SPM_PROTO_HDRS builtin_pb/sentencepiece.pb.h)
@@ -142,6 +144,7 @@ set(SPM_TEST_SRCS
   bpe_model_test.cc
   bpe_model_trainer_test.cc
   builder_test.cc
+  invalid_model_test.cc
   char_model_test.cc
   char_model_trainer_test.cc
   filesystem_test.cc

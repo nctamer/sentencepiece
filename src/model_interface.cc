@@ -17,6 +17,7 @@
 #include <algorithm>
 
 #include "sentencepiece_model.pb.h"
+#include "third_party/absl/strings/str_cat.h"
 #include "third_party/absl/strings/str_format.h"
 #include "third_party/absl/strings/string_view.h"
 #include "util.h"
@@ -75,9 +76,9 @@ void ModelInterface::InitializePieces(bool use_reserved_id_map) {
   int reserved_id_map_size = 0;
   for (int i = 0; i < model_proto_->pieces_size(); ++i) {
     const auto& sp = model_proto_->pieces(i);
-    static constexpr size_t kMaxPieceSize = 8192;
+    static constexpr size_t kMaxPieceSize = 8000;
     if (sp.piece().size() >= kMaxPieceSize) {
-      status_ = util::InternalError("piece size must be less than 8k.");
+      status_ = absl::InternalError("piece is too long.");
       return;
     }
     const bool is_normal_piece =
@@ -96,11 +97,11 @@ void ModelInterface::InitializePieces(bool use_reserved_id_map) {
   for (int i = 0; i < model_proto_->pieces_size(); ++i) {
     const auto& sp = model_proto_->pieces(i);
     if (sp.piece().empty()) {
-      status_ = util::InternalError("piece must not be empty.");
+      status_ = absl::InternalError("piece must not be empty.");
       return;
     }
     if (sp.piece().find('\0') != absl::string_view::npos) {
-      status_ = util::InternalError("piece must not include null character.");
+      status_ = absl::InternalError("piece must not include null character.");
       return;
     }
     if (use_reserved_id_map) {
@@ -110,11 +111,13 @@ void ModelInterface::InitializePieces(bool use_reserved_id_map) {
            sp.type() == ModelProto::SentencePiece::UNUSED);
       if (!port::InsertIfNotPresent(
               is_normal_piece ? &pieces_ : &reserved_id_map_, sp.piece(), i)) {
-        status_ = util::InternalError(sp.piece() + " is already defined.");
+        status_ = absl::InternalError(
+            absl::StrCat(sp.piece(), " is already defined."));
         return;
       }
     } else if (!port::InsertIfNotPresent(&pieces_, sp.piece(), i)) {
-      status_ = util::InternalError(sp.piece() + " is already defined.");
+      status_ =
+          absl::InternalError(absl::StrCat(sp.piece(), " is already defined."));
       return;
     }
 
@@ -124,7 +127,7 @@ void ModelInterface::InitializePieces(bool use_reserved_id_map) {
 
     if (sp.type() == ModelProto::SentencePiece::UNKNOWN) {
       if (unk_id_ >= 0) {
-        status_ = util::InternalError("unk is already defined.");
+        status_ = absl::InternalError("unk is already defined.");
         return;
       }
       unk_id_ = i;
@@ -132,24 +135,24 @@ void ModelInterface::InitializePieces(bool use_reserved_id_map) {
 
     if (sp.type() == ModelProto::SentencePiece::BYTE) {
       if (!model_proto_->trainer_spec().byte_fallback()) {
-        status_ =
-            util::InternalError("byte piece " + sp.piece() +
-                                " is found although `byte_fallback` is false.");
+        status_ = absl::InternalError(
+            absl::StrCat("byte piece ", sp.piece(),
+                         " is found although `byte_fallback` is false."));
         return;
       }
       const int byte = PieceToByte(sp.piece());
       if (0 <= byte && byte < 256) {
         byte_found[byte] = true;
       } else {
-        status_ =
-            util::InternalError("byte piece " + sp.piece() + " is invalid.");
+        status_ = absl::InternalError(
+            absl::StrCat("byte piece ", sp.piece(), " is invalid."));
         return;
       }
     }
   }
 
   if (unk_id_ == -1) {
-    status_ = util::InternalError("unk is not defined.");
+    status_ = absl::InternalError("unk is not defined.");
     return;
   }
 
@@ -157,7 +160,7 @@ void ModelInterface::InitializePieces(bool use_reserved_id_map) {
     // Checks that there are 256 byte pieces.
     if (std::find(byte_found.begin(), byte_found.end(), false) !=
         byte_found.end()) {
-      status_ = util::InternalError(
+      status_ = absl::InternalError(
           "there are not 256 byte pieces although `byte_fallback` is true.");
       return;
     }
@@ -181,7 +184,9 @@ std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
 
   std::vector<absl::string_view> result;
   if (treat_ws_as_suffix) {  // put ws tokens at the end of non-ws sequences.
-    if (begin < end) result.emplace_back(begin, 0);
+    if (begin < end) {
+      result.emplace_back(begin, 0);
+    }
     while (begin < end) {
       const int mblen =
           std::min<int>(string_util::OneCharLen(begin), end - begin);
@@ -190,7 +195,9 @@ std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
       if (is_ws) {  // keep track of sequences consecutive ws tokens.
         in_ws_sequence = true;
       } else if (in_ws_sequence) {
-        if (allow_ws_only_pieces) result.emplace_back(begin, 0);
+        if (allow_ws_only_pieces) {
+          result.emplace_back(begin, 0);
+        }
 
         in_ws_sequence = false;
       }
@@ -199,8 +206,9 @@ std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
           absl::string_view(result.back().data(), result.back().size() + mblen);
       begin += mblen;
 
-      if (begin < end && is_ws && !allow_ws_only_pieces)
+      if (begin < end && is_ws && !allow_ws_only_pieces) {
         result.emplace_back(begin, 0);
+      }
     }
   } else {
     while (begin < end) {
@@ -229,7 +237,9 @@ std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
         in_ws_sequence = true;
       }
 
-      if (in_ws_sequence && !is_ws) in_ws_sequence = false;
+      if (in_ws_sequence && !is_ws) {
+        in_ws_sequence = false;
+      }
 
       result.back() =
           absl::string_view(result.back().data(), result.back().size() + mblen);
@@ -241,7 +251,7 @@ std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
 }
 
 const std::string& ByteToPiece(unsigned char c) {
-  static const std::vector<std::string>* const kBytePieces = []() {
+  static const std::vector<std::string>* const kBytePieces = [] {
     auto* v = new std::vector<std::string>(256);
     for (int i = 0; i < 256; ++i) {
       (*v)[i] = absl::StrFormat("<0x%02X>", i);

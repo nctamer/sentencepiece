@@ -1,5 +1,3 @@
-
-
 // Copyright 2016 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +28,8 @@
 #include "third_party/absl/random/random.h"
 #include "third_party/absl/strings/str_split.h"
 #include "third_party/absl/strings/string_view.h"
+#include "third_party/absl/time/clock.h"
+#include "third_party/absl/time/time.h"
 #include "util.h"
 
 namespace sentencepiece {
@@ -80,8 +80,8 @@ inline float GetUserDefinedScore(int length) { return 0.1 * (length - 1); }
 inline float Gumbel() {
   const float kEpsilon = 1e-7;
   auto *mt = random::GetRandomGenerator();
-  std::uniform_real_distribution<float> dis(0.0, 1.0);
-  float noise = -std::log(-(std::log(dis(*mt) + kEpsilon)));
+  float noise =
+      -std::log(-(std::log(absl::Uniform(*mt, 0.0f, 1.0f) + kEpsilon)));
 
   return noise;
 }
@@ -371,6 +371,9 @@ std::vector<Lattice::LatticePathWithScore> Lattice::NBest(size_t nbest_size,
     return {Viterbi()};
   }
 
+  const int timeout_ms = sentencepiece::GetNBestTimeout();
+  const absl::Time start_time = absl::Now();
+
   // Uses A* search to enumerate N-bests.
   // Given a lattice, enumerates hypotheses (paths) from EOS.
   // At each partial path x, compute f(x) as follows
@@ -498,6 +501,15 @@ std::vector<Lattice::LatticePathWithScore> Lattice::NBest(size_t nbest_size,
     constexpr int kMaxAgendaSize = 10000;
     constexpr int kMinAgendaSize = 512;
     if (agenda.size() >= kMaxAgendaSize) {
+      if (timeout_ms > 0) {
+        const auto elapsed =
+            absl::ToInt64Milliseconds(absl::Now() - start_time);
+        if (elapsed >= timeout_ms) {
+          LOG(WARNING) << "NBest search timed out after " << elapsed << " ms. "
+                       << "Falling back to Viterbi best path.";
+          return {Viterbi()};
+        }
+      }
       // Keeps the top `kMinAgendaSize` hypothesis.
       Agenda new_agenda;
       // Keeps the top hypothesis and the ones on their "next" paths.
@@ -578,10 +590,15 @@ void Model::PopulateNodes(Lattice *lattice) const {
     const char *begin = lattice->surface(begin_pos);
 
     // Finds all pieces which are prefix of surface(begin_pos).
-    const size_t num_nodes = trie_->commonPrefixSearch(
-        begin, trie_results.data(), trie_results.size(),
-        static_cast<int>(end - begin));
-    CHECK_LT(num_nodes, trie_results.size());
+    size_t num_nodes = trie_->commonPrefixSearch(begin, trie_results.data(),
+                                                 trie_results.size(),
+                                                 static_cast<int>(end - begin));
+    if (num_nodes > trie_results.size()) {
+      trie_results.resize(num_nodes + 1);
+      num_nodes = trie_->commonPrefixSearch(begin, trie_results.data(),
+                                            trie_results.size(),
+                                            static_cast<int>(end - begin));
+    }
 
     bool has_single_node = false;
 
@@ -623,7 +640,7 @@ void Model::BuildTrie(std::vector<std::pair<absl::string_view, int>> *pieces) {
   if (!status().ok()) return;
 
   if (pieces->empty()) {
-    status_ = util::InternalError("no pieces are loaded.");
+    status_ = absl::InternalError("no pieces are loaded.");
     return;
   }
 
@@ -644,7 +661,7 @@ void Model::BuildTrie(std::vector<std::pair<absl::string_view, int>> *pieces) {
   trie_ = std::make_unique<Darts::DoubleArray>();
   if (trie_->build(key.size(), const_cast<char **>(&key[0]),
                    const_cast<size_t *>(&length[0]), &value[0]) != 0) {
-    status_ = util::InternalError("cannot build double-array.");
+    status_ = absl::InternalError("cannot build double-array.");
     return;
   }
 
@@ -662,16 +679,20 @@ void Model::BuildTrie(std::vector<std::pair<absl::string_view, int>> *pieces) {
   pieces_.clear();
 
   if (trie_results_size_ == 0)
-    status_ = util::InternalError("no entry is found in the trie.");
+    status_ = absl::InternalError("no entry is found in the trie.");
 }
 
 Model::Model(const ModelProto &model_proto) {
   model_proto_ = &model_proto;
 
-  InitializePieces();
+  InitializePieces(/* use_reserved_id_map= */ true);
 
   min_score_ = FLT_MAX;
   for (const auto &sp : model_proto_->pieces()) {
+    if (std::isnan(sp.score()) || std::isinf(sp.score())) {
+      status_ = absl::InternalError("score is NaN or Inf.");
+      return;
+    }
     if (sp.type() == ModelProto::SentencePiece::NORMAL) {
       min_score_ = std::min(min_score_, sp.score());
     }
@@ -962,11 +983,23 @@ EncodeResult Model::EncodeOptimized(absl::string_view normalized) const {
   std::vector<BestPathNode> best_path_ends_at(size + 1);
   // Generate lattice on-the-fly (not stored) and update best_path_ends_at.
   size_t starts_at = 0;
+  const float kScoreResetThreshold = 100000.0f;
+  size_t max_frontier = 0;
   while (starts_at < size) {
     std::size_t node_pos = 0;
     std::size_t key_pos = starts_at;
-    const auto best_path_score_till_here =
+    float best_path_score_till_here =
         best_path_ends_at[starts_at].best_path_score;
+    if (best_path_score_till_here < -kScoreResetThreshold ||
+        best_path_score_till_here > kScoreResetThreshold) {
+      const float offset = best_path_score_till_here;
+      for (size_t i = starts_at; i <= max_frontier; ++i) {
+        if (i == starts_at || best_path_ends_at[i].starts_at != -1) {
+          best_path_ends_at[i].best_path_score -= offset;
+        }
+      }
+      best_path_score_till_here = 0.0f;
+    }
     bool has_single_node = false;
     const int mblen =
         std::min<int>(string_util::OneCharLen(normalized.data() + starts_at),
@@ -977,6 +1010,7 @@ EncodeResult Model::EncodeOptimized(absl::string_view normalized) const {
       if (ret == -2) break;
       if (ret >= 0 && ret < GetPieceSize()) {
         if (IsUnusedInlined(ret)) continue;
+        max_frontier = std::max(max_frontier, key_pos);
         // Update the best path node.
         auto &target_node = best_path_ends_at[key_pos];
         const auto length = (key_pos - starts_at);
@@ -998,6 +1032,7 @@ EncodeResult Model::EncodeOptimized(absl::string_view normalized) const {
       }
     }
     if (!has_single_node) {
+      max_frontier = std::max(max_frontier, starts_at + static_cast<size_t>(mblen));
       auto &target_node = best_path_ends_at[starts_at + mblen];
       const auto candidate_best_path_score =
           unk_score + best_path_score_till_here;

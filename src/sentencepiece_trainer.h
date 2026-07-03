@@ -17,6 +17,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "sentencepiece_processor.h"
@@ -48,13 +49,13 @@ class Normalizer;
 //
 class SentenceIterator {
  public:
-  virtual ~SentenceIterator() {}
+  virtual ~SentenceIterator() = default;
   // Returns true if iteration finishes (including error case).
   // Uses SentenceIterator::status() method to know whether
   // all sentences are loaded successfully.
-  virtual bool done() const = 0;
+  [[nodiscard]] virtual bool done() const = 0;
   virtual void Next() = 0;
-  virtual const std::string& value() const = 0;
+  [[nodiscard]] virtual const std::string& value() const = 0;
   virtual absl::Status status() const = 0;
 };
 
@@ -164,7 +165,7 @@ class SentencePieceTrainer {
 
  private:
   SentencePieceTrainer() {}
-  ~SentencePieceTrainer() {}
+  ~SentencePieceTrainer() = default;
 };
 
 class SentencePieceNormalizer {
@@ -173,14 +174,22 @@ class SentencePieceNormalizer {
   virtual ~SentencePieceNormalizer();
 
   virtual absl::Status Load(std::unique_ptr<ModelProto> model_proto);
+  virtual absl::Status Load(std::unique_ptr<NormalizerSpec> normalizer_spec);
 
   virtual absl::Status Load(absl::string_view filename);
 
   virtual absl::Status LoadFromSerializedProto(absl::string_view serialized);
+  virtual absl::Status LoadFromSerializedNormalizerSpec(absl::string_view serialized);
 
   virtual absl::Status LoadFromRuleTSV(absl::string_view filename);
 
   virtual absl::Status LoadFromRuleName(absl::string_view name);
+
+  virtual absl::Status LoadFromMap(
+      absl::Span<const std::pair<std::string, std::string>> norm_map);
+
+  virtual absl::Status Decompile(
+      std::vector<std::pair<std::string, std::string>> *norm_map) const;
 
   virtual absl::Status Normalize(absl::string_view input,
                                  std::string* normalized) const;
@@ -189,15 +198,17 @@ class SentencePieceNormalizer {
                                  std::string* normalized,
                                  std::vector<size_t>* norm_to_orig) const;
 
-  virtual std::string Normalize(absl::string_view input) const;
+  [[nodiscard]] virtual std::string Normalize(absl::string_view input) const;
 
-  virtual NormalizerSpec* mutable_normalizer_spec() const;
+  [[nodiscard]] virtual NormalizerSpec* mutable_normalizer_spec();
 
-  virtual std::string serialized_model_proto() const;
+  [[nodiscard]] virtual std::string serialized_model_proto() const;
+
+  [[nodiscard]] virtual std::string serialized_normalizer_spec() const;
 
  private:
   std::unique_ptr<normalizer::Normalizer> normalizer_;
-  std::unique_ptr<ModelProto> model_proto_;
+  std::unique_ptr<NormalizerSpec> normalizer_spec_;
 };
 
 // Converts the utf8 byte spans into Unicode char span.

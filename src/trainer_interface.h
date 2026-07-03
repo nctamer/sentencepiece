@@ -54,11 +54,11 @@ std::vector<std::pair<K, V>> Sorted(const absl::flat_hash_map<K, V>& m) {
 class MultiFileSentenceIterator : public SentenceIterator {
  public:
   explicit MultiFileSentenceIterator(const std::vector<std::string>& files);
-  ~MultiFileSentenceIterator() {}
+  ~MultiFileSentenceIterator() override = default;
 
-  bool done() const override;
+  [[nodiscard]] bool done() const override;
   void Next() override;
-  const std::string& value() const override { return value_; }
+  [[nodiscard]] const std::string& value() const override { return value_; }
   absl::Status status() const override;
 
  private:
@@ -77,16 +77,15 @@ class TrainerInterface {
   using Sentence = std::pair<std::string, int64_t>;
   using Sentences = std::vector<Sentence>;
 
-  static const char32 kWSChar;
-  static const char32 kUNKChar;
-  static const char32 kUPPBoundaryChar;
+  static const char32_t kWSChar;
+  static const char32_t kUNKChar;
+  static const char32_t kUPPBoundaryChar;
   static const char kWSStr[];
   static const char kUNKStr[];
   static const char kUPPBoundaryStr[];
 
-  TrainerInterface(const TrainerSpec& trainer_spec,
-                   const NormalizerSpec& normalizer_spec,
-                   const NormalizerSpec& denormalizer_spec);
+  TrainerInterface(TrainerSpec trainer_spec, NormalizerSpec normalizer_spec,
+                   NormalizerSpec denormalizer_spec);
 
   virtual ~TrainerInterface();
 
@@ -131,7 +130,7 @@ class TrainerInterface {
 
   // Set of characters which must be included in the final vocab.
   // The value of this map stores the frequency.
-  absl::flat_hash_map<char32, int64_t> required_chars_;
+  absl::flat_hash_map<char32_t, int64_t> required_chars_;
 
   // Final output pieces
   std::vector<std::pair<std::string, float>> final_pieces_;

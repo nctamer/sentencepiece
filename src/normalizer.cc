@@ -59,14 +59,21 @@ void Normalizer::Init() {
     // Reads the body of double array.
     trie_ = std::make_unique<Darts::DoubleArray>();
 
-    // The second arg of set_array is not the size of blob,
-    // but the number of double array units.
-    trie_->set_array(const_cast<char*>(trie_blob.data()),
-                     trie_blob.size() / trie_->unit_size());
+    // copy_array ensures correct alignment even if the trie_blob is
+    // mis-aligned. Although standard proto parsing copies data to the heap
+    // (guaranteeing alignment), zero-copy parsing or custom buffers might
+    // pass misaligned data.
+    if (reinterpret_cast<uintptr_t>(trie_blob.data()) % 4 == 0) {
+      trie_->set_array(const_cast<char*>(trie_blob.data()),
+                       trie_blob.size() / trie_->unit_size());
+    } else {
+      trie_->copy_array(reinterpret_cast<const char*>(trie_blob.data()),
+                        trie_blob.size());
+    }
 
-    if (!trie_->validate()) {
-      status_ = util::InternalError(
-          "Trie data contains out-of-bounds node references.");
+    if (!trie_->validate(normalized_.size())) {
+      status_ = absl::InternalError("precompiled_charsmap is invalid.");
+      trie_.reset();
       return;
     }
   }
@@ -282,7 +289,7 @@ absl::Status Normalizer::DecodePrecompiledCharsMap(
       !string_util::DecodePOD<uint32_t>(
           absl::string_view(blob.data(), sizeof(trie_blob_size)),
           &trie_blob_size)) {
-    return util::InternalError("Blob for normalization rule is broken.");
+    return absl::InternalError("Blob for normalization rule is broken.");
   }
 
   if constexpr (util::is_bigendian()) {
@@ -290,12 +297,12 @@ absl::Status Normalizer::DecodePrecompiledCharsMap(
   }
 
   if (trie_blob_size >= blob.size() - sizeof(trie_blob_size)) {
-    return util::InternalError("Trie data size exceeds the input blob size.");
+    return absl::InternalError("Trie data size exceeds the input blob size.");
   }
 
   // Dart unit_size is 4 and blob size in units must be a multiple of 256.
   if (trie_blob_size < 1024 || (trie_blob_size & 0x3FF) != 0) {
-    return util::InternalError("Trie data size is not divisible by 1024.");
+    return absl::InternalError("Trie data size is not divisible by 1024.");
   }
 
   blob.remove_prefix(sizeof(trie_blob_size));
@@ -316,7 +323,7 @@ absl::Status Normalizer::DecodePrecompiledCharsMap(
   *normalized = absl::string_view(blob.data(), blob.size());
 
   if (normalized->empty() || normalized->back() != '\0') {
-    return util::InternalError("normalized block must be null terminated.");
+    return absl::InternalError("normalized block must be null terminated.");
   }
 
   return absl::OkStatus();

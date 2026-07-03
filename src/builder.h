@@ -25,8 +25,7 @@
 #include "third_party/absl/status/status.h"
 #include "third_party/absl/strings/string_view.h"
 
-namespace sentencepiece {
-namespace normalizer {
+namespace sentencepiece::normalizer {
 
 // Builder creates a text normalization rule from user-defined string
 // to string mappings. The normalization mapping is compiled into
@@ -39,7 +38,7 @@ class Builder {
   ~Builder() = delete;
 
   // Basic Unicode character sequence.
-  using Chars = std::vector<char32>;
+  using Chars = std::vector<char32_t>;
 
   // String-to-string mapping.
   using CharsMap = std::map<Chars, Chars>;
@@ -144,6 +143,6 @@ class Builder {
  private:
   FRIEND_TEST(BuilderTest, RemoveRedundantMapTest);
 };
-}  // namespace normalizer
-}  // namespace sentencepiece
+}  // namespace sentencepiece::normalizer
+
 #endif  // BUILDER_H_
