@@ -33,6 +33,25 @@
 
 namespace sentencepiece {
 
+// True when `c` may begin a main-chain interval token, i.e. when a whitespace
+// immediately before `c` is an interval boundary. THE one copy of this rule:
+// both the pretokenizer (SplitIntoWords) and the piece validator
+// (TrainerInterface::IsValidSentencePiece) call here, so a boundary can never
+// mean two different things in training.
+//
+// The character set is the first-character set of the intermo productions that
+// establish a main-chain interval (docs/intermo.ebnf):
+//   elided_num     = "/" , positive          -> '/'      (/4 /8 /16 — the
+//                                               dominant duration spelling)
+//   fraction       = positive , "/" , positive -> '1'-'9'
+//   whole_multiple = positive                  -> '1'-'9'
+//   barline        = "|" , ...                 -> '|'    (a Boundary interval,
+//                                               EBNF G4a)
+// '0' is deliberately EXCLUDED: "0/..." can only be grace_duration, and EBNF G3
+// makes grace durations nested sub-Moments, never main-chain intervals.
+bool IsIntervalBoundaryStart(char32_t c, bool split_by_interval,
+                             bool split_by_barline);
+
 // "_this_is_a_pen" => ["_this", "_is", "_a", "_pen"]
 std::vector<absl::string_view> SplitIntoWords(
     absl::string_view text, bool treat_ws_as_suffix = false,

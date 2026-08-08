@@ -169,6 +169,16 @@ void ModelInterface::InitializePieces(bool use_reserved_id_map) {
   matcher_ = std::make_unique<normalizer::PrefixMatcher>(user_defined_symbols);
 }
 
+bool IsIntervalBoundaryStart(char32_t c, bool split_by_interval,
+                             bool split_by_barline) {
+  // A barline is a Boundary interval in both modes (EBNF G4a).
+  if (c == '|') return split_by_interval || split_by_barline;
+  if (!split_by_interval) return false;
+  // Metric interval tokens: elided_num '/', fraction/whole_multiple '1'-'9'.
+  // '0' is grace_duration and never a main-chain interval (EBNF G3).
+  return c == '/' || (c >= '1' && c <= '9');
+}
+
 std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
                                               bool treat_ws_as_suffix,
                                               bool allow_ws_only_pieces,
@@ -220,12 +230,9 @@ std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
       if ((split_by_interval || split_by_barline) && is_ws) {
         const char *after_ws = begin + kSpaceLen;
         if (after_ws < end) {
-          const char c = *after_ws;
-          if (split_by_barline) {
-            should_split = (c == '|');
-          } else {
-            should_split = (c >= '0' && c <= '9') || c == '|';
-          }
+          should_split = IsIntervalBoundaryStart(
+              static_cast<char32_t>(static_cast<unsigned char>(*after_ws)),
+              split_by_interval, split_by_barline);
         } else {
           should_split = false;
         }

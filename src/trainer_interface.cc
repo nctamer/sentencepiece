@@ -257,18 +257,30 @@ bool TrainerInterface::IsValidSentencePiece(
     }
 
     if (c == kWSChar) {
-      // Interval/barline mode: reject pieces with internal boundary-crossing
-      // whitespace (whitespace followed by digit/| at internal position).
-      if (trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
-          trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
+      // Interval/barline mode: no piece may CONTAIN an interval boundary, at
+      // any position. Two cases, and the second is not symmetric with the
+      // first:
+      //
+      //   internal (pos+1 < size) — the following character is known, so the
+      //     piece is rejected exactly when that character starts an interval.
+      //
+      //   trailing (pos+1 == size) — the following character is NOT known here,
+      //     and sentencepiece does no pretokenization at ENCODE time. A piece
+      //     ending in whitespace is therefore free to swallow the next
+      //     interval's leading whitespace at inference even though every
+      //     training occurrence was interior. Observed: "▁|4/4k0▁" learned
+      //     where the bar continues with an onset, then firing on
+      //     "|4/4k0 1" and straddling the barline. Unknowable == unsafe.
+      const bool interval_mode =
+          trainer_spec_.GetExtension(::sentencepiece::split_by_interval);
+      const bool barline_mode =
+          trainer_spec_.GetExtension(::sentencepiece::split_by_barline);
+      if (interval_mode || barline_mode) {
+        if (pos > 0 && pos + 1 == sentencepiece.size()) return false;
         if (pos > 0 && pos + 1 < sentencepiece.size()) {
-          const char32_t next_c = sentencepiece[pos + 1];
-          if (trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
-            if (next_c == '|') return false;
-          } else {
-            if ((next_c >= '0' && next_c <= '9') || next_c == '|')
-              return false;
-          }
+          if (IsIntervalBoundaryStart(sentencepiece[pos + 1], interval_mode,
+                                      barline_mode))
+            return false;
         }
       } else if (!trainer_spec_.allow_whitespace_only_pieces() ||
           !all_whitespace_piece) {
