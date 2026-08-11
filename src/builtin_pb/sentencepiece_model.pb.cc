@@ -3487,6 +3487,10 @@ const std::string protected_pieces_file_default("");
 ::PROTOBUF_NAMESPACE_ID::internal::ExtensionIdentifier< ::sentencepiece::TrainerSpec,
     ::PROTOBUF_NAMESPACE_ID::internal::StringTypeTraits, 9, false >
   protected_pieces_file(kProtectedPiecesFileFieldNumber, protected_pieces_file_default);
+const std::string seed_merges_file_default("");
+::PROTOBUF_NAMESPACE_ID::internal::ExtensionIdentifier< ::sentencepiece::TrainerSpec,
+    ::PROTOBUF_NAMESPACE_ID::internal::StringTypeTraits, 9, false >
+  seed_merges_file(kSeedMergesFileFieldNumber, seed_merges_file_default);
 
 // @@protoc_insertion_point(namespace_scope)
 }  // namespace sentencepiece

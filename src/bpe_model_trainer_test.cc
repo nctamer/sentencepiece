@@ -89,6 +89,51 @@ TEST(BPETrainerTest, BasicTest) {
             RunTrainer({"pen", "pineapple", "apple"}, 20, {"app"}));
 }
 
+TEST(BPETrainerTest, SavesTheMergeEachPieceCameFrom) {
+  // The guarantee consumers need: every learned piece is left+right of a
+  // recorded merge, and BOTH halves are themselves in the vocabulary. That is
+  // what makes a merge list reconstructible WITHOUT guessing a split.
+  const std::string model_prefix =
+      util::JoinPath(::testing::TempDir(), "merges_model");
+  const std::string input_file =
+      util::JoinPath(::testing::TempDir(), "merges_input");
+  {
+    auto output = filesystem::NewWritableFile(input_file);
+    output->WriteLine("abracadabra");
+    output->WriteLine("pineapple");
+    output->WriteLine("hellohe");
+  }
+  ASSERT_TRUE(SentencePieceTrainer::Train(
+                  absl::StrCat("--model_prefix=", model_prefix,
+                               " --input=", input_file,
+                               " --vocab_size=40 --model_type=bpe"
+                               " --normalization_rule_name=identity"))
+                  .ok());
+
+  SentencePieceProcessor processor;
+  ASSERT_TRUE(processor.Load(model_prefix + ".model").ok());
+  std::unordered_set<std::string> vocab;
+  for (const auto &piece : processor.model_proto().pieces()) {
+    vocab.insert(piece.piece());
+  }
+
+  auto input = filesystem::NewReadableFile(model_prefix + ".merges");
+  ASSERT_TRUE(input->status().ok());
+  std::string line;
+  int merges = 0;
+  while (input->ReadLine(&line)) {
+    const auto tab = line.find('\t');
+    ASSERT_NE(std::string::npos, tab) << "merge line is not left<TAB>right";
+    const std::string left = line.substr(0, tab);
+    const std::string right = line.substr(tab + 1);
+    EXPECT_TRUE(vocab.count(left + right)) << "merged piece missing: " << line;
+    EXPECT_TRUE(vocab.count(left)) << "left half missing: " << left;
+    EXPECT_TRUE(vocab.count(right)) << "right half missing: " << right;
+    ++merges;
+  }
+  EXPECT_GT(merges, 0);
+}
+
 static constexpr char kTestInputData[] = "wagahaiwa_nekodearu.txt";
 
 TEST(BPETrainerTest, EndToEndTest) {

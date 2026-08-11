@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "filesystem.h"
 #include "pretokenizer_for_training.h"
 #include "third_party/absl/container/flat_hash_set.h"
 #include "third_party/absl/flags/flag.h"
@@ -296,6 +297,20 @@ absl::Status Trainer::Train() {
               << " protected pieces for BPE";
   }
 
+  RETURN_IF_ERROR(ApplySeedMerges());
+
+  // The pair each learned piece was merged from, in learned order.
+  //
+  // BPE knows this pair — it is the whole content of a merge — but upstream
+  // discards it at Save(), so a .model records pieces and scores and nothing
+  // about how they were built. Every consumer that needs a merge list (an HF
+  // tokenizer, or any EXPANSION of an existing byte-level BPE vocabulary) then
+  // has to guess the split back from the piece string, and guessing is lossy:
+  // 5.9-8.3% of learned pieces admit no split into two pieces already present
+  // and must be dropped, taking their embedding row with them. Recording the
+  // pair costs one line per merge and removes the guess.
+  std::vector<std::pair<std::string, std::string>> merges;
+
   // We may see duplicated pieces that are extracted with different path.
   // In real segmentation phase, we can consider them as one symbol.
   // e.g., "aaa" => "aa" + "a" or "a" + "aa".
@@ -349,6 +364,13 @@ absl::Status Trainer::Train() {
     final_pieces_.emplace_back(best_symbol->ToString(),
                                -static_cast<float>(final_pieces_.size()));
 
+    // Both halves are current segments, so each is either a required char or
+    // an already-accepted piece — never something absent from the vocabulary.
+    if (best_symbol->IsBigram()) {
+      merges.emplace_back(best_symbol->left->ToString(),
+                          best_symbol->right->ToString());
+    }
+
     if (final_pieces_.size() % 20 == 0) {
       LOG(INFO) << "Added: freq=" << best_symbol->freq
                 << " size=" << final_pieces_.size()
@@ -375,10 +397,99 @@ absl::Status Trainer::Train() {
                                -static_cast<float>(final_pieces_.size()));
   }
 
+  RETURN_IF_ERROR(SaveMerges(merges));
+
   allocated_.clear();
   symbols_cache_.clear();
 
   return Save();
+}
+
+absl::Status Trainer::ApplySeedMerges() {
+  // Replays the seed tokenizer's merges onto the corpus, in rank order, so
+  // that learning starts from the segmentation the seed actually produces.
+  // Nothing is added to the vocabulary here — the pieces are already in it via
+  // protected_pieces_file; what changes is only how the corpus is segmented.
+  //
+  // A merge whose halves are not currently present, or whose pair does not
+  // occur in this corpus, simply does not fire. That is not an error: a seed
+  // trained on other data will always carry merges this corpus cannot
+  // exercise, and the piece keeps its vocabulary slot regardless.
+  const std::string& filename =
+      trainer_spec_.GetExtension(::sentencepiece::seed_merges_file);
+  if (filename.empty()) return absl::OkStatus();
+
+  auto input = filesystem::NewReadableFile(filename);
+  RET_CHECK(input->status().ok())
+      << "Cannot open seed_merges_file: " << filename;
+
+  // The symbol currently representing each piece string. Seeded with the
+  // characters, extended by each merge that fires.
+  absl::flat_hash_map<std::string, Symbol*> by_string;
+  for (const auto& w : required_chars_) {
+    Symbol* symbol = GetCharSymbol(w.first);
+    by_string[symbol->ToString()] = symbol;
+  }
+
+  std::string line;
+  int applied = 0, skipped = 0;
+  while (input->ReadLine(&line)) {
+    const auto tab = line.find('\t');
+    if (tab == std::string::npos) continue;
+    const auto left = by_string.find(line.substr(0, tab));
+    const auto right = by_string.find(line.substr(tab + 1));
+    if (left == by_string.end() || right == by_string.end()) {
+      ++skipped;
+      continue;
+    }
+    Symbol* symbol = GetPairSymbol(left->second, right->second);
+    if (symbol == nullptr || !symbol->active) {
+      ++skipped;
+      continue;
+    }
+    // Positions recorded at scan time go stale as earlier merges consume them.
+    // ComputeFreq drops the dead ones; without it AcceptSymbol walks into a
+    // half-merged position and trips its RET_CHECK.
+    symbol->needs_recomputation = true;
+    ComputeFreq(symbol);
+    if (symbol->freq == 0) {
+      ++skipped;
+      continue;
+    }
+    by_string[symbol->ToString()] = symbol;
+    RETURN_IF_ERROR(AcceptSymbol(symbol));
+    ++applied;
+
+    for (Symbol* pending : pending_queue_) {
+      pending->pending = false;
+      if (pending->active) {
+        ComputeFreq(pending);
+        pq_.push({pending->freq, pending});
+      }
+    }
+    pending_queue_.clear();
+  }
+
+  LOG(INFO) << "Applied " << applied << " seed merges (" << skipped
+            << " did not fire on this corpus)";
+  return absl::OkStatus();
+}
+
+absl::Status Trainer::SaveMerges(
+    const std::vector<std::pair<std::string, std::string>>& merges) const {
+  // Written beside .model and .vocab, in learned order: one merge per line,
+  // "left<TAB>right". Tab-separated because a piece may contain a space (the
+  // whitespace marker is a piece character), which the usual space-separated
+  // merges.txt cannot express.
+  if (trainer_spec_.model_prefix().empty()) return absl::OkStatus();
+  const std::string filename = trainer_spec_.model_prefix() + ".merges";
+  LOG(INFO) << "Saving merges: " << filename;
+  auto output = filesystem::NewWritableFile(filename);
+  RETURN_IF_ERROR(output->status());
+  for (const auto& merge : merges) {
+    RET_CHECK(output->WriteLine(merge.first + "\t" + merge.second));
+  }
+  return absl::OkStatus();
 }
 
 #ifdef SPM_NLCODEC_BPE

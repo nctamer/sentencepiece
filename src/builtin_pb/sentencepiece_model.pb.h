@@ -2073,6 +2073,10 @@ static const int kProtectedPiecesFileFieldNumber = 204;
 extern ::PROTOBUF_NAMESPACE_ID::internal::ExtensionIdentifier< ::sentencepiece::TrainerSpec,
     ::PROTOBUF_NAMESPACE_ID::internal::StringTypeTraits, 9, false >
   protected_pieces_file;
+static const int kSeedMergesFileFieldNumber = 205;
+extern ::PROTOBUF_NAMESPACE_ID::internal::ExtensionIdentifier< ::sentencepiece::TrainerSpec,
+    ::PROTOBUF_NAMESPACE_ID::internal::StringTypeTraits, 9, false >
+  seed_merges_file;
 
 // ===================================================================
 

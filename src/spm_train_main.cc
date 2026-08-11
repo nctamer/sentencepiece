@@ -87,6 +87,9 @@ ABSL_FLAG(bool, split_by_barline, false,
           "split only at whitespace followed by | (intermo barline only)");
 ABSL_FLAG(std::string, protected_pieces_file, "",
           "unigram: pieces to protect from pruning (one per line)");
+ABSL_FLAG(std::string, seed_merges_file, "",
+          "bpe: seed tokenizer's merges, left<TAB>right per line in rank "
+          "order; replayed onto the corpus before learning");
 ABSL_FLAG(std::string, pretokenization_delimiter,
           kDefaultTrainerSpec.pretokenization_delimiter(),
           "specifies the delimiter of pre-tokenization");
@@ -249,6 +252,8 @@ int main(int argc, char* argv[]) {
                             absl::GetFlag(FLAGS_split_by_barline));
   trainer_spec.SetExtension(::sentencepiece::protected_pieces_file,
                             absl::GetFlag(FLAGS_protected_pieces_file));
+  trainer_spec.SetExtension(::sentencepiece::seed_merges_file,
+                            absl::GetFlag(FLAGS_seed_merges_file));
   SetTrainerSpecFromFlag(pretokenization_delimiter);
   SetTrainerSpecFromFlag(byte_fallback);
   SetTrainerSpecFromFlag(treat_whitespace_as_suffix);

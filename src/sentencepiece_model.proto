@@ -266,6 +266,20 @@ extend TrainerSpec {
   // and appear in the final model. Their probabilities are freely estimated.
   // Works for both BPE and unigram model types.
   optional string protected_pieces_file = 204 [default = ""];
+
+  // Path to the seed tokenizer's merge list, "left<TAB>right" per line in
+  // rank order — the format this trainer writes as <model_prefix>.merges.
+  //
+  // BPE only, and only meaningful with protected_pieces_file. Those pieces
+  // enter the VOCABULARY but, on their own, never touch the corpus: the
+  // trainer keeps segmenting from raw characters, so it learns merges that
+  // contradict the seed's own. Such a merge cannot fire in any rank-ordered
+  // tokenizer built from the result, because the seed merge outranks it —
+  // 5.9% of learned pieces were unreachable this way, each holding an
+  // embedding row no input could produce. Replaying the seed's merges first
+  // makes the corpus look the way the seed tokenizer sees it, so every merge
+  // learned on top of it composes seed pieces and stays reachable.
+  optional string seed_merges_file = 205 [default = ""];
 }
 
 // NormalizerSpec encodes a various parameters for string normalizaiton
