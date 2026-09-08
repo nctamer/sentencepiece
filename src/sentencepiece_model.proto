@@ -57,308 +57,133 @@ message TrainerSpec {
   optional int32 vocab_size = 4 [default = 8000];
 
   // List of the languages this model can accept.
-  // Since the model is language-agnostic, this field is used as a reference.
   repeated string accept_language = 5;
 
   ///////////////////////////////////////////////////////////////////
   // Training parameters.
-  //
-  // Uses characters which cover the corpus with the ratio of `chars_coverage`.
-  // This parameter determines the set of basic Alphabet of sentence piece.
-  // 1.0 - `chars_coverage` characters are treated as UNK.
-  // See also required_chars field.
   optional float character_coverage = 10 [default = 0.9995];
-
-  // Maximum size of sentences the trainer loads from `input` parameter.
-  // Trainer simply loads the `input` files in sequence.
-  // It is better to shuffle the input corpus randomly.
   optional uint64 input_sentence_size = 11 [default = 0];
   optional bool shuffle_input_sentence = 19 [default = true];
-
-  // The size of seed sentencepieces.
-  // `seed_sentencepiece_size` must be larger than `vocab_size`.
   optional int32 seed_sentencepiece_size = 14 [default = 1000000];
-
-  // In every EM sub-iterations, keeps top
-  // `shrinking_factor` * `current sentencepieces size` with respect to
-  // the loss of the sentence piece. This value should be smaller than 1.0.
   optional float shrinking_factor = 15 [default = 0.75];
-
-  // The maximum sentence length in byte. The sentences with the length
-  // larger than `max_sentence_length` is simply ignored.
-  // Longer input tends to bring the following risks:
-  //  * Overflow during EM training (unigram language model only)
-  //  * Performance drop because of O(n log n) cost in BPE.
   optional int32 max_sentence_length = 18 [default = 4192];
-
-  // Number of threads in the training.
   optional int32 num_threads = 16 [default = 16];
-
-  // Number of EM sub iterations.
   optional int32 num_sub_iterations = 17 [default = 2];
 
   ///////////////////////////////////////////////////////////////////
   // SentencePiece parameters which control the shapes of sentence piece.
-  //
-  // Maximum length of sentencepiece.
   optional int32 max_sentencepiece_length = 20 [default = 16];
-
-  // Uses Unicode script to split sentence pieces.
-  // When `split_by_unicode_script` is true, we do not allow sentence piece to
-  // include multiple Unicode scripts, e.g. "F1" is not a valid piece.
-  // Exception: CJ characters (Hiragana/Katakana/Han) are all handled
-  // as one script type, since Japanese word can consist of multiple scripts.
-  // This exception is always applied regardless of the accept-language
-  // parameter.
   optional bool split_by_unicode_script = 21 [default = true];
-
-  // When `split_by_number` is true, put a boundary between number and
-  // non-number transition. If we want to treat "F1" is one token, set this flag
-  // to be false.
   optional bool split_by_number = 23 [default = true];
-
-  // Use a white space to split sentence pieces.
-  // When `split_by_whitespace` is false, we may have the piece containing
-  // a white space in the middle. e.g., "in_the".
   optional bool split_by_whitespace = 22 [default = true];
-
-  // Adds whitespace symbol (_) as a suffix instead of prefix. e.g., _hello =>
-  // hello_. When `treat_whitespace_as_suffix` is true,
-  // NormalizerSpec::add_dummy_prefix will add the dummy whitespace to the end
-  // of sentence.
   optional bool treat_whitespace_as_suffix = 24 [default = false];
-
-  // Allows pieces that only contain whitespaces instead of appearing only as
-  // prefix or suffix of other pieces.
   optional bool allow_whitespace_only_pieces = 26 [default = false];
-
-  // Split all digits (0-9) into separate pieces.
   optional bool split_digits = 25 [default = false];
-
-  // Defines the pre-tokenization delimiter.
-  // When specified, no pieces crossing this delimiter is not included
-  // in the vocab. Then the delimiter string is virtually ignored
-  // during the training. This field can allows constraints on the vocabulary
-  // selection. Note that this field is available on unigram mode.
   optional string pretokenization_delimiter = 53 [default = ""];
 
   ///////////////////////////////////////////////////////////////////
   // Vocabulary management
-  //
-  // Defines control symbols used as an indicator to
-  // change the behavior of the decoder. <s> and </s> are pre-defined.
-  // We can use this field to encode various meta information,
-  // including language indicator in multilingual model.
-  // These symbols are not visible to users, but visible to
-  // the decoder. Note that when the input sentence contains control symbols,
-  // they are not treated as one token, but segmented into normal pieces.
-  // Control symbols must be inserted independently from the segmentation.
   repeated string control_symbols = 30;
-
-  // Defines user defined symbols.
-  // These symbols are added with extremely high score
-  // so they are always treated as one unique symbol in any context.
-  // Typical usage of user_defined_symbols is placeholder for named entities.
   repeated string user_defined_symbols = 31;
-
-  // Defines required characters. Each UTF8 character in this string is included
-  // in the character set regardless of character_coverage value. Unlike
-  // user_defined_symbols, these characters have scores based on the frequency
-  // on input sentences, and the model can form subwords using characters
-  // in this field.
   optional string required_chars = 36;
-
-  // Decomposes unknown pieces into UTF-8 bytes.
   optional bool byte_fallback = 35 [default = false];
-
-  // When creating the vocabulary file, defines whether or not to additionally
-  // output the score for each piece.
   optional bool vocabulary_output_piece_score = 32 [default = true];
-
-  // `vocab_size` is treated as hard limit. Crash if
-  // the model can not produce the vocab of size `vocab_size`,
-  // When `hard_vocab_limit` is false, vocab_size is treated
-  // as soft limit. Note that when model_type=char,
-  // always assumes hard_vocab_limit = false.
   optional bool hard_vocab_limit = 33 [default = true];
-
-  // use all symbols for vocab extraction. This flag is valid
-  // if model type is either CHAR or WORD
   optional bool use_all_vocab = 34 [default = false];
 
   ///////////////////////////////////////////////////////////////////
   // Reserved special meta tokens.
-  // * -1 is not used.
-  // * unk_id must not be -1.
-  // Id must starts with 0 and be contigous.
-  optional int32 unk_id = 40 [default = 0];   // <unk>
-  optional int32 bos_id = 41 [default = 1];   // <s>
-  optional int32 eos_id = 42 [default = 2];   // </s>
-  optional int32 pad_id = 43 [default = -1];  // <pad> (padding)
+  optional int32 unk_id = 40 [default = 0];
+  optional int32 bos_id = 41 [default = 1];
+  optional int32 eos_id = 42 [default = 2];
+  optional int32 pad_id = 43 [default = -1];
   optional string unk_piece = 45 [default = "<unk>"];
   optional string bos_piece = 46 [default = "<s>"];
   optional string eos_piece = 47 [default = "</s>"];
   optional string pad_piece = 48 [default = "<pad>"];
-
-  // Encodes <unk> into U+2047 (DOUBLE QUESTION MARK),
-  // since this character can be useful both for user and
-  // developer. We can easily figure out that <unk> is emitted.
   optional string unk_surface = 44 [default = " \xE2\x81\x87 "];
-
-  // Increase bit depth to allow unigram model training on large
-  // (>10M sentences) corpora. A Side-effect of enabling this flag
-  // is increased memory usage.
   optional bool train_extremely_large_corpus = 49 [default = false];
-
-  // Path to a seed sentencepieces file, with one tab-separated
-  // seed sentencepiece <tab> frequency per line.
   optional string seed_sentencepieces_file = 54 [default = ""];
 
-  ///////////////////////////////////////////////////////////////////
-  // Tokenizer continuation / expansion.
+  // First-class continuation inputs. These fields intentionally live in the
+  // ordinary TrainerSpec range so all language bindings and spec parsers can
+  // transport them without knowing about a tokenizer family adapter.
   //
-  // `expansion_spec` is a serialized ExpansionSpec. It is authoritative for
-  // inherited external IDs, piece roles, BPE merge ranks, bootstrap state and
-  // fingerprints. It is currently the canonical BPE-continuation input.
+  // BPE: binary ExpansionSpec. The adapter that creates it is authoritative for
+  // external IDs, merge ranks, reversible atomic alphabet and boundary policy.
   optional string expansion_spec = 55 [default = ""];
 
-  // Optional output path for the serialized ExpansionResult. If empty,
-  // continuation trainers write <model_prefix>.expansion.
+  // Optional binary ExpansionResult output path. If empty, continuation writes
+  // <model_prefix>.expansion when model_prefix is available.
   optional string expansion_result = 56 [default = ""];
 
-  // Native SentencePiece Unigram continuation input. The complete prior
-  // ModelProto is authoritative: piece index is the inherited token ID, and
-  // piece/type/score/normalizer state is inherited from that model.
+  // Native Unigram continuation: authoritative prior SentencePiece ModelProto.
+  // All inherited piece IDs/types are copied from this file; inherited NORMAL
+  // scores are constrained to the common additive-length gauge during EM.
   optional string unigram_prior_model = 57 [default = ""];
 
-  reserved 6;   // Deprecated self_test_sample_size.
-  reserved 12;  // Deprecated mining_sentence_size.
-  reserved 13;  // Deprecated training_sentence_size.
-  reserved 50;  // Deprecated enable_differential_privacy.
-  reserved 51;  // Deprecated differential_privacy_noise_level.
-  reserved 52;  // Deprecated differential_privacy_clipping_threshold.
+  reserved 6;
+  reserved 12;
+  reserved 13;
+  reserved 50;
+  reserved 51;
+  reserved 52;
 
-  // Extension ids 200-205 were used by an earlier Intermo-specific fork
-  // (interval/barline splitting, retired phase controls, protected pieces and
-  // seed-merges). They are intentionally retired and must not be reused.
+  // The old fork used extension IDs 200-205 for Intermo-specific splitting,
+  // protected-piece files and seed-merge files. Continuation is a clean break:
+  // never reuse those numbers for a new wire meaning.
+  reserved 200 to 205;
   extensions 206 to max;
 }
 
-// NormalizerSpec encodes a various parameters for string normalizaiton
 message NormalizerSpec {
-  // name of normalization rule.
   optional string name = 1;
-
-  // Pre-compiled normalization rule created by
-  // Builder::GetPrecompiledCharsMap() or Builder::CompileCharsMap() method.
-  // Usually this field is set by Builder::GetNormalizerSpec() method.
   optional bytes precompiled_charsmap = 2;
-
-  // Adds dummy whitespace at the beginning of text in order to
-  // treat "world" in "world" and "hello world" in the same way.
   optional bool add_dummy_prefix = 3 [default = true];
-
-  // Removes leading, trailing, and duplicate internal whitespace.
   optional bool remove_extra_whitespaces = 4 [default = true];
-
-  // Replaces whitespace with meta symbol.
-  // This field must be true to train sentence piece model.
   optional bool escape_whitespaces = 5 [default = true];
-
-  // Custom normalization rule file in TSV format.
-  // https://github.com/google/sentencepiece/blob/master/doc/normalization.md
-  // This field is only used in SentencePieceTrainer::Train() method, which
-  // compiles the rule into the binary rule stored in `precompiled_charsmap`.
   optional string normalization_rule_tsv = 6;
-
-  // Customized extensions: the range of field numbers
-  // are open to third-party extensions.
   extensions 200 to max;
 }
 
-// ModelProto stores model parameters.
-// SentencePieceProcessor is supposed to be self-contained.
-// All settings/parameters which may change the behavior must be encoded
-// in ModelProto.
-message ModelProto {
-  message SentencePiece {
-    enum Type {
-      NORMAL = 1;        // normal symbol
-      UNKNOWN = 2;       // unknown symbol. only <unk> for now.
-      CONTROL = 3;       // control symbols. </s>, <s>, <2ja> etc.
-      USER_DEFINED = 4;  // user defined symbols.
-                         // Typical usage of USER_DEFINED symbol
-                         // is placeholder.
-      BYTE = 6;          // byte symbols. Used when `byte_fallback` is true.
-      UNUSED = 5;        // this piece is not used.
-    }
-    optional string piece = 1;  // piece must not be empty.
-    optional float score = 2;
-    optional Type type = 3 [default = NORMAL];
-
-    // Customized extensions: the range of field numbers
-    // are open to third-party extensions.
-    extensions 200 to max;
-  }
-
-  // Sentence pieces with scores.
-  repeated SentencePiece pieces = 1;
-
-  // Spec used to generate this model file.
-  optional TrainerSpec trainer_spec = 2;
-
-  // Spec for text normalization.
-  optional NormalizerSpec normalizer_spec = 3;
-
-  // Spec for text de-normalization.
-  optional NormalizerSpec denormalizer_spec = 5;
-
-  // Continuation provenance, when this native ModelProto is itself the output
-  // of a continuation trainer. External-tokenizer expansion remains governed
-  // by the standalone ExpansionResult sidecar.
-  optional ExpansionResult expansion_result = 6;
-
-  reserved 4;  // Deprecated self_test_data.
-
-  // Customized extensions: the range of field numbers
-  // are open to third-party extensions.
-  extensions 200 to max;
-}
-
-// Tokenizer-family-neutral state used by continuation adapters.
-enum ExpansionModelType {
-  EXPANSION_MODEL_UNSPECIFIED = 0;
-  EXPANSION_BPE = 1;
-  EXPANSION_UNIGRAM = 2;
-}
-
-// One externally visible tokenizer piece. `external_id` is the embedding-row
-// ABI, not an incidental trainer-local index. `atomic` means the piece is one
-// atom of the reversible training alphabet; `mergeable` excludes specials or
-// AddedTokens which must retain identity but must not participate in BPE.
+// A piece in an external tokenizer's immutable ID ABI or in its appended
+// continuation region. `atomic` is meaningful for BPE: the piece is exactly one
+// atom in the reversible representation supplied by the tokenizer adapter.
+// Atomic strings may contain multiple Unicode scalars; a valid ExpansionSpec
+// must induce exactly one segmentation of every continuation corpus record into
+// declared atomic strings. Ambiguous or uncovered records are rejected before
+// merge replay/learning.
 message ExpansionPiece {
-  optional int32 external_id = 1 [default = -1];
-  optional string piece = 2;
+  required int32 external_id = 1;
+  required string piece = 2;
   optional ModelProto.SentencePiece.Type type = 3 [default = NORMAL];
   optional float score = 4 [default = 0.0];
   optional bool mergeable = 5 [default = true];
   optional bool atomic = 6 [default = false];
 }
 
-// One exact binary BPE construction. Ranks are total and deterministic within
-// each list. The child is always `left + right` and is therefore not stored.
+// One exact BPE construction. `rank` is rank within the list in which the
+// message appears in ExpansionSpec; ExpansionResult rewrites it to the final
+// effective rank. `external_id` names the child `left + right`.
 message ExpansionMerge {
-  optional int32 rank = 1 [default = -1];
-  optional string left = 2;
-  optional string right = 3;
+  required int32 rank = 1;
+  required string left = 2;
+  required string right = 3;
   optional int32 external_id = 4 [default = -1];
 }
 
-// Authoritative input for external-tokenizer continuation.
+enum ExpansionModelType {
+  EXPANSION_UNSPECIFIED = 0;
+  EXPANSION_BPE = 1;
+  EXPANSION_UNIGRAM = 2;
+}
+
+// Adapter-produced authoritative continuation state. Generic trainer code must
+// not reconstruct merge ranks, IDs, token types, regexes, byte mappings or
+// tokenizer-specific grammar from piece strings.
 message ExpansionSpec {
-  optional uint32 schema_version = 1 [default = 1];
-  optional ExpansionModelType model_type = 2
-      [default = EXPANSION_MODEL_UNSPECIFIED];
+  optional int32 schema_version = 1 [default = 1];
+  required ExpansionModelType model_type = 2;
   repeated ExpansionPiece base_pieces = 3;
   repeated ExpansionMerge base_merges = 4;
   repeated ExpansionPiece bootstrap_pieces = 5;
@@ -366,8 +191,6 @@ message ExpansionSpec {
   optional bool preserve_base_ids = 7 [default = true];
   optional bool allow_rank_prepend = 8 [default = false];
   optional int32 first_new_external_id = 9 [default = -1];
-  // Number of ordinary learned expansion pieces. Bootstrap pieces are tracked
-  // separately and do not consume this budget.
   optional int32 requested_new_pieces = 10 [default = 0];
   optional string vocab_sha256 = 11;
   optional string merges_sha256 = 12;
@@ -376,13 +199,12 @@ message ExpansionSpec {
   optional string boundary_policy = 15;
 }
 
-// Self-auditing continuation output. A consumer can reconstruct the complete
-// external token-ID ABI and final BPE merge program without guessing a split
-// from token strings.
+// Self-auditing continuation artifact. This is authoritative for external
+// tokenizers even when their sparse ID space cannot be represented faithfully
+// by a native contiguous SentencePiece ModelProto.
 message ExpansionResult {
-  optional uint32 schema_version = 1 [default = 1];
-  optional ExpansionModelType model_type = 2
-      [default = EXPANSION_MODEL_UNSPECIFIED];
+  optional int32 schema_version = 1 [default = 1];
+  required ExpansionModelType model_type = 2;
   repeated ExpansionPiece base_pieces = 3;
   repeated ExpansionPiece bootstrap_pieces = 4;
   repeated ExpansionPiece learned_pieces = 5;
@@ -400,9 +222,40 @@ message ExpansionResult {
   optional string pretokenizer_sha256 = 17;
   optional string boundary_policy = 18;
 
-  // Native Unigram continuation provenance.
+  // Native Unigram continuation audit fields.
   optional string prior_model_sha256 = 19;
   optional int32 prior_piece_count = 20 [default = 0];
   optional double unigram_lambda = 21 [default = 0.0];
   optional double unigram_score_gauge_max_error = 22 [default = 0.0];
+}
+
+// ModelProto stores model parameters.
+message ModelProto {
+  message SentencePiece {
+    enum Type {
+      NORMAL = 1;
+      UNKNOWN = 2;
+      CONTROL = 3;
+      USER_DEFINED = 4;
+      BYTE = 6;
+      UNUSED = 5;
+    }
+    optional string piece = 1;
+    optional float score = 2;
+    optional Type type = 3 [default = NORMAL];
+    extensions 200 to max;
+  }
+
+  repeated SentencePiece pieces = 1;
+  optional TrainerSpec trainer_spec = 2;
+  optional NormalizerSpec normalizer_spec = 3;
+  optional NormalizerSpec denormalizer_spec = 5;
+
+  // Present only on continuation-produced native models. External-tokenizer
+  // adapters should use the standalone ExpansionResult as the source of truth
+  // when the external ID space is sparse or otherwise non-native.
+  optional ExpansionResult expansion_result = 6;
+
+  reserved 4;
+  extensions 200 to max;
 }
