@@ -6,6 +6,9 @@
 #include "bpe_continuation_trainer.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -45,15 +48,20 @@ ContinuationTrainer::Position ContinuationTrainer::DecodePos(uint64_t n) {
                   static_cast<int>(n & 0xffff)};
 }
 
-ContinuationTrainer::Symbol* ContinuationTrainer::GetCharSymbol(char32_t c) {
-  const uint64_t fp = absl::HashOf(uint64_t{0}, static_cast<uint32_t>(c));
+ContinuationTrainer::Symbol* ContinuationTrainer::GetAtomicSymbol(
+    absl::string_view atom) {
+  const uint64_t fp = absl::HashOf(uint64_t{0}, atom);
   const auto it = symbols_cache_.find(fp);
-  if (it != symbols_cache_.end()) return it->second;
+  if (it != symbols_cache_.end()) {
+    CHECK_EQ(it->second->ToString(), atom)
+        << "hash collision in BPE continuation atomic alphabet";
+    return it->second;
+  }
 
   auto s = std::make_unique<Symbol>();
-  s->is_unk = (kUNKChar == c);
   s->fp = fp;
-  s->chars.push_back(c);
+  s->chars = string_util::UTF8ToUnicodeText(atom);
+  s->is_unk = (s->chars.size() == 1 && s->chars.front() == kUNKChar);
   s->freq = 1;
   Symbol* out = s.get();
   symbols_cache_.emplace(fp, out);
@@ -68,7 +76,13 @@ ContinuationTrainer::Symbol* ContinuationTrainer::GetPairSymbol(
   }
   const uint64_t fp = absl::HashOf(uint64_t{1}, left->fp, right->fp);
   const auto it = symbols_cache_.find(fp);
-  if (it != symbols_cache_.end()) return it->second;
+  if (it != symbols_cache_.end()) {
+    CHECK_EQ(it->second->left, left)
+        << "hash collision in BPE continuation pair cache";
+    CHECK_EQ(it->second->right, right)
+        << "hash collision in BPE continuation pair cache";
+    return it->second;
+  }
 
   string_util::UnicodeText chars = left->chars;
   chars.insert(chars.end(), right->chars.begin(), right->chars.end());
@@ -166,6 +180,162 @@ void ContinuationTrainer::DrainPendingQueue() {
   pending_queue_.clear();
 }
 
+absl::Status ContinuationTrainer::SegmentAtoms(
+    absl::string_view text, std::vector<std::string>* atoms) const {
+  RET_CHECK(atoms != nullptr);
+  atoms->clear();
+  if (text.empty()) return absl::OkStatus();
+  if (atomic_pieces_ordered_.empty()) {
+    return absl::InvalidArgumentError(
+        "BPE continuation has an empty reversible atomic alphabet");
+  }
+
+  // ways[pos] is capped at two: 0 = impossible, 1 = unique, 2 = ambiguous.
+  // Positions are byte offsets. Because every transition consumes a complete
+  // structurally-valid atomic token, every reachable position is a valid UTF-8
+  // boundary even when an atom spans multiple Unicode scalars.
+  const size_t n = text.size();
+  std::vector<unsigned char> ways(n + 1, 0);
+  std::vector<int> choice(n + 1, -1);
+  ways[n] = 1;
+
+  for (size_t reverse = 0; reverse < n; ++reverse) {
+    const size_t pos = n - reverse - 1;
+    int total = 0;
+    int unique_choice = -1;
+    for (size_t i = 0; i < atomic_pieces_ordered_.size(); ++i) {
+      const std::string& atom = atomic_pieces_ordered_[i];
+      if (atom.size() > n - pos || ways[pos + atom.size()] == 0) continue;
+      if (text.substr(pos, atom.size()) != atom) continue;
+      if (total == 0 && ways[pos + atom.size()] == 1) {
+        unique_choice = static_cast<int>(i);
+      } else {
+        unique_choice = -1;
+      }
+      total = std::min(2, total + static_cast<int>(ways[pos + atom.size()]));
+      if (total == 2) unique_choice = -1;
+    }
+    ways[pos] = static_cast<unsigned char>(total);
+    if (total == 1) choice[pos] = unique_choice;
+  }
+
+  if (ways[0] == 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "text cannot be segmented by the inherited reversible atomic "
+        "alphabet: ", text));
+  }
+  if (ways[0] != 1) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "declared BPE atomic alphabet is ambiguous for text: ", text));
+  }
+
+  size_t pos = 0;
+  while (pos < n) {
+    const int index = choice[pos];
+    if (index < 0 || index >= static_cast<int>(atomic_pieces_ordered_.size())) {
+      return absl::InternalError(
+          "unique atomic segmentation lost its reconstruction choice");
+    }
+    const std::string& atom = atomic_pieces_ordered_[index];
+    atoms->push_back(atom);
+    pos += atom.size();
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ContinuationTrainer::ValidateMergeProgram(
+    const std::vector<ExpansionMerge>& merges,
+    bool require_all_declared_pieces) const {
+  std::set<std::string> constructible(atomic_pieces_ordered_.begin(),
+                                      atomic_pieces_ordered_.end());
+  std::set<std::pair<std::string, std::string>> seen_pairs;
+  std::set<std::string> constructed_children;
+  std::map<std::string, std::pair<int, bool>> pieces;
+
+  auto add_piece = [&](const ExpansionPiece& piece) -> absl::Status {
+    const auto inserted = pieces.emplace(
+        piece.piece(), std::make_pair(piece.external_id(), piece.mergeable()));
+    if (!inserted.second) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("duplicate declared piece string: ", piece.piece()));
+    }
+    return absl::OkStatus();
+  };
+  for (const auto& piece : base_pieces_) ABSL_RETURN_IF_ERROR(add_piece(piece));
+  for (const auto& piece : bootstrap_pieces_) {
+    ABSL_RETURN_IF_ERROR(add_piece(piece));
+  }
+  for (const auto& piece : learned_pieces_) {
+    ABSL_RETURN_IF_ERROR(add_piece(piece));
+  }
+
+  for (size_t i = 0; i < merges.size(); ++i) {
+    const ExpansionMerge& merge = merges[i];
+    if (merge.rank() != static_cast<int>(i)) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "effective merge ranks must be contiguous from zero; expected ", i,
+          " got ", merge.rank()));
+    }
+    if (merge.left().empty() || merge.right().empty()) {
+      return absl::InvalidArgumentError("merge parents must be nonempty");
+    }
+    if (!seen_pairs.insert({merge.left(), merge.right()}).second) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "duplicate merge pair in effective program: ", merge.left(), " + ",
+          merge.right()));
+    }
+    if (!constructible.count(merge.left()) ||
+        !constructible.count(merge.right())) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "merge parents are not constructible at effective rank ",
+          merge.rank(), ": ", merge.left(), " + ", merge.right()));
+    }
+
+    const std::string child = merge.left() + merge.right();
+    const auto piece_it = pieces.find(child);
+    if (piece_it == pieces.end() || !piece_it->second.second) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "merge child is missing or nonmergeable at effective rank ",
+          merge.rank(), ": ", child));
+    }
+    if (merge.external_id() != piece_it->second.first) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "merge child external_id mismatch for ", child, ": merge says ",
+          merge.external_id(), " but piece says ", piece_it->second.first));
+    }
+    if (!constructed_children.insert(child).second) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "piece has multiple merge constructions in effective program: ",
+          child));
+    }
+    constructible.insert(child);
+  }
+
+  if (require_all_declared_pieces) {
+    auto require_piece = [&](const ExpansionPiece& piece) -> absl::Status {
+      if (piece.mergeable() && !piece.atomic() &&
+          !constructible.count(piece.piece())) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "mergeable declared piece has no construction in effective rank "
+            "program: ",
+            piece.piece()));
+      }
+      return absl::OkStatus();
+    };
+    for (const auto& piece : base_pieces_) {
+      ABSL_RETURN_IF_ERROR(require_piece(piece));
+    }
+    for (const auto& piece : bootstrap_pieces_) {
+      ABSL_RETURN_IF_ERROR(require_piece(piece));
+    }
+    for (const auto& piece : learned_pieces_) {
+      ABSL_RETURN_IF_ERROR(require_piece(piece));
+    }
+  }
+
+  return absl::OkStatus();
+}
+
 absl::Status ContinuationTrainer::LoadAndValidateSpec() {
   if (trainer_spec_.expansion_spec().empty()) {
     return absl::InvalidArgumentError(
@@ -221,17 +391,33 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
       return absl::InvalidArgumentError(
           absl::StrCat("duplicate base external_id: ", piece.external_id()));
     }
+    if (!string_util::IsStructurallyValid(piece.piece())) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("base piece is not structurally valid UTF-8: ",
+                       piece.piece()));
+    }
     if (!base_by_string.emplace(piece.piece(), piece).second) {
       return absl::InvalidArgumentError(
           absl::StrCat("duplicate base piece string: ", piece.piece()));
+    }
+    if (piece.atomic() && !piece.mergeable()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "atomic BPE pieces must be mergeable: ", piece.piece()));
     }
     max_id = std::max(max_id, piece.external_id());
     existing_piece_strings_.insert(piece.piece());
     if (piece.atomic() ||
         (piece.mergeable() && string_util::UTF8Len(piece.piece()) == 1)) {
-      atomic_piece_strings_.insert(piece.piece());
       piece.set_atomic(true);
+      atomic_piece_strings_.insert(piece.piece());
     }
+  }
+  atomic_pieces_ordered_.assign(atomic_piece_strings_.begin(),
+                                atomic_piece_strings_.end());
+  std::sort(atomic_pieces_ordered_.begin(), atomic_pieces_ordered_.end());
+  if (atomic_pieces_ordered_.empty()) {
+    return absl::InvalidArgumentError(
+        "ExpansionSpec has no mergeable reversible atomic BPE pieces");
   }
 
   first_new_external_id_ = expansion_spec_.first_new_external_id() >= 0
@@ -246,11 +432,18 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
 
   bootstrap_pieces_.assign(expansion_spec_.bootstrap_pieces().begin(),
                            expansion_spec_.bootstrap_pieces().end());
+  std::map<std::string, int> bootstrap_ids;
   for (auto& piece : bootstrap_pieces_) {
-    if (piece.piece().empty() || !piece.mergeable() ||
+    if (piece.piece().empty() || !piece.mergeable() || piece.atomic() ||
         piece.type() != ModelProto::SentencePiece::NORMAL) {
       return absl::InvalidArgumentError(
-          "bootstrap BPE pieces must be nonempty mergeable NORMAL pieces");
+          "bootstrap BPE pieces must be nonempty, constructed, mergeable "
+          "NORMAL pieces");
+    }
+    if (!string_util::IsStructurallyValid(piece.piece())) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("bootstrap piece is not structurally valid UTF-8: ",
+                       piece.piece()));
     }
     if (!existing_piece_strings_.insert(piece.piece()).second) {
       return absl::InvalidArgumentError(
@@ -262,93 +455,103 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
           " got ", piece.external_id()));
     }
     piece.set_external_id(next_external_id_++);
-    occupied_ids.insert(piece.external_id());
+    if (!occupied_ids.insert(piece.external_id()).second) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("bootstrap external ID collision: ", piece.external_id()));
+    }
+    bootstrap_ids[piece.piece()] = piece.external_id();
   }
 
   target_new_pieces_ = expansion_spec_.requested_new_pieces();
   if (target_new_pieces_ == 0) {
-    target_new_pieces_ = trainer_spec_.vocab_size() -
-                         static_cast<int>(base_pieces_.size()) -
-                         static_cast<int>(bootstrap_pieces_.size());
+    target_new_pieces_ = trainer_spec_.vocab_size() - next_external_id_;
   }
   if (target_new_pieces_ < 0) {
     return absl::InvalidArgumentError(
-        "requested vocabulary is smaller than inherited + bootstrap state");
+        "requested/final vocabulary is smaller than the occupied external ID "
+        "range after bootstrap allocation");
   }
 
   base_merges_.assign(expansion_spec_.base_merges().begin(),
                       expansion_spec_.base_merges().end());
-  std::sort(base_merges_.begin(), base_merges_.end(),
-            [](const ExpansionMerge& a, const ExpansionMerge& b) {
-              return a.rank() < b.rank();
-            });
+  bootstrap_merges_.assign(expansion_spec_.bootstrap_merges().begin(),
+                           expansion_spec_.bootstrap_merges().end());
+  auto rank_sort = [](const ExpansionMerge& a, const ExpansionMerge& b) {
+    return a.rank() < b.rank();
+  };
+  std::sort(base_merges_.begin(), base_merges_.end(), rank_sort);
+  std::sort(bootstrap_merges_.begin(), bootstrap_merges_.end(), rank_sort);
 
-  std::set<std::string> constructible = atomic_piece_strings_;
-  std::set<std::pair<std::string, std::string>> merge_pairs;
-  std::set<std::string> constructed_children;
-  for (size_t i = 0; i < base_merges_.size(); ++i) {
-    auto& merge = base_merges_[i];
-    if (merge.rank() != static_cast<int>(i)) {
-      return absl::InvalidArgumentError(
-          "base merge ranks must be unique and contiguous from zero");
+  auto validate_local_ranks = [](const std::vector<ExpansionMerge>& merges,
+                                 absl::string_view label) -> absl::Status {
+    for (size_t i = 0; i < merges.size(); ++i) {
+      if (merges[i].rank() != static_cast<int>(i)) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            label, " merge ranks must be unique and contiguous from zero; "
+            "expected ",
+            i, " got ", merges[i].rank()));
+      }
+      if (merges[i].left().empty() || merges[i].right().empty()) {
+        return absl::InvalidArgumentError(
+            absl::StrCat(label, " merge parents must be nonempty"));
+      }
     }
-    if (!merge_pairs.insert({merge.left(), merge.right()}).second) {
-      return absl::InvalidArgumentError("duplicate base merge pair");
+    return absl::OkStatus();
+  };
+  ABSL_RETURN_IF_ERROR(validate_local_ranks(base_merges_, "base"));
+  ABSL_RETURN_IF_ERROR(validate_local_ranks(bootstrap_merges_, "bootstrap"));
+
+  // First prove the inherited base tokenizer is a valid program on its own.
+  // Rank-prepending bootstrap state is not allowed to retroactively make a
+  // malformed inherited tokenizer constructible.
+  std::set<std::string> base_constructible(atomic_pieces_ordered_.begin(),
+                                           atomic_pieces_ordered_.end());
+  std::set<std::pair<std::string, std::string>> all_pairs;
+  std::set<std::string> base_children;
+  for (auto& merge : base_merges_) {
+    if (!all_pairs.insert({merge.left(), merge.right()}).second) {
+      return absl::InvalidArgumentError("duplicate inherited BPE merge pair");
     }
-    if (!constructible.count(merge.left()) ||
-        !constructible.count(merge.right())) {
+    if (!base_constructible.count(merge.left()) ||
+        !base_constructible.count(merge.right())) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "malformed base merge order: parents are not yet constructible at rank ",
-          merge.rank(), ": ", merge.left(), " + ", merge.right()));
+          "malformed inherited merge order at rank ", merge.rank(), ": ",
+          merge.left(), " + ", merge.right()));
     }
     const std::string child = merge.left() + merge.right();
     const auto child_it = base_by_string.find(child);
     if (child_it == base_by_string.end() || !child_it->second.mergeable()) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "base merge child is missing or nonmergeable: ", child));
+          "inherited merge child is missing or nonmergeable: ", child));
     }
-    if (!constructed_children.insert(child).second) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("base piece has multiple merge constructions: ", child));
+    if (child_it->second.atomic()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "piece cannot be both an atomic alphabet symbol and an inherited "
+          "merge child: ",
+          child));
+    }
+    if (!base_children.insert(child).second) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "inherited piece has multiple merge constructions: ", child));
     }
     merge.set_external_id(child_it->second.external_id());
-    constructible.insert(child);
+    base_constructible.insert(child);
   }
-
   for (const auto& piece : base_pieces_) {
-    if (piece.mergeable() && piece.type() == ModelProto::SentencePiece::NORMAL &&
-        !constructible.count(piece.piece())) {
+    if (piece.mergeable() && !piece.atomic() &&
+        !base_constructible.count(piece.piece())) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "mergeable base piece has no atomic/inherited construction: ",
+          "mergeable inherited piece is neither atomic nor constructed by the "
+          "inherited merge program: ",
           piece.piece()));
     }
   }
 
-  bootstrap_merges_.assign(expansion_spec_.bootstrap_merges().begin(),
-                           expansion_spec_.bootstrap_merges().end());
-  std::sort(bootstrap_merges_.begin(), bootstrap_merges_.end(),
-            [](const ExpansionMerge& a, const ExpansionMerge& b) {
-              return a.rank() < b.rank();
-            });
-  std::map<std::string, int> bootstrap_ids;
-  for (const auto& piece : bootstrap_pieces_) {
-    bootstrap_ids[piece.piece()] = piece.external_id();
-  }
-  for (size_t i = 0; i < bootstrap_merges_.size(); ++i) {
-    auto& merge = bootstrap_merges_[i];
-    if (merge.rank() != static_cast<int>(i)) {
-      return absl::InvalidArgumentError(
-          "bootstrap merge ranks must be unique and contiguous from zero");
-    }
-    if (!merge_pairs.insert({merge.left(), merge.right()}).second) {
+  std::set<std::string> bootstrap_children;
+  for (auto& merge : bootstrap_merges_) {
+    if (!all_pairs.insert({merge.left(), merge.right()}).second) {
       return absl::InvalidArgumentError(
           "bootstrap merge duplicates an inherited/bootstrap pair");
-    }
-    if (!constructible.count(merge.left()) ||
-        !constructible.count(merge.right())) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "bootstrap merge parents are not constructible: ", merge.left(),
-          " + ", merge.right()));
     }
     const std::string child = merge.left() + merge.right();
     const auto child_it = bootstrap_ids.find(child);
@@ -357,15 +560,20 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
           "bootstrap merge child is not declared as a bootstrap piece: ",
           child));
     }
-    merge.set_external_id(child_it->second);
-    constructible.insert(child);
-  }
-  for (const auto& piece : bootstrap_pieces_) {
-    if (!constructible.count(piece.piece())) {
+    if (!bootstrap_children.insert(child).second) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "bootstrap piece has no valid construction: ", piece.piece()));
+          "bootstrap piece has multiple merge constructions: ", child));
     }
+    merge.set_external_id(child_it->second);
   }
+
+  // This is the single authority for constructibility and rank semantics. With
+  // allow_rank_prepend=true it validates bootstrap -> base; otherwise it
+  // validates base -> bootstrap. Training will replay this exact same order and
+  // serialization will emit this exact same order.
+  const std::vector<ExpansionMerge> effective_prefix = EffectiveMergeTable();
+  ABSL_RETURN_IF_ERROR(
+      ValidateMergeProgram(effective_prefix, /*require_all_declared_pieces=*/true));
 
   return absl::OkStatus();
 }
@@ -381,14 +589,10 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
   sentences_ = corpus_.sentences;
   symbols_.resize(sentences_.size());
   for (size_t sid = 0; sid < sentences_.size(); ++sid) {
-    for (const char32_t c : string_util::UTF8ToUnicodeText(sentences_[sid].first)) {
-      const std::string atom = string_util::UnicodeCharToUTF8(c);
-      if (!atomic_piece_strings_.contains(atom)) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "continuation corpus requires an atom absent from the inherited "
-            "reversible alphabet: ", atom));
-      }
-      Symbol* symbol = GetCharSymbol(c);
+    std::vector<std::string> atoms;
+    ABSL_RETURN_IF_ERROR(SegmentAtoms(sentences_[sid].first, &atoms));
+    for (const std::string& atom : atoms) {
+      Symbol* symbol = GetAtomicSymbol(atom);
       symbols_[sid].push_back(symbol);
       live_by_string_[atom] = symbol;
     }
@@ -419,7 +623,8 @@ absl::Status ContinuationTrainer::ReplayMerges(
     if (symbol == nullptr) {
       return absl::InvalidArgumentError(absl::StrCat(
           label, " merge is incompatible with current trainer piece-shape "
-          "constraints: ", merge.left(), " + ", merge.right()));
+          "constraints at effective rank ", merge.rank(), ": ", merge.left(),
+          " + ", merge.right()));
     }
     symbol->needs_recomputation = true;
     ComputeFreq(symbol);
@@ -461,8 +666,10 @@ absl::Status ContinuationTrainer::LearnExpansion() {
     }
     const std::string child = best->ToString();
     if (existing_piece_strings_.contains(child)) {
-      // A rediscovered inherited/bootstrap string is not a new token and must
-      // not consume budget. Do not apply an unrecorded alternative ancestry.
+      // A rediscovered inherited/bootstrap string is not a new token and does
+      // not consume expansion budget. Applying an alternative ancestry here
+      // would mutate the corpus with a merge that is absent from the exported
+      // rank program, so the candidate is retired instead.
       symbols_cache_.erase(best->fp);
       best->active = false;
       continue;
@@ -483,8 +690,8 @@ absl::Status ContinuationTrainer::LearnExpansion() {
     merge.set_right(best->right->ToString());
     merge.set_external_id(piece.external_id());
 
-    // Provenance is captured at the acceptance point, before the corpus is
-    // mutated. There is never a later split-guessing step.
+    // Exact parent provenance is captured at the acceptance point, before the
+    // corpus is mutated. No exporter is ever asked to infer a split later.
     learned_pieces_.push_back(piece);
     learned_merges_.push_back(merge);
     existing_piece_strings_.insert(child);
@@ -540,22 +747,14 @@ bool ContinuationTrainer::IsReachable(
     absl::string_view piece, const std::vector<ExpansionMerge>& merges) const {
   std::map<std::pair<std::string, std::string>, int> pair_rank;
   for (const auto& merge : merges) {
-    const auto key = std::make_pair(merge.left(), merge.right());
-    const auto it = pair_rank.find(key);
-    if (it == pair_rank.end() || merge.rank() < it->second) {
-      pair_rank[key] = merge.rank();
-    }
+    pair_rank[{merge.left(), merge.right()}] = merge.rank();
   }
 
   std::vector<std::string> symbols;
-  for (const char32_t c : string_util::UTF8ToUnicodeText(piece)) {
-    std::string atom = string_util::UnicodeCharToUTF8(c);
-    if (!atomic_piece_strings_.contains(atom)) return false;
-    symbols.push_back(std::move(atom));
-  }
+  if (!SegmentAtoms(piece, &symbols).ok()) return false;
 
   size_t guard = 0;
-  while (symbols.size() > 1 && guard++ <= merges.size() + piece.size() + 1) {
+  while (symbols.size() > 1 && guard++ <= merges.size() + symbols.size() + 1) {
     int best_rank = std::numeric_limits<int>::max();
     std::pair<std::string, std::string> best_pair;
     bool found = false;
@@ -628,6 +827,13 @@ absl::Status ContinuationTrainer::BuildNativeModel(ModelProto* model) const {
 
 absl::Status ContinuationTrainer::FinalizeArtifacts() {
   const std::vector<ExpansionMerge> effective = EffectiveMergeTable();
+
+  // Stronger than per-piece reachability: first prove that the complete table
+  // we are about to serialize is a valid rank program from the declared atomic
+  // alphabet, including inherited, bootstrap and learned constructions.
+  ABSL_RETURN_IF_ERROR(
+      ValidateMergeProgram(effective, /*require_all_declared_pieces=*/true));
+
   int unreachable = 0;
   for (const auto& piece : learned_pieces_) {
     if (!IsReachable(piece.piece(), effective)) {
@@ -635,6 +841,11 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
       LOG(ERROR) << "unreachable learned BPE piece id=" << piece.external_id()
                  << " piece=" << piece.piece();
     }
+  }
+  if (unreachable != 0) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "BPE expansion failed reachability verification: ", unreachable,
+        " learned pieces are unreachable in the serialized final merge table"));
   }
 
   ExpansionResult result;
@@ -671,27 +882,13 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   result.set_first_new_external_id(first_new_external_id_);
   result.set_requested_new_pieces(target_new_pieces_);
   result.set_actual_new_pieces(static_cast<int>(learned_pieces_.size()));
-  result.set_unreachable_pieces(unreachable);
+  result.set_unreachable_pieces(0);
   result.set_rank_prepend(expansion_spec_.allow_rank_prepend());
   result.set_vocab_sha256(expansion_spec_.vocab_sha256());
   result.set_merges_sha256(expansion_spec_.merges_sha256());
   result.set_tokenizer_sha256(expansion_spec_.tokenizer_sha256());
   result.set_pretokenizer_sha256(expansion_spec_.pretokenizer_sha256());
   result.set_boundary_policy(expansion_spec_.boundary_policy());
-
-  const std::string result_path = !trainer_spec_.expansion_result().empty()
-                                      ? trainer_spec_.expansion_result()
-                                      : trainer_spec_.model_prefix() + ".expansion";
-  if (!result_path.empty()) {
-    ABSL_RETURN_IF_ERROR(
-        continuation::WriteExpansionResult(result_path, result));
-  }
-
-  if (unreachable != 0) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "BPE expansion failed reachability verification: ", unreachable,
-        " learned pieces are unreachable in the serialized final merge table"));
-  }
 
   std::vector<ExpansionPiece> all_pieces = base_pieces_;
   all_pieces.insert(all_pieces.end(), bootstrap_pieces_.begin(),
@@ -704,6 +901,16 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
         trainer_spec_.model_prefix() + ".merges", effective));
     ABSL_RETURN_IF_ERROR(continuation::WriteExpansionVocab(
         trainer_spec_.model_prefix() + ".vocab", all_pieces));
+  }
+
+  const std::string result_path = !trainer_spec_.expansion_result().empty()
+                                      ? trainer_spec_.expansion_result()
+                                      : trainer_spec_.model_prefix() + ".expansion";
+  if (!result_path.empty()) {
+    // The success sidecar is deliberately written only after full-program and
+    // learned-piece reachability validation has passed.
+    ABSL_RETURN_IF_ERROR(
+        continuation::WriteExpansionResult(result_path, result));
   }
 
   ModelProto native;
@@ -731,6 +938,8 @@ absl::Status ContinuationTrainer::Train() {
 
   existing_piece_strings_.clear();
   atomic_piece_strings_.clear();
+  atomic_pieces_ordered_.clear();
+  live_by_string_.clear();
   base_pieces_.clear();
   bootstrap_pieces_.clear();
   learned_pieces_.clear();
@@ -739,17 +948,23 @@ absl::Status ContinuationTrainer::Train() {
   learned_merges_.clear();
   sentences_.clear();
   final_pieces_.clear();
+  allocated_.clear();
+  symbols_cache_.clear();
+  symbols_.clear();
+  pq_ = decltype(pq_)();
+  pending_queue_.clear();
 
   ABSL_RETURN_IF_ERROR(LoadAndValidateSpec());
   ABSL_RETURN_IF_ERROR(continuation::LoadPreparedCorpus(
       trainer_spec_, normalizer_spec_, components_, &corpus_));
   ABSL_RETURN_IF_ERROR(InitializeCorpusSymbols());
 
-  // Exact inherited state is established before ordinary learning. An
-  // inherited merge absent from this domain corpus is retained in the final
-  // merge program but naturally has no occurrence to apply here.
-  ABSL_RETURN_IF_ERROR(ReplayMerges(base_merges_, "inherited"));
-  ABSL_RETURN_IF_ERROR(ReplayMerges(bootstrap_merges_, "bootstrap"));
+  // Replay the same inherited/bootstrap rank program that will be serialized.
+  // This is the critical continuation invariant: training and exported BPE
+  // tokenization start from one identical state, including rank prepending.
+  const std::vector<ExpansionMerge> effective_prefix = EffectiveMergeTable();
+  ABSL_RETURN_IF_ERROR(
+      ReplayMerges(effective_prefix, "effective inherited/bootstrap"));
   ABSL_RETURN_IF_ERROR(LearnExpansion());
   ABSL_RETURN_IF_ERROR(FinalizeArtifacts());
 
