@@ -13,6 +13,7 @@
 // limitations under the License.!
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -62,6 +63,12 @@ ABSL_FLAG(int32_t, seed_sentencepiece_size,
           "the size of seed sentencepieces");
 ABSL_FLAG(std::string, seed_sentencepieces_file, "",
           "file to load seed sentencepieces from");
+ABSL_FLAG(std::string, expansion_spec, "",
+          "serialized ExpansionSpec for tokenizer continuation");
+ABSL_FLAG(std::string, expansion_result, "",
+          "optional output path for the serialized ExpansionResult");
+ABSL_FLAG(std::string, unigram_prior_model, "",
+          "prior Unigram ModelProto for true Unigram continuation");
 ABSL_FLAG(double, shrinking_factor, kDefaultTrainerSpec.shrinking_factor(),
           "Keeps top shrinking_factor pieces with respect to the loss");
 ABSL_FLAG(int32_t, num_threads, kDefaultTrainerSpec.num_threads(),
@@ -215,6 +222,9 @@ int main(int argc, char* argv[]) {
   SetTrainerSpecFromFlag(shuffle_input_sentence);
   SetTrainerSpecFromFlag(seed_sentencepiece_size);
   SetTrainerSpecFromFlag(seed_sentencepieces_file);
+  SetTrainerSpecFromFlag(expansion_spec);
+  SetTrainerSpecFromFlag(expansion_result);
+  SetTrainerSpecFromFlag(unigram_prior_model);
   SetTrainerSpecFromFlag(shrinking_factor);
   SetTrainerSpecFromFlag(num_threads);
   SetTrainerSpecFromFlag(num_sub_iterations);
