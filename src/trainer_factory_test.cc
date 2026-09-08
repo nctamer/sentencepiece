@@ -51,3 +51,9 @@ TEST(TrainerFactoryTest, BasicTest) {
   }
 }
 }  // namespace sentencepiece
+
+// Keep the continuation contract oracles attached to the factory test target:
+// they intentionally exercise TrainerFactory routing, and this avoids adding a
+// second test binary/source-list path that could drift from the public trainer
+// entry point. The included file owns its own namespace and test fixtures.
+#include "continuation_contract_test.cc"
