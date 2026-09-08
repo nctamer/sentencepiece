@@ -78,7 +78,7 @@ original_text = "".join(pieces).replace("▁", " ")
 ```
 
 ### 2. Purely Data-Driven & Language-Independent
-SentencePiece trains tokenization and detokenization models directly from raw sentences. It does **not** require language-specific pre-tokenizers (such as Moses, MeCab, or KyTea). This makes it highly effective for languages without explicit word boundaries, such as Chinese, Japanese, and Korean.
+SentencePiece trains tokenization and detokenization models directly from raw sentences. It does **not** require language-specific pre-tokenizers (such as Moses, MeCab, or KyTea). This makes it highly effective for languages without explicit word boundaries, such as Chinese, Japanese, and Thai.
 
 ### 3. Subword Regularization & BPE-Dropout
 To improve the robustness and accuracy of translation and language models, SentencePiece supports on-the-fly subword sampling during training. By sampling different segmentations for the same input text (Subword Regularization for Unigram, BPE-Dropout for BPE), it virtually augments your training data and makes the model more resilient to spelling variations and noise.
@@ -134,7 +134,8 @@ To run these benchmarks yourself, see the [reproduction instructions and scripts
 
 For detailed guides, API references, and advanced usage, please refer to the following resources:
 
-*   [Command Line Interface (CLI) & Build Guide](doc/cli.md)
+*   [Command Line Interface (CLI) & Build Guide (CMake)](doc/cli.md)
+*   [Building with Bazel](doc/bazel.md)
 *   [C++ API Reference](doc/cpp.md)
 *   [Python API Reference](python/README.md) & [Python Module Directory](python/)
 *   [Python Tokenizer Comparison Cheat Sheet](python/tokenizer_comparison_cheat_sheet.md)
@@ -145,8 +146,8 @@ For detailed guides, API references, and advanced usage, please refer to the fol
 *   [Special Symbols & Control Tokens](doc/special_symbols.md)
 *   [Vocabulary Piece Constraints](doc/piece_constraints.md)
 *   [Model Protobuf Schema](doc/model_proto.md)
+*   [Tokenizer Continuation / Expansion](README_expansion.md) *(fork extension)*
 *   [Docker Deployment Guide](contrib/docker/README.md)
-*   [NLCodec BPE Trainer (Contrib)](contrib/nlcodec/README.md)
 
 ---
 

@@ -14,16 +14,36 @@
 
 #include "filesystem.h"
 
+#include <cerrno>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <string>
 
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/string_view.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "util.h"
 
-#if defined(OS_WIN) && defined(UNICODE) && defined(_UNICODE)
-#define WPATH(path) (::sentencepiece::util::Utf8ToWide(path).c_str())
+#if defined(_WIN32) && !defined(__CYGWIN__) && defined(UNICODE) && \
+    defined(_UNICODE)
+#include <windows.h>
+namespace {
+std::wstring Utf8ToWide(absl::string_view input) {
+  const int output_length = ::MultiByteToWideChar(
+      CP_UTF8, 0, input.data(), static_cast<int>(input.size()), nullptr, 0);
+  if (output_length == 0) {
+    return L"";
+  }
+  std::wstring output(output_length, 0);
+  const int result = ::MultiByteToWideChar(CP_UTF8, 0, input.data(),
+                                           static_cast<int>(input.size()),
+                                           output.data(), output.size());
+  return result == output_length ? output : L"";
+}
+}  // namespace
+#define WPATH(path) (Utf8ToWide(path).c_str())
 #else
 #define WPATH(path) (path.data())
 #endif
@@ -43,8 +63,7 @@ class PosixReadableFile : public ReadableFile {
       is_ = &file_;
     }
     if (!*is_ || ((is_->peek() != 0) && is_->fail())) {
-      status_ = absl::StatusBuilder(absl::StatusCode::kNotFound)
-                << "\"" << filename.data() << "\": " << util::StrError(errno);
+      status_ = absl::ErrnoToStatus(errno, absl::StrCat("\"", filename, "\""));
     }
   }
 
@@ -84,8 +103,7 @@ class PosixWritableFile : public WritableFile {
       os_ = &file_;
     }
     if (!*os_) {
-      status_ = absl::StatusBuilder(absl::StatusCode::kPermissionDenied)
-                << "\"" << filename.data() << "\": " << util::StrError(errno);
+      status_ = absl::ErrnoToStatus(errno, absl::StrCat("\"", filename, "\""));
     }
   }
 

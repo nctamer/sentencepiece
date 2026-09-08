@@ -15,16 +15,21 @@
 #ifndef SPEC_PARSER_H_
 #define SPEC_PARSER_H_
 
+#include <cstdint>
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/status_builder.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "ret_check.h"
 #include "sentencepiece_processor.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/status/status_builder.h"
-#include "third_party/absl/strings/ascii.h"
-#include "third_party/absl/strings/numbers.h"
-#include "third_party/absl/strings/str_split.h"
-#include "third_party/absl/strings/string_view.h"
+#include "sentencepiece_trainer.h"
 #include "util.h"
 
 namespace sentencepiece {
@@ -134,7 +139,6 @@ inline std::string PrintProto(const TrainerSpec& message,
   PRINT_ENUM(model_type, kModelType_Map);
   PRINT_PARAM(vocab_size);
   PRINT_REPEATED_STRING(accept_language);
-  PRINT_PARAM(self_test_sample_size);
   PRINT_PARAM(character_coverage);
   PRINT_PARAM(input_sentence_size);
   PRINT_PARAM(shuffle_input_sentence);
@@ -148,9 +152,18 @@ inline std::string PrintProto(const TrainerSpec& message,
   PRINT_PARAM(split_by_number);
   PRINT_PARAM(split_by_whitespace);
   PRINT_PARAM(split_digits);
-  os << "  split_by_interval: " << message.GetExtension(split_by_interval) << "\n";
-  os << "  split_by_barline: " << message.GetExtension(split_by_barline) << "\n";
-  os << "  protected_pieces_file: " << message.GetExtension(protected_pieces_file) << "\n";
+  PRINT_PARAM(expansion_spec);
+  PRINT_PARAM(expansion_result);
+  PRINT_PARAM(unigram_prior_model);
+  // Legacy intermo extensions (TrainerSpec 200/201/204/205).
+  os << "  split_by_interval: " << message.GetExtension(split_by_interval)
+     << "\n";
+  os << "  split_by_barline: " << message.GetExtension(split_by_barline)
+     << "\n";
+  os << "  protected_pieces_file: "
+     << message.GetExtension(protected_pieces_file) << "\n";
+  os << "  seed_merges_file: " << message.GetExtension(seed_merges_file)
+     << "\n";
   PRINT_PARAM(pretokenization_delimiter);
   PRINT_PARAM(treat_whitespace_as_suffix);
   PRINT_PARAM(allow_whitespace_only_pieces);
@@ -172,9 +185,6 @@ inline std::string PrintProto(const TrainerSpec& message,
   PRINT_PARAM(eos_piece);
   PRINT_PARAM(pad_piece);
   PRINT_PARAM(unk_surface);
-  PRINT_PARAM(enable_differential_privacy);
-  PRINT_PARAM(differential_privacy_noise_level);
-  PRINT_PARAM(differential_privacy_clipping_threshold);
 
   os << "}\n";
 
@@ -217,7 +227,6 @@ absl::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_ENUM(model_type, kModelType_Map);
   PARSE_INT32(vocab_size);
   PARSE_REPEATED_STRING(accept_language);
-  PARSE_INT32(self_test_sample_size);
   PARSE_DOUBLE(character_coverage);
   PARSE_UINT64(input_sentence_size);
   PARSE_BOOL(shuffle_input_sentence);
@@ -231,20 +240,27 @@ absl::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_BOOL(split_by_number);
   PARSE_BOOL(split_by_whitespace);
   PARSE_BOOL(split_digits);
-  if (name == "split_by_interval") {
-    bool v; if (!absl::SimpleAtob(value.empty() ? "true" : value, &v))
+  PARSE_STRING(expansion_spec);
+  PARSE_STRING(expansion_result);
+  PARSE_STRING(unigram_prior_model);
+  // Legacy intermo extensions. Kept so pre-continuation CLI/API callers keep
+  // parsing; these names are compatibility shims, not the continuation model.
+  if (name == "split_by_interval" || name == "split_by_barline") {
+    bool v;
+    if (!absl::SimpleAtob(value.empty() ? "true" : value, &v)) {
       return absl::StatusBuilder(absl::StatusCode::kInvalidArgument)
              << "cannot parse \"" << value << "\" as bool.";
-    message->SetExtension(split_by_interval, v); return absl::OkStatus();
-  }
-  if (name == "split_by_barline") {
-    bool v; if (!absl::SimpleAtob(value.empty() ? "true" : value, &v))
-      return absl::StatusBuilder(absl::StatusCode::kInvalidArgument)
-             << "cannot parse \"" << value << "\" as bool.";
-    message->SetExtension(split_by_barline, v); return absl::OkStatus();
+    }
+    message->SetExtension(
+        name == "split_by_interval" ? split_by_interval : split_by_barline, v);
+    return absl::OkStatus();
   }
   if (name == "protected_pieces_file") {
     message->SetExtension(protected_pieces_file, std::string(value));
+    return absl::OkStatus();
+  }
+  if (name == "seed_merges_file") {
+    message->SetExtension(seed_merges_file, std::string(value));
     return absl::OkStatus();
   }
   PARSE_STRING(pretokenization_delimiter);
@@ -268,9 +284,6 @@ absl::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_STRING(eos_piece);
   PARSE_STRING(pad_piece);
   PARSE_STRING(unk_surface);
-  PARSE_BOOL(enable_differential_privacy);
-  PARSE_DOUBLE(differential_privacy_noise_level);
-  PARSE_UINT64(differential_privacy_clipping_threshold);
 
   return absl::StatusBuilder(absl::StatusCode::kNotFound)
          << "unknown field name \"" << name << "\" in TrainerSpec.";

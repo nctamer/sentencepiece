@@ -20,10 +20,11 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
+#include "absl/container/flat_hash_set.h"
 #include "sentencepiece_model.pb.h"
-#include "third_party/absl/container/flat_hash_set.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/string_view.h"
 #include "trainer_interface.h"
 #include "unigram_model.h"
 #include "util.h"
@@ -70,19 +71,24 @@ class Trainer : public TrainerInterface {
       : TrainerInterface::TrainerInterface(trainer_spec, normalizer_spec,
                                            denormalizer_spec) {}
 
+  // Makes and returns initial seed sentencepieces for EM training.
   TrainerModel::SentencePieces MakeSeedSentencePieces();
 
   absl::Status Train() override;
 
  private:
   FRIEND_TEST(TrainerTest, IsValidSentencePieceTest);
+  FRIEND_TEST(UnigramTrainerTest, PruneUnreachableSentencePiecesTest);
 
-  // Makes seed pieces from the training corpus.
-  // The size of seed pieces is determined by seed_sentencepiece_size.
-  // node_int_type should be of integer type (int32_t or int64_t),
-  // determined by train_extremely_large_corpus.
-  template <typename node_int_type>
-  TrainerModel::SentencePieces MakeSeedSentencePiecesInternal();
+  // Loads and returns seed sentencepieces from external TSV file specified in
+  // seed_sentencepieces_file.
+  TrainerModel::SentencePieces LoadSeedSentencePiecesFromFile(
+      const absl::flat_hash_map<std::string, int64_t>& all_chars);
+
+  // Dynamically constructs and returns seed sentencepieces from the training
+  // corpus using parallel Suffix Array (libsais_omp).
+  TrainerModel::SentencePieces MakeSeedSentencePiecesFromCorpus(
+      const absl::flat_hash_map<std::string, int64_t>& all_chars);
 
   // Executes the E step of EM and returns expected count.
   // The index of return array is the vocab id.
@@ -102,12 +108,24 @@ class Trainer : public TrainerInterface {
   TrainerModel::SentencePieces PruneSentencePieces(
       const TrainerModel& model) const;
 
+  // Prunes unreachable sentencepieces whose score is strictly lower than
+  // their alternative decomposition (Viterbi score inversion).
+  TrainerModel::SentencePieces PruneUnreachableSentencePieces(
+      const TrainerModel& model) const;
+
+  // Runs classic discrete pruning EM loop (shrinking_factor per epoch).
+  absl::Status TrainDiscretePruning(TrainerModel* model);
+
+  // Runs continuous L1 relaxation proximal sparse pruning EM loop.
+  absl::Status TrainSparsePruning(TrainerModel* model);
+
   // Makes the final sentence pieces by incorporating the required characters
   // and control/user defined symbols.
   TrainerModel::SentencePieces FinalizeSentencePieces(
       const TrainerModel& model) const;
 
-  // Pieces protected from pruning (loaded from protected_pieces_file).
+  // LEGACY protected_pieces_file: pieces protected from pruning. Empty for
+  // every ordinary and every continuation run.
   absl::flat_hash_set<std::string> protected_pieces_;
 
   // When the size of SentencePieces becomes less than desired_vocab_size_,

@@ -16,18 +16,31 @@
 
 #include <algorithm>
 #include <functional>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
 #include <utility>
+#include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/status_macros.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/str_replace.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "filesystem.h"
-#include "third_party/absl/container/flat_hash_map.h"
-#include "third_party/absl/container/flat_hash_set.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/str_cat.h"
-#include "third_party/absl/strings/str_join.h"
-#include "third_party/absl/strings/str_replace.h"
-#include "third_party/absl/strings/str_split.h"
-#include "third_party/absl/strings/string_view.h"
-#include "third_party/absl/strings/strip.h"
+#include "normalizer.h"
+#include "ret_check.h"
+#include "darts.h"
+#include "util.h"
 
 #ifdef ENABLE_NFKC_COMPILE
 #include <unicode/errorcode.h>
@@ -37,12 +50,6 @@
 #include <unicode/rbnf.h>
 #include <unicode/utypes.h>
 #endif  // ENABLE_NFKC_COMPILE
-
-#include <set>
-
-#include "normalizer.h"
-#include "third_party/darts_clone/darts.h"
-#include "util.h"
 
 #ifndef DISABLE_EMBEDDED_DATA
 #include "normalization_rule.h"
@@ -108,11 +115,11 @@ std::vector<Builder::Chars> ExpandUnnormalized(
         norm2orig) {
   CHECK(!nfkd.empty());
   std::vector<Builder::Chars> results;
-  for (const auto c : port::FindOrDie(norm2orig, nfkd[0])) {
+  for (const auto c : norm2orig.at(nfkd[0])) {
     results.push_back({c});
   }
   for (size_t i = 1; i < nfkd.size(); ++i) {
-    const auto& orig = port::FindOrDie(norm2orig, nfkd[i]);
+    const auto& orig = norm2orig.at(nfkd[i]);
     std::vector<Builder::Chars> new_results;
     for (const auto& r : results) {
       for (const auto c : orig) {
@@ -208,7 +215,7 @@ absl::Status Builder::CompileCharsMap(const CharsMap& chars_map,
     const std::string utf8_in = string_util::UnicodeTextToUTF8(p.first);
     RET_CHECK(!utf8_in.empty());
     RET_CHECK(string_util::IsStructurallyValid(utf8_in));
-    kv.emplace_back(utf8_in, port::FindOrDie(normalized2pos, p.second));
+    kv.emplace_back(utf8_in, normalized2pos.at(p.second));
   }
 
   std::sort(kv.begin(), kv.end());
@@ -240,7 +247,7 @@ absl::Status Builder::CompileCharsMap(const CharsMap& chars_map,
   absl::string_view trie_blob(static_cast<const char*>(trie.array()),
                               trie.size() * trie.unit_size());
   *output = Normalizer::EncodePrecompiledCharsMap(trie_blob, normalized);
-  RETURN_IF_ERROR(IsValidNormalizerData(*output));
+  ABSL_RETURN_IF_ERROR(IsValidNormalizerData(*output));
 
   LOG(INFO) << "Generated normalizer blob. size=" << output->size();
 
@@ -256,8 +263,8 @@ absl::Status Builder::DecompileCharsMap(absl::string_view blob,
   absl::string_view trie_blob;
   absl::string_view normalized;
   std::string buf;
-  RETURN_IF_ERROR(Normalizer::DecodePrecompiledCharsMap(blob, &trie_blob,
-                                                        &normalized, &buf));
+  ABSL_RETURN_IF_ERROR(Normalizer::DecodePrecompiledCharsMap(
+      blob, &trie_blob, &normalized, &buf));
 
   Darts::DoubleArray trie;
   // copy array as try_blob may not be 4-byte aligned.
@@ -365,7 +372,7 @@ absl::Status Builder::GetPrecompiledCharsMap(absl::string_view name,
 #else   // DISABLE_EMBEDDED_DATA
   {
     const std::string filename =
-        absl::StrCat(util::JoinPath(GetDataDir(), name), ".bin");
+        absl::StrCat(filesystem::JoinPath(GetDataDir(), name), ".bin");
     auto input = filesystem::NewReadableFile(filename, true /* is binary */);
     if (input->status().ok()) {
       input->ReadAll(output);
@@ -429,7 +436,7 @@ absl::Status BuildMapInternal(
     }
   }
 
-  RETURN_IF_ERROR(Builder::RemoveRedundantMap(&nfkc_map));
+  ABSL_RETURN_IF_ERROR(Builder::RemoveRedundantMap(&nfkc_map));
   *chars_map = std::move(nfkc_map);
 #endif  // ENABLE_NFKC_COMPILE
   return absl::OkStatus();
@@ -465,9 +472,9 @@ absl::Status Builder::BuildNmtNFKCMap(CharsMap* chars_map) {
   LOG(INFO) << "Running BuildNmtNFKCMap";
 
   CharsMap nfkc_map;
-  RETURN_IF_ERROR(BuildNFKCMap(&nfkc_map));
-  RETURN_IF_ERROR(MergeNmtMap(&nfkc_map));
-  RETURN_IF_ERROR(RemoveRedundantMap(&nfkc_map));
+  ABSL_RETURN_IF_ERROR(BuildNFKCMap(&nfkc_map));
+  ABSL_RETURN_IF_ERROR(MergeNmtMap(&nfkc_map));
+  ABSL_RETURN_IF_ERROR(RemoveRedundantMap(&nfkc_map));
 
   *chars_map = std::move(nfkc_map);
 #else
@@ -499,7 +506,7 @@ absl::Status Builder::MergeUnicodeCaseFoldMap(Builder::CharsMap* chars_map) {
     if (trg != cp) (*chars_map)[{cp}] = {trg};
   }
 
-  RETURN_IF_ERROR(RemoveRedundantMap(chars_map));
+  ABSL_RETURN_IF_ERROR(RemoveRedundantMap(chars_map));
 #endif
 
   return absl::OkStatus();
@@ -569,8 +576,8 @@ absl::Status Builder::MergeNmtMap(Builder::CharsMap* chars_map) {
 absl::Status Builder::BuildNFKC_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfkc_map;
-  RETURN_IF_ERROR(Builder::BuildNFKCMap(&nfkc_map));
-  RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfkc_map));
+  ABSL_RETURN_IF_ERROR(Builder::BuildNFKCMap(&nfkc_map));
+  ABSL_RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfkc_map));
   *chars_map = std::move(nfkc_map);
 #else
   LOG(ERROR) << kCompileError;
@@ -583,8 +590,8 @@ absl::Status Builder::BuildNFKC_CFMap(CharsMap* chars_map) {
 absl::Status Builder::BuildNmtNFKC_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfkc_map;
-  RETURN_IF_ERROR(Builder::BuildNmtNFKCMap(&nfkc_map));
-  RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfkc_map));
+  ABSL_RETURN_IF_ERROR(Builder::BuildNmtNFKCMap(&nfkc_map));
+  ABSL_RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfkc_map));
   *chars_map = std::move(nfkc_map);
 #else
   LOG(ERROR) << kCompileError;
@@ -636,8 +643,8 @@ absl::Status Builder::BuildNFDMap(CharsMap* chars_map) {
 absl::Status Builder::BuildNFKD_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfkd_map;
-  RETURN_IF_ERROR(Builder::BuildNFKDMap(&nfkd_map));
-  RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfkd_map));
+  ABSL_RETURN_IF_ERROR(Builder::BuildNFKDMap(&nfkd_map));
+  ABSL_RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfkd_map));
   *chars_map = std::move(nfkd_map);
 #else
   LOG(ERROR) << kCompileError;
@@ -649,8 +656,8 @@ absl::Status Builder::BuildNFKD_CFMap(CharsMap* chars_map) {
 absl::Status Builder::BuildNFC_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfc_map;
-  RETURN_IF_ERROR(Builder::BuildNFKDMap(&nfc_map));
-  RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfc_map));
+  ABSL_RETURN_IF_ERROR(Builder::BuildNFKDMap(&nfc_map));
+  ABSL_RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfc_map));
   *chars_map = std::move(nfc_map);
 #else
   LOG(ERROR) << kCompileError;
@@ -662,8 +669,8 @@ absl::Status Builder::BuildNFC_CFMap(CharsMap* chars_map) {
 absl::Status Builder::BuildNFD_CFMap(CharsMap* chars_map) {
 #ifdef ENABLE_NFKC_COMPILE
   CharsMap nfd_map;
-  RETURN_IF_ERROR(Builder::BuildNFDMap(&nfd_map));
-  RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfd_map));
+  ABSL_RETURN_IF_ERROR(Builder::BuildNFDMap(&nfd_map));
+  ABSL_RETURN_IF_ERROR(Builder::MergeUnicodeCaseFoldMap(&nfd_map));
   *chars_map = std::move(nfd_map);
 #else
   LOG(ERROR) << kCompileError;
@@ -679,14 +686,14 @@ absl::Status Builder::LoadCharsMap(absl::string_view filename,
 
   auto input = filesystem::NewReadableFile(filename);
 
-  RETURN_IF_ERROR(input->status());
+  ABSL_RETURN_IF_ERROR(input->status());
 
   std::string line;
   chars_map->clear();
   while (input->ReadLine(&line)) {
     std::vector<std::string> fields =
         absl::StrSplit(line, '\t', absl::AllowEmpty());
-    CHECK_GE(fields.size(), 1);
+    CHECK(!fields.empty());
     if (fields.size() == 1) {
       fields.emplace_back("");  // Deletion rule.
     }
@@ -697,14 +704,18 @@ absl::Status Builder::LoadCharsMap(absl::string_view filename,
         continue;
       }
       absl::ConsumePrefix(&s, "U+");
-      src.push_back(string_util::HexToInt<char32_t>(s));
+      uint32_t cp = 0;
+      RET_CHECK(absl::SimpleHexAtoi(s, &cp)) << "Invalid hex codepoint: " << s;
+      src.push_back(static_cast<char32_t>(cp));
     }
     for (auto s : absl::StrSplit(fields[1], ' ')) {
       if (s.empty()) {
         continue;
       }
       absl::ConsumePrefix(&s, "U+");
-      trg.push_back(string_util::HexToInt<char32_t>(s));
+      uint32_t cp = 0;
+      RET_CHECK(absl::SimpleHexAtoi(s, &cp)) << "Invalid hex codepoint: " << s;
+      trg.push_back(static_cast<char32_t>(cp));
     }
     RET_CHECK(!src.empty());
     (*chars_map)[src] = trg;
@@ -717,7 +728,7 @@ absl::Status Builder::LoadCharsMap(absl::string_view filename,
 absl::Status Builder::SaveCharsMap(absl::string_view filename,
                                    const Builder::CharsMap& chars_map) {
   auto output = filesystem::NewWritableFile(filename);
-  RETURN_IF_ERROR(output->status());
+  ABSL_RETURN_IF_ERROR(output->status());
 
   for (const auto& c : chars_map) {
     std::vector<std::string> src;
@@ -725,11 +736,11 @@ absl::Status Builder::SaveCharsMap(absl::string_view filename,
     string_util::UnicodeText srcu;
     string_util::UnicodeText trgu;
     for (char32_t v : c.first) {
-      src.push_back(string_util::IntToHex(v));
+      src.push_back(absl::StrFormat("%X", v));
       srcu.push_back(v);
     }
     for (char32_t v : c.second) {
-      trg.push_back(string_util::IntToHex(v));
+      trg.push_back(absl::StrFormat("%X", v));
       trgu.push_back(v);
     }
     std::string line = absl::StrJoin(src, " ") + "\t" +

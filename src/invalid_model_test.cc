@@ -12,29 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <gtest/gtest.h>
+
 #include <cstdint>
-#include <cstring>
 #include <fstream>
 #include <ios>
 #include <string>
-#include <vector>
-#include <memory>
 
-#include "testharness.h"
-#include "third_party/absl/base/internal/endian.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/string_view.h"
-#include "third_party/darts_clone/darts.h"
+#include "absl/base/internal/endian.h"
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
+#include "filesystem.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
-#include "util.h"
-#include "unigram_model.h"
 
 namespace sentencepiece {
 namespace {
 
 std::string GetTestDataPath(absl::string_view filename) {
-  return util::JoinPath(::testing::SrcDir(), filename);
+  return filesystem::JoinPath(::testing::SrcDir(), filename);
 }
 
 absl::Status LoadModelWithModifiedCharsmap(const ModelProto& base_model,
@@ -49,7 +45,7 @@ absl::Status LoadModelWithModifiedCharsmap(const ModelProto& base_model,
 // Test for GitHub issue #1269 (Out-of-bounds read in Darts trie validation)
 TEST(SentencePieceProcessorTest, RejectCorruptedModel1269) {
   // 1. Read base model
-  std::string model_path = GetTestDataPath("test_oss_model.model");
+  std::string model_path = GetTestDataPath("botchan_en_unigram_1000.model");
   std::ifstream ifs(model_path, std::ios::binary);
   ModelProto model_proto;
   ASSERT_TRUE(model_proto.ParseFromIstream(&ifs));
@@ -114,7 +110,7 @@ TEST(SentencePieceProcessorTest, ReproduceIssue1263) {
 
 TEST(SentencePieceProcessorTest, CharsmapValidationTests) {
   // Read base model once
-  std::string model_path = GetTestDataPath("test_oss_model.model");
+  std::string model_path = GetTestDataPath("botchan_en_unigram_1000.model");
   std::ifstream ifs(model_path, std::ios::binary);
   ModelProto base_model;
   ASSERT_TRUE(base_model.ParseFromIstream(&ifs));
@@ -178,7 +174,7 @@ TEST(SentencePieceProcessorTest, CharsmapValidationTests) {
 }
 
 TEST(SentencePieceProcessorTest, RejectModelWithOOBCharsmapValue) {
-  std::string model_path = GetTestDataPath("test_oss_model.model");
+  std::string model_path = GetTestDataPath("botchan_en_unigram_1000.model");
   std::ifstream ifs(model_path, std::ios::binary);
   ModelProto model_proto;
   ASSERT_TRUE(model_proto.ParseFromIstream(&ifs));
@@ -211,8 +207,6 @@ TEST(SentencePieceProcessorTest, RejectModelWithOOBCharsmapValue) {
   EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
   EXPECT_EQ(status.message(), "precompiled_charsmap is invalid.");
 }
-
-
 
 }  // namespace
 }  // namespace sentencepiece

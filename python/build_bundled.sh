@@ -1,7 +1,5 @@
 #!/bin/sh
 
-VERSION="$1"
-
 mkdir -p build
 
 BUILD_DIR=./build
@@ -12,16 +10,16 @@ if [ -f ./sentencepiece/src/CMakeLists.txt ]; then
 elif [ -f ../src/CMakeLists.txt ]; then
   SRC_DIR=..  
 else
-  # Try tagged version. Othewise, use head.
-  git clone https://github.com/google/sentencepiece.git -b v"${VERSION}" --depth 1 || \
-  git clone https://github.com/google/sentencepiece.git --depth 1
-  SRC_DIR=./sentencepiece
+  echo "Error: SentencePiece C++ source files not found in ./sentencepiece or ../" >&2
+  exit 1
 fi
 
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 cmake ${SRC_DIR} -B ${BUILD_DIR} \
   -DSPM_ENABLE_SHARED=OFF \
   -DSPM_DISABLE_EMBEDDED_DATA=ON \
   -DCMAKE_INSTALL_PREFIX=${INSTALL_DIR} \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DCMAKE_CXX_FLAGS="-fPIC -fvisibility=default -ffunction-sections -fdata-sections"
-cmake --build ${BUILD_DIR} --config Release --target install --parallel $(nproc)
+cmake --build ${BUILD_DIR} --config Release --target install --parallel ${NPROC}
+

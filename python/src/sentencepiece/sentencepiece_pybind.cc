@@ -5,8 +5,8 @@
 #include <sentencepiece_trainer.h>
 
 #include <algorithm>
+#include <iostream>
 #include <memory>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -408,13 +408,15 @@ std::vector<IntSpanOrVector> CastToVectorIntSpanOrVector(
 }
 
 template <typename FuncType>
-decltype(auto) SingleCall(const sentencepiece::SentencePieceProcessor& self, int id, FuncType func) {
+decltype(auto) SingleCall(const sentencepiece::SentencePieceProcessor& self,
+                          int id, FuncType func) {
   CheckIdsThrowException(absl::Span<const int>(&id, 1), self.GetPieceSize());
   return (self.*func)(id);
 }
 
 template <typename FuncType>
-py::list BatchCall(const sentencepiece::SentencePieceProcessor& self, const py::object& ids_obj, FuncType func) {
+py::list BatchCall(const sentencepiece::SentencePieceProcessor& self,
+                   const py::object& ids_obj, FuncType func) {
   IntSpanOrVector ids = CastToIntSpanOrVector(ids_obj);
   CheckIdsThrowException(ids.span(), self.GetPieceSize());
   py::list outs(ids.span().size());
@@ -424,15 +426,17 @@ py::list BatchCall(const sentencepiece::SentencePieceProcessor& self, const py::
   return outs;
 }
 
-#define REGISTER_ID_METHOD(NAME)                                                \
-  .def(#NAME,                                                                   \
-       [](const sentencepiece::SentencePieceProcessor& self, int id) {          \
-         return SingleCall(self, id, &sentencepiece::SentencePieceProcessor::NAME);\
-       })                                                                       \
-  .def(#NAME, [](const sentencepiece::SentencePieceProcessor& self,             \
-                 const py::object& ids_obj) {                                   \
-    return BatchCall(self, ids_obj, &sentencepiece::SentencePieceProcessor::NAME);\
-  })
+#define REGISTER_ID_METHOD(NAME)                                          \
+  .def(#NAME,                                                             \
+       [](const sentencepiece::SentencePieceProcessor& self, int id) {    \
+         return SingleCall(self, id,                                      \
+                           &sentencepiece::SentencePieceProcessor::NAME); \
+       })                                                                 \
+      .def(#NAME, [](const sentencepiece::SentencePieceProcessor& self,   \
+                     const py::object& ids_obj) {                         \
+        return BatchCall(self, ids_obj,                                   \
+                         &sentencepiece::SentencePieceProcessor::NAME);   \
+      })
 
 void CheckProtoArgsThrowException(bool add_bos, bool add_eos, bool reverse,
                                   bool emit_unk_piece) {
@@ -490,9 +494,7 @@ py::dict ExtractOffsetMapping(const sentencepiece::SentencePieceText& spt,
       if (piece.begin() >= utf8_to_unicode.size() ||
 
           piece.end() >= utf8_to_unicode.size()) {
-
         throw py::value_error("Invalid piece offsets in SentencePieceText");
-
       }
 
       int start_unicode = utf8_to_unicode[piece.begin()];
@@ -550,14 +552,15 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
              return true;
            })
       .def("LoadFromSerializedProto",
-            [](sentencepiece::SentencePieceProcessor& self,
-               const py::bytes& serialized) {
-              std::string_view serialized_view = serialized.cast<std::string_view>();
-              py::gil_scoped_release release;
-              auto status = self.LoadFromSerializedProto(serialized_view);
-              if (!status.ok()) throw status;
-              return true;
-            })
+           [](sentencepiece::SentencePieceProcessor& self,
+              const py::bytes& serialized) {
+             std::string_view serialized_view =
+                 serialized.cast<std::string_view>();
+             py::gil_scoped_release release;
+             auto status = self.LoadFromSerializedProto(serialized_view);
+             if (!status.ok()) throw status;
+             return true;
+           })
       .def("status", &sentencepiece::SentencePieceProcessor::status)
       .def("SetEncodeExtraOptions",
            &sentencepiece::SentencePieceProcessor::SetEncodeExtraOptions)
@@ -686,9 +689,8 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
                  if (piece.begin() >= utf8_to_unicode.size() ||
 
                      piece.end() >= utf8_to_unicode.size()) {
-
-                   throw py::value_error("Invalid piece offsets in SentencePieceText");
-
+                   throw py::value_error(
+                       "Invalid piece offsets in SentencePieceText");
                  }
 
                  int start_unicode = utf8_to_unicode[piece.begin()];
@@ -900,9 +902,8 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
                    if (piece.begin() >= utf8_to_unicode.size() ||
 
                        piece.end() >= utf8_to_unicode.size()) {
-
-                     throw py::value_error("Invalid piece offsets in SentencePieceText");
-
+                     throw py::value_error(
+                         "Invalid piece offsets in SentencePieceText");
                    }
 
                    int start_unicode = utf8_to_unicode[piece.begin()];
@@ -923,31 +924,31 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
 
       // Single Decode APIs
       .def("_DecodeIds",
-            [](const sentencepiece::SentencePieceProcessor& self,
-               const py::object& ids_obj) {
-              IntSpanOrVector ids = CastToIntSpanOrVector(ids_obj);
-              std::string detok;
-              {
-                py::gil_scoped_release release;
-                CheckIdsThrowException(ids.span(), self.GetPieceSize());
-                auto status = self.Decode(ids.span(), &detok);
-                if (!status.ok()) throw status;
-              }
-              return py::str(detok);
-            })
+           [](const sentencepiece::SentencePieceProcessor& self,
+              const py::object& ids_obj) {
+             IntSpanOrVector ids = CastToIntSpanOrVector(ids_obj);
+             std::string detok;
+             {
+               py::gil_scoped_release release;
+               CheckIdsThrowException(ids.span(), self.GetPieceSize());
+               auto status = self.Decode(ids.span(), &detok);
+               if (!status.ok()) throw status;
+             }
+             return py::str(detok);
+           })
       .def("_DecodeIdsAsBytes",
-            [](const sentencepiece::SentencePieceProcessor& self,
-               const py::object& ids_obj) {
-              IntSpanOrVector ids = CastToIntSpanOrVector(ids_obj);
-              std::string detok;
-              {
-                py::gil_scoped_release release;
-                CheckIdsThrowException(ids.span(), self.GetPieceSize());
-                auto status = self.Decode(ids.span(), &detok);
-                if (!status.ok()) throw status;
-              }
-              return py::bytes(detok);
-            })
+           [](const sentencepiece::SentencePieceProcessor& self,
+              const py::object& ids_obj) {
+             IntSpanOrVector ids = CastToIntSpanOrVector(ids_obj);
+             std::string detok;
+             {
+               py::gil_scoped_release release;
+               CheckIdsThrowException(ids.span(), self.GetPieceSize());
+               auto status = self.Decode(ids.span(), &detok);
+               if (!status.ok()) throw status;
+             }
+             return py::bytes(detok);
+           })
       .def("_DecodePieces",
            [](const sentencepiece::SentencePieceProcessor& self,
               const py::list& pieces) {
@@ -976,18 +977,18 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
              return py::bytes(detok);
            })
       .def("_DecodeIdsAsSerializedProto",
-            [](const sentencepiece::SentencePieceProcessor& self,
-               const py::object& ids_obj) {
-              IntSpanOrVector ids = CastToIntSpanOrVector(ids_obj);
-              sentencepiece::SentencePieceText spt;
-              {
-                py::gil_scoped_release release;
-                CheckIdsThrowException(ids.span(), self.GetPieceSize());
-                auto status = self.Decode(ids.span(), &spt);
-                if (!status.ok()) throw status;
-              }
-              return py::bytes(spt.SerializeAsString());
-            })
+           [](const sentencepiece::SentencePieceProcessor& self,
+              const py::object& ids_obj) {
+             IntSpanOrVector ids = CastToIntSpanOrVector(ids_obj);
+             sentencepiece::SentencePieceText spt;
+             {
+               py::gil_scoped_release release;
+               CheckIdsThrowException(ids.span(), self.GetPieceSize());
+               auto status = self.Decode(ids.span(), &spt);
+               if (!status.ok()) throw status;
+             }
+             return py::bytes(spt.SerializeAsString());
+           })
       .def("_DecodePiecesAsSerializedProto",
            [](const sentencepiece::SentencePieceProcessor& self,
               const py::list& pieces) {
@@ -1032,19 +1033,19 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
              sentencepiece::SentencePieceText spt;
              absl::Status status;
              if (input_is_pieces) {
-                PyListStringViewVector pieces(normalized_input.cast<py::list>());
-                {
-                  py::gil_scoped_release release;
-                  status = self.Decode(pieces.views(), &spt);
-                }
-              } else {
-                IntSpanOrVector ids = CastToIntSpanOrVector(normalized_input);
-                {
-                  py::gil_scoped_release release;
-                  CheckIdsThrowException(ids.span(), self.GetPieceSize());
-                  status = self.Decode(ids.span(), &spt);
-                }
-              }
+               PyListStringViewVector pieces(normalized_input.cast<py::list>());
+               {
+                 py::gil_scoped_release release;
+                 status = self.Decode(pieces.views(), &spt);
+               }
+             } else {
+               IntSpanOrVector ids = CastToIntSpanOrVector(normalized_input);
+               {
+                 py::gil_scoped_release release;
+                 CheckIdsThrowException(ids.span(), self.GetPieceSize());
+                 status = self.Decode(ids.span(), &spt);
+               }
+             }
              if (!status.ok()) throw status;
 
              return ExtractOffsetMapping(spt, return_bytes);
@@ -1052,79 +1053,82 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
 
       // Batch Decode APIs
       .def("_DecodeIdsBatch",
-            [](const sentencepiece::SentencePieceProcessor& self,
-               const py::object& ins_obj, int num_threads,
-               py::object thread_pool) {
-              std::vector<IntSpanOrVector> ins = CastToVectorIntSpanOrVector(ins_obj);
-              std::vector<std::string> outs(ins.size());
-              WorkerPool pool(num_threads, thread_pool);
-              {
-                py::gil_scoped_release release;
-                auto status = sentencepiece::RunBatch(
-                    ins.size(),
-                    [&](size_t i) {
-                      auto s = CheckIds(ins[i].span(), self.GetPieceSize());
-                      if (!s.ok()) return s;
-                      return self.Decode(ins[i].span(), &outs[i]);
-                    },
-                    *pool.get());
-                if (!status.ok()) throw status;
-              }
-              py::list py_outs(outs.size());
+           [](const sentencepiece::SentencePieceProcessor& self,
+              const py::object& ins_obj, int num_threads,
+              py::object thread_pool) {
+             std::vector<IntSpanOrVector> ins =
+                 CastToVectorIntSpanOrVector(ins_obj);
+             std::vector<std::string> outs(ins.size());
+             WorkerPool pool(num_threads, thread_pool);
+             {
+               py::gil_scoped_release release;
+               auto status = sentencepiece::RunBatch(
+                   ins.size(),
+                   [&](size_t i) {
+                     auto s = CheckIds(ins[i].span(), self.GetPieceSize());
+                     if (!s.ok()) return s;
+                     return self.Decode(ins[i].span(), &outs[i]);
+                   },
+                   *pool.get());
+               if (!status.ok()) throw status;
+             }
+             py::list py_outs(outs.size());
              for (size_t i = 0; i < outs.size(); ++i) {
                py_outs[i] = py::str(outs[i]);
              }
              return py_outs;
            })
       .def("_DecodeIdsAsBytesBatch",
-            [](const sentencepiece::SentencePieceProcessor& self,
-               const py::object& ins_obj, int num_threads,
-               py::object thread_pool) {
-              std::vector<IntSpanOrVector> ins = CastToVectorIntSpanOrVector(ins_obj);
-              std::vector<std::string> outs(ins.size());
-              WorkerPool pool(num_threads, thread_pool);
-              {
-                py::gil_scoped_release release;
-                auto status = sentencepiece::RunBatch(
-                    ins.size(),
-                    [&](size_t i) {
-                      auto s = CheckIds(ins[i].span(), self.GetPieceSize());
-                      if (!s.ok()) return s;
-                      return self.Decode(ins[i].span(), &outs[i]);
-                    },
-                    *pool.get());
-                if (!status.ok()) throw status;
-              }
-              py::list py_outs(outs.size());
+           [](const sentencepiece::SentencePieceProcessor& self,
+              const py::object& ins_obj, int num_threads,
+              py::object thread_pool) {
+             std::vector<IntSpanOrVector> ins =
+                 CastToVectorIntSpanOrVector(ins_obj);
+             std::vector<std::string> outs(ins.size());
+             WorkerPool pool(num_threads, thread_pool);
+             {
+               py::gil_scoped_release release;
+               auto status = sentencepiece::RunBatch(
+                   ins.size(),
+                   [&](size_t i) {
+                     auto s = CheckIds(ins[i].span(), self.GetPieceSize());
+                     if (!s.ok()) return s;
+                     return self.Decode(ins[i].span(), &outs[i]);
+                   },
+                   *pool.get());
+               if (!status.ok()) throw status;
+             }
+             py::list py_outs(outs.size());
              for (size_t i = 0; i < outs.size(); ++i) {
                py_outs[i] = py::bytes(outs[i]);
              }
              return py_outs;
            })
       .def("_DecodeIdsAsSerializedProtoBatch",
-            [](const sentencepiece::SentencePieceProcessor& self,
-               const py::object& ins_obj, int num_threads,
-               py::object thread_pool) {
-              std::vector<IntSpanOrVector> ins = CastToVectorIntSpanOrVector(ins_obj);
-              std::vector<std::string> outs(ins.size());
-              WorkerPool pool(num_threads, thread_pool);
-              {
-                py::gil_scoped_release release;
-                auto status = sentencepiece::RunBatch(
-                    ins.size(),
-                    [&](size_t i) {
-                      auto s = CheckIds(ins[i].span(), self.GetPieceSize());
-                      if (!s.ok()) return s;
-                      sentencepiece::SentencePieceText spt;
-                      s = self.Decode(ins[i].span(), &spt);
-                      if (!s.ok()) return s;
-                      outs[i] = spt.SerializeAsString();
-                      return absl::OkStatus();
-                    },
-                    *pool.get());
-                if (!status.ok()) throw status;
-              }
-              py::list py_outs(outs.size());
+           [](const sentencepiece::SentencePieceProcessor& self,
+              const py::object& ins_obj, int num_threads,
+              py::object thread_pool) {
+             std::vector<IntSpanOrVector> ins =
+                 CastToVectorIntSpanOrVector(ins_obj);
+             std::vector<std::string> outs(ins.size());
+             WorkerPool pool(num_threads, thread_pool);
+             {
+               py::gil_scoped_release release;
+               auto status = sentencepiece::RunBatch(
+                   ins.size(),
+                   [&](size_t i) {
+                     auto s = CheckIds(ins[i].span(), self.GetPieceSize());
+                     if (!s.ok()) return s;
+                     sentencepiece::SentencePieceText spt;
+                     s = self.Decode(ins[i].span(), &spt);
+                     if (!s.ok()) return s;
+                     outs[i] = spt.SerializeAsString();
+                     return absl::OkStatus();
+                   },
+                   *pool.get());
+               if (!status.ok()) throw status;
+             }
+             py::list py_outs(outs.size());
              for (size_t i = 0; i < outs.size(); ++i) {
                py_outs[i] = py::bytes(outs[i]);
              }
@@ -1134,9 +1138,6 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
            [](const sentencepiece::SentencePieceProcessor& self,
               const py::list& ins, int num_threads, py::object thread_pool) {
              if (ins.empty()) return py::list();
-             py::list sublist0 = ins[0].cast<py::list>();
-             if (sublist0.empty()) return py::list();
-             bool is_bytes = py::isinstance<py::bytes>(sublist0[0]);
 
              std::vector<PyListStringViewVector> C_ins_wrappers;
              C_ins_wrappers.reserve(ins.size());
@@ -1155,6 +1156,18 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
                    *pool.get());
                if (!status.ok()) throw status;
              }
+
+             // Empty sequences (e.g. a sentence that encoded to no pieces) are
+             // valid and decode to an empty string, so where they appear in the
+             // batch must not change the result. Determine the output element
+             // type (str/bytes) from the first non-empty sequence.
+             bool is_bytes = false;
+             for (size_t i = 0; i < ins.size(); ++i) {
+               if (C_ins[i].empty()) continue;
+               is_bytes = py::isinstance<py::bytes>(ins[i].cast<py::list>()[0]);
+               break;
+             }
+
              py::list py_outs(outs.size());
              for (size_t i = 0; i < outs.size(); ++i) {
                py_outs[i] = ToPyString(outs[i], is_bytes);
@@ -1247,21 +1260,27 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
              bool is_pieces_batch = false;
              bool detected_bytes = false;
 
-             if (!py_ins.empty()) {
-               py::object first_seq = py_ins[0];
-               if (py::isinstance<py::list>(first_seq) ||
-                   py::isinstance<py::tuple>(first_seq)) {
-                 py::sequence inner_seq = first_seq;
-                 if (!inner_seq.empty()) {
-                   py::object first_item = inner_seq[0];
-                   if (py::isinstance<py::str>(first_item)) {
-                     is_pieces_batch = true;
-                   } else if (py::isinstance<py::bytes>(first_item)) {
-                     is_pieces_batch = true;
-                     detected_bytes = true;
-                   }
-                 }
+             // A batch may start with empty sequences (e.g. a sentence that
+             // encoded to no pieces / no ids). Empty sequences carry no type
+             // information, so infer the element type from the first non-empty
+             // inner sequence; otherwise a piece batch that starts with an empty
+             // sequence would be decoded as an id batch.
+             for (size_t i = 0; i < py_ins.size(); ++i) {
+               py::object seq = py_ins[i];
+               if (!py::isinstance<py::list>(seq) &&
+                   !py::isinstance<py::tuple>(seq)) {
+                 continue;
                }
+               py::sequence inner_seq = seq;
+               if (inner_seq.empty()) continue;
+               py::object first_item = inner_seq[0];
+               if (py::isinstance<py::str>(first_item)) {
+                 is_pieces_batch = true;
+               } else if (py::isinstance<py::bytes>(first_item)) {
+                 is_pieces_batch = true;
+                 detected_bytes = true;
+               }
+               break;
              }
 
              if (is_pieces_batch) {
@@ -1274,7 +1293,8 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
              if (is_pieces_batch) {
                std::vector<PyListStringViewVector> C_ins_wrappers;
                C_ins_wrappers.reserve(py_ins.size());
-               std::vector<absl::Span<const absl::string_view>> C_ins(py_ins.size());
+               std::vector<absl::Span<const absl::string_view>> C_ins(
+                   py_ins.size());
                for (size_t i = 0; i < py_ins.size(); ++i) {
                  C_ins_wrappers.emplace_back(py_ins[i].cast<py::list>());
                  C_ins[i] = C_ins_wrappers.back().views();
@@ -1288,22 +1308,22 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
                  if (!status.ok()) throw status;
                }
              } else {
-                std::vector<IntSpanOrVector> C_ins =
-                    CastToVectorIntSpanOrVector(py_ins);
+               std::vector<IntSpanOrVector> C_ins =
+                   CastToVectorIntSpanOrVector(py_ins);
 
-                {
-                  py::gil_scoped_release release;
-                  auto status = sentencepiece::RunBatch(
-                      py_ins.size(),
-                      [&](size_t i) {
-                        auto s = CheckIds(C_ins[i].span(), self.GetPieceSize());
-                        if (!s.ok()) return s;
-                        return self.Decode(C_ins[i].span(), &spts[i]);
-                      },
-                      *pool.get());
-                  if (!status.ok()) throw status;
-                }
-              }
+               {
+                 py::gil_scoped_release release;
+                 auto status = sentencepiece::RunBatch(
+                     py_ins.size(),
+                     [&](size_t i) {
+                       auto s = CheckIds(C_ins[i].span(), self.GetPieceSize());
+                       if (!s.ok()) return s;
+                       return self.Decode(C_ins[i].span(), &spts[i]);
+                     },
+                     *pool.get());
+                 if (!status.ok()) throw status;
+               }
+             }
 
              py::list py_outs(spts.size());
              for (size_t i = 0; i < spts.size(); ++i) {
@@ -1390,67 +1410,6 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
            })
 
       // Sample and Score APIs
-      .def("_SampleEncodeAndScoreAsIds",
-           [](const sentencepiece::SentencePieceProcessor& self,
-              const py::object& input, int num_samples, float alpha, bool wor,
-              bool include_best, bool add_bos, bool add_eos, bool reverse) {
-             PyInputStringView in(input);
-             std::vector<std::pair<std::vector<int>, float>> idss;
-             {
-               py::gil_scoped_release release;
-               auto status = self.SampleEncodeAndScore(
-                   in.value, num_samples, alpha, wor, include_best, &idss);
-               if (!status.ok()) throw status;
-               for (auto& ids : idss) {
-                 RewriteIdsThrowException(self, &ids.first, add_bos, add_eos,
-                                          reverse);
-               }
-             }
-             return idss;
-           })
-      .def("_SampleEncodeAndScoreAsPieces",
-           [](const sentencepiece::SentencePieceProcessor& self,
-              const py::object& input, int num_samples, float alpha, bool wor,
-              bool include_best, bool add_bos, bool add_eos, bool reverse,
-              bool emit_unk_piece, bool return_bytes) {
-             PyInputStringView in(input);
-             std::vector<std::pair<std::vector<std::string>, float>> piecess;
-             {
-               py::gil_scoped_release release;
-               auto status = self.SampleEncodeAndScore(
-                   in.value, num_samples, alpha, wor, include_best, &piecess);
-               if (!status.ok()) throw status;
-               for (auto& pieces : piecess) {
-                 RewriteIdsThrowException(self, &pieces.first, add_bos, add_eos,
-                                          reverse, emit_unk_piece);
-               }
-             }
-             py::list py_outs(piecess.size());
-             for (size_t i = 0; i < piecess.size(); ++i) {
-               py_outs[i] = py::make_tuple(
-                   ToPyStringList(piecess[i].first, return_bytes),
-                   piecess[i].second);
-             }
-             return py_outs;
-           })
-      .def("_SampleEncodeAndScoreAsSerializedProto",
-           [](const sentencepiece::SentencePieceProcessor& self,
-              const py::object& input, int num_samples, float alpha, bool wor,
-              bool include_best, bool add_bos, bool add_eos, bool reverse,
-              bool emit_unk_piece) {
-             CheckProtoArgsThrowException(add_bos, add_eos, reverse,
-                                          emit_unk_piece);
-             PyInputStringView in(input);
-             sentencepiece::NBestSentencePieceText samples_spt;
-             {
-               py::gil_scoped_release release;
-               auto status =
-                   self.SampleEncodeAndScore(in.value, num_samples, alpha, wor,
-                                             include_best, &samples_spt);
-               if (!status.ok()) throw status;
-             }
-             return py::bytes(samples_spt.SerializeAsString());
-           })
 
       // Parallel Encode APIs
       .def(
@@ -1554,32 +1513,6 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
              return py::make_tuple(ToPyString(norm, in.is_bytes), offsets);
            })
 
-      // Entropy API
-      .def("_CalculateEntropy",
-           [](const sentencepiece::SentencePieceProcessor& self,
-              const py::object& input, float alpha) {
-             PyInputStringView in(input);
-             float entropy = 0.0;
-             {
-               py::gil_scoped_release release;
-               auto status = self.CalculateEntropy(in.value, alpha, &entropy);
-               if (!status.ok()) throw status;
-             }
-             return entropy;
-           })
-
-      // Normalizer Spec Override
-      .def("_OverrideNormalizerSpec",
-           [](sentencepiece::SentencePieceProcessor& self,
-              const std::unordered_map<std::string, std::string>& args) {
-             absl::Status status;
-             for (const auto& [key, value] : args) {
-               status = sentencepiece::SentencePieceTrainer::SetProtoField(
-                   key, value, self.mutable_normalizer_spec());
-               if (!status.ok()) throw status;
-             }
-           })
-
       // Vocab management
       .def("GetPieceSize", &sentencepiece::SentencePieceProcessor::GetPieceSize)
       .def("PieceToId",
@@ -1597,13 +1530,9 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
                }
              }
              return ids;
-           })
-      REGISTER_ID_METHOD(IdToPiece)
-      REGISTER_ID_METHOD(GetScore)
-      REGISTER_ID_METHOD(IsUnknown)
-      REGISTER_ID_METHOD(IsControl)
-      REGISTER_ID_METHOD(IsUnused)
-      REGISTER_ID_METHOD(IsByte)
+           }) REGISTER_ID_METHOD(IdToPiece) REGISTER_ID_METHOD(GetScore)
+          REGISTER_ID_METHOD(IsUnknown) REGISTER_ID_METHOD(IsControl)
+              REGISTER_ID_METHOD(IsUnused) REGISTER_ID_METHOD(IsByte)
       .def("unk_id", &sentencepiece::SentencePieceProcessor::unk_id)
       .def("bos_id", &sentencepiece::SentencePieceProcessor::bos_id)
       .def("eos_id", &sentencepiece::SentencePieceProcessor::eos_id)
@@ -1624,55 +1553,64 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
       .def_static("_TrainFromString",
                   [](const std::string& arg) {
                     py::gil_scoped_release release;
-                    auto status =
-                        sentencepiece::SentencePieceTrainer::Train(arg);
+                    auto status = sentencepiece::SentencePieceTrainer::Train(
+                        arg, sentencepiece::TrainerComponents{});
                     if (!status.ok()) throw status;
                     return true;
                   })
-      .def_static("_TrainFromMap",
-                  [](const std::unordered_map<std::string, std::string>& args) {
-                    py::gil_scoped_release release;
-                    auto status =
-                        sentencepiece::SentencePieceTrainer::Train(args);
-                    if (!status.ok()) throw status;
-                    return true;
-                  })
-      .def_static("_TrainFromMap2",
-                  [](const std::unordered_map<std::string, std::string>& args,
-                     py::iterator iter) {
-                    PySentenceIterator py_iter(std::move(iter));
-                    {
-                      py::gil_scoped_release release;
-                      auto status = sentencepiece::SentencePieceTrainer::Train(
-                          args, &py_iter);
-                      if (!status.ok()) throw status;
-                    }
-                    return true;
-                  })
-      .def_static("_TrainFromMap3",
-                  [](const std::unordered_map<std::string, std::string>& args) {
-                    std::string model_proto;
-                    {
-                      py::gil_scoped_release release;
-                      auto status = sentencepiece::SentencePieceTrainer::Train(
-                          args, nullptr, &model_proto);
-                      if (!status.ok()) throw status;
-                    }
-                    return py::bytes(model_proto);
-                  })
-      .def_static("_TrainFromMap4",
-                  [](const std::unordered_map<std::string, std::string>& args,
-                     py::iterator iter) {
-                    std::string model_proto;
-                    PySentenceIterator py_iter(std::move(iter));
-                    {
-                      py::gil_scoped_release release;
-                      auto status = sentencepiece::SentencePieceTrainer::Train(
-                          args, &py_iter, &model_proto);
-                      if (!status.ok()) throw status;
-                    }
-                    return py::bytes(model_proto);
-                  });
+      .def_static(
+          "_TrainFromMap",
+          [](const std::unordered_map<std::string, std::string>& args,
+             py::object sentence_iterator, py::object pretokenizer,
+             bool allow_inconsistent_pretokenization,
+             bool return_model_proto) -> py::object {
+            sentencepiece::TrainerComponents components;
+            components.allow_inconsistent_pretokenization =
+                allow_inconsistent_pretokenization;
+            std::unique_ptr<PySentenceIterator> py_iter;
+            if (!sentence_iterator.is_none()) {
+              py_iter = std::make_unique<PySentenceIterator>(
+                  sentence_iterator.cast<py::iterator>());
+              components.sentence_iterator = py_iter.get();
+            }
+            if (!pretokenizer.is_none()) {
+              components.pretokenizer =
+                  [pretokenizer](
+                      absl::string_view text) -> std::vector<std::string> {
+                py::gil_scoped_acquire acquire;
+                try {
+                  py::object py_text = py::str(text.data(), text.size());
+                  py::object result = pretokenizer(py_text);
+                  std::vector<std::string> chunks;
+                  for (auto item : result.cast<py::sequence>()) {
+                    chunks.push_back(item.cast<std::string>());
+                  }
+                  return chunks;
+                } catch (const std::exception& e) {
+                  std::cerr << "Pretokenizer failed: " << e.what() << "\n";
+                  return {};
+                }
+              };
+            }
+
+            std::string model_proto;
+            {
+              py::gil_scoped_release release;
+              auto status = sentencepiece::SentencePieceTrainer::Train(
+                  args, components,
+                  return_model_proto ? &model_proto : nullptr);
+              if (!status.ok()) throw status;
+            }
+
+            if (return_model_proto) {
+              return py::bytes(model_proto);
+            }
+            return py::none();
+          },
+          py::arg("args"), py::arg("sentence_iterator") = py::none(),
+          py::arg("pretokenizer") = nullptr,
+          py::arg("allow_inconsistent_pretokenization") = false,
+          py::arg("return_model_proto") = false);
 
   // Bind Normalizer
   py::class_<sentencepiece::SentencePieceNormalizer>(m,
@@ -1687,14 +1625,15 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
              return true;
            })
       .def("LoadFromSerializedProto",
-            [](sentencepiece::SentencePieceNormalizer& self,
-               const py::bytes& serialized) {
-              std::string_view serialized_view = serialized.cast<std::string_view>();
-              py::gil_scoped_release release;
-              auto status = self.LoadFromSerializedProto(serialized_view);
-              if (!status.ok()) throw status;
-              return true;
-            })
+           [](sentencepiece::SentencePieceNormalizer& self,
+              const py::bytes& serialized) {
+             std::string_view serialized_view =
+                 serialized.cast<std::string_view>();
+             py::gil_scoped_release release;
+             auto status = self.LoadFromSerializedProto(serialized_view);
+             if (!status.ok()) throw status;
+             return true;
+           })
       .def("LoadFromRuleTSV",
            [](sentencepiece::SentencePieceNormalizer& self,
               const std::string& filename) {

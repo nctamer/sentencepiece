@@ -12,17 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
-#include "init.h"
-#include "testharness.h"
-#include "util.h"
+#include <gtest/gtest.h>
 
-ABSL_FLAG(std::string, test_srcdir, sentencepiece::util::JoinPath("..", "data"),
-          "Data directory.");
+#include <cstdlib>
+#include <string>
+
+#include "absl/flags/flag.h"
+#include "filesystem.h"
+#include "init.h"
+
+ABSL_FLAG(std::string, test_srcdir,
+          sentencepiece::filesystem::JoinPath("..", "data"), "Data directory.");
 ABSL_FLAG(std::string, test_tmpdir, "test_tmp", "Temporary directory.");
 
-int main(int argc, char **argv) {
-  sentencepiece::ScopedResourceDestructor cleaner;
+int main(int argc, char** argv) {
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
-  sentencepiece::test::RunAllTests();
-  return 0;
+  // Set TEST_SRCDIR environment variable so GoogleTest's native
+  // testing::SrcDir() can locate test data files when --test_srcdir is passed.
+#if defined(_WIN32) && !defined(__CYGWIN__)
+  _putenv_s("TEST_SRCDIR", absl::GetFlag(FLAGS_test_srcdir).c_str());
+#else
+  setenv("TEST_SRCDIR", absl::GetFlag(FLAGS_test_srcdir).c_str(), 1);
+#endif
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
 }

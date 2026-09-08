@@ -22,17 +22,30 @@
 #include <utility>
 #include <vector>
 
-#include "common.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/flags/declare.h"
+#include "absl/flags/flag.h"
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "filesystem.h"
+#include "gtest_prod.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
 #include "sentencepiece_trainer.h"
-#include "third_party/absl/container/flat_hash_map.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/string_view.h"
 #include "util.h"
 
+ABSL_DECLARE_FLAG(bool, use_sparse_pruning);
+ABSL_DECLARE_FLAG(bool, auto_character_coverage);
+ABSL_DECLARE_FLAG(float, fixed_sparse_lambda);
+ABSL_DECLARE_FLAG(bool, post_l1_debias);
+ABSL_DECLARE_FLAG(float, seed_piece_length_power);
+ABSL_DECLARE_FLAG(float, min_freq_alpha);
+
 namespace sentencepiece {
+
+namespace string_util {
+using UnicodeText = std::vector<char32_t>;
+}  // namespace string_util
 
 template <typename K, typename V>
 std::vector<std::pair<K, V>> Sorted(const std::vector<std::pair<K, V>>& m) {
@@ -79,21 +92,30 @@ class TrainerInterface {
 
   static const char32_t kWSChar;
   static const char32_t kUNKChar;
-  static const char32_t kUPPBoundaryChar;
+  static const char32_t kPretokenizationBoundaryChar;
   static const char kWSStr[];
   static const char kUNKStr[];
-  static const char kUPPBoundaryStr[];
+  static const char kPretokenizationBoundaryStr[];
 
   TrainerInterface(TrainerSpec trainer_spec, NormalizerSpec normalizer_spec,
                    NormalizerSpec denormalizer_spec);
 
   virtual ~TrainerInterface();
 
+  // Loads sentence from `components` and stores the model
+  // to `output_model_proto`.
+  virtual absl::Status Train(const TrainerComponents& components,
+                             ModelProto* output_model_proto) {
+    components_ = components;
+    output_model_proto_ = output_model_proto;
+    return Train();
+  }
+
   // Loads sentence from `sentence_iterator` and stores the model
   // to `output_model_proto`.
   virtual absl::Status Train(SentenceIterator* sentence_iterator,
                              ModelProto* output_model_proto) {
-    sentence_iterator_ = sentence_iterator;
+    components_.sentence_iterator = sentence_iterator;
     output_model_proto_ = output_model_proto;
     return Train();
   }
@@ -155,8 +177,8 @@ class TrainerInterface {
   // Detect errors on initialization.
   absl::Status status_;
 
-  // Loads sentences from SentenceIterator if not null.
-  SentenceIterator* sentence_iterator_ = nullptr;
+  // Components passed to Trainer.
+  TrainerComponents components_;
 
   // Emits model to this proto instead of file.
   ModelProto* output_model_proto_ = nullptr;
@@ -176,9 +198,6 @@ class TrainerInterface {
 
   // Initializes `meta_pieces_` from TrainerSpec.
   absl::Status InitMetaPieces();
-
-  // Randomly sampled raw sentences for self-testing.
-  std::vector<std::string> self_test_samples_;
 };
 }  // namespace sentencepiece
 #endif  // TRAINER_INTERFACE_H_

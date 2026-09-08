@@ -20,12 +20,15 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "absl/container/btree_set.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/types/span.h"
 #include "sentencepiece_model.pb.h"
-#include "third_party/absl/container/btree_set.h"
-#include "third_party/absl/container/flat_hash_map.h"
-#include "third_party/absl/status/status.h"
 #include "trainer_interface.h"
 
 namespace sentencepiece::bpe {
@@ -41,25 +44,18 @@ class Trainer : public TrainerInterface {
 
   absl::Status Train() override;
 
-#ifdef SPM_NLCODEC_BPE
-  // Fast BPE training using nlcodec's max-heap + linked-list algorithm.
-  // Based on nlcodec by Thamme Gowda (https://github.com/isi-nlp/nlcodec)
-  // "Many-to-English Machine Translation Tools, Data, and Pretrained Models"
-  // Gowda et al., ACL 2021. https://arxiv.org/abs/2104.00290v2
-  absl::Status TrainFast();
-#endif  // SPM_NLCODEC_BPE
-
  private:
   // Symbol represents a character or symbol bigram.
   struct Symbol {
-    const Symbol* left = nullptr;    // left symbol in bigram
-    const Symbol* right = nullptr;   // right symbol in bigram
-    string_util::UnicodeText chars;  // all flattend chracter sequence
-    uint64_t fp = 0;                 // fingerprint of this symbol.
-    uint64_t freq = 0;               // frequency of this symbol.
-    bool is_unk = false;             // true if this symbol is unknown.
-    bool active = true;              // true if this symbol is active.
-    bool pending = false;            // true if this symbol is pending push.
+    const Symbol* left = nullptr;   // left symbol in bigram
+    const Symbol* right = nullptr;  // right symbol in bigram
+    std::string piece;              // UTF-8 string or raw byte sequence
+    size_t char_len = 1;            // character length (in codepoints)
+    uint64_t fp = 0;                // fingerprint of this symbol.
+    uint64_t freq = 0;              // frequency of this symbol.
+    bool is_unk = false;            // true if this symbol is unknown.
+    bool active = true;             // true if this symbol is active.
+    bool pending = false;           // true if this symbol is pending push.
     bool needs_recomputation =
         true;  // true if this symbol needs recomputation.
 
@@ -70,7 +66,6 @@ class Trainer : public TrainerInterface {
     [[nodiscard]] bool IsBigram() const {
       return left != nullptr && right != nullptr;
     }
-    [[nodiscard]] std::string ToString() const;
     Symbol() = default;
   };
 
@@ -100,6 +95,17 @@ class Trainer : public TrainerInterface {
     p.right = n & 0xffff;
     return p;
   }
+
+  // LEGACY seed_merges_file: replays the seed tokenizer's merges onto the
+  // corpus before learning, so new merges are learned on top of the seed's
+  // segmentation instead of contradicting it. Superseded by --expansion_spec.
+  absl::Status ApplySeedMerges();
+
+  // Writes <model_prefix>.merges - the pair each learned piece was merged
+  // from, in learned order. Upstream discards this, forcing every consumer of
+  // a merge list to guess the split back from the piece string.
+  absl::Status SaveMerges(
+      const std::vector<std::pair<std::string, std::string>>& merges) const;
 
   // Gets unary (character) symbol from the char code |c|.
   // The return value is cached.
@@ -140,10 +146,10 @@ class Trainer : public TrainerInterface {
       if (e1.freq != e2.freq) {
         return e1.freq < e2.freq;
       }
-      if (e1.symbol->chars.size() != e2.symbol->chars.size()) {
-        return e1.symbol->chars.size() > e2.symbol->chars.size();
+      if (e1.symbol->char_len != e2.symbol->char_len) {
+        return e1.symbol->char_len > e2.symbol->char_len;
       }
-      return e1.symbol->chars > e2.symbol->chars;
+      return e1.symbol->piece > e2.symbol->piece;
     }
   };
 
@@ -156,6 +162,17 @@ class Trainer : public TrainerInterface {
 
   // Sentences. symbols_[sid][index] stores a symbol in sentence_[sid][index].
   std::vector<std::vector<Symbol*>> symbols_;
+
+  struct MergeCandidate {
+    std::string piece;
+    int64_t score = 0;
+  };
+
+  // Prunes merge candidates and selects an optimal set of subwords and single
+  // characters using Global Search with Fenwick Tree.
+  std::vector<std::pair<std::string, float>> PrunePiecesWithGlobalSearch(
+      absl::Span<const MergeCandidate> merge_candidates,
+      size_t target_final_pieces_size);
 };
 }  // namespace sentencepiece::bpe
 

@@ -15,20 +15,10 @@
 #ifndef INIT_H_
 #define INIT_H_
 
-#include "common.h"
-
 namespace sentencepiece {
 
-void ParseCommandLineFlags(const char *usage, int *argc, char ***argv,
+void ParseCommandLineFlags(const char* usage, int* argc, char*** argv,
                            bool remove_arg = true);
-
-void ShutdownLibrary();
-
-class ScopedResourceDestructor {
- public:
-  ScopedResourceDestructor() {}
-  ~ScopedResourceDestructor() { ShutdownLibrary(); }
-};
 
 }  // namespace sentencepiece
 

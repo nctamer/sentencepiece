@@ -14,30 +14,26 @@
 
 #include "util.h"
 
-#include <map>
+#include <gtest/gtest.h>
 
-#include "filesystem.h"
-#include "testharness.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/str_cat.h"
-#include "third_party/absl/strings/string_view.h"
-#include "third_party/absl/time/clock.h"
-#include "third_party/absl/time/time.h"
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "config.h"
+#include "sentencepiece_processor.h"
 
 namespace sentencepiece {
 namespace {
 constexpr int kMaxUnicode = 0x10FFFF;
-}
-
-TEST(UtilTest, Hex) {
-  for (char32_t a = 0; a < 100000; ++a) {
-    const std::string s = string_util::IntToHex<char32_t>(a);
-    CHECK_EQ(a, string_util::HexToInt<char32_t>(s));
-  }
-  const int n = 151414;
-  CHECK_EQ("24F76", string_util::IntToHex(n));
-  CHECK_EQ(n, string_util::HexToInt<int>("24F76"));
-  CHECK_EQ(n, string_util::HexToInt<int>("0x24F76"));
 }
 
 TEST(UtilTest, StringViewTest) {
@@ -88,14 +84,6 @@ TEST(UtilTest, EncodePODTet) {
     tmp = string_util::EncodePOD<int64_t>(10);
     EXPECT_FALSE(string_util::DecodePOD<int32_t>(tmp, &v));
   }
-}
-
-TEST(UtilTest, ItoaTest) {
-  EXPECT_EQ("0", string_util::SimpleItoa(0));
-  EXPECT_EQ("10", string_util::SimpleItoa(10));
-  EXPECT_EQ("-10", string_util::SimpleItoa(-10));
-  EXPECT_EQ("718", string_util::SimpleItoa(718));
-  EXPECT_EQ("-522", string_util::SimpleItoa(-522));
 }
 
 TEST(UtilTest, OneCharLenTest) {
@@ -271,57 +259,6 @@ TEST(UtilTest, UnicodeTextToUTF8Test) {
   EXPECT_EQ("これはtest", string_util::UnicodeTextToUTF8(ut));
 }
 
-TEST(UtilTest, MapUtilTest) {
-  const std::map<std::string, std::string> kMap = {
-      {"a", "A"}, {"b", "B"}, {"c", "C"}};
-
-  EXPECT_TRUE(port::ContainsKey(kMap, "a"));
-  EXPECT_TRUE(port::ContainsKey(kMap, "b"));
-  EXPECT_FALSE(port::ContainsKey(kMap, ""));
-  EXPECT_FALSE(port::ContainsKey(kMap, "x"));
-
-  EXPECT_EQ("A", port::FindOrDie(kMap, "a"));
-  EXPECT_EQ("B", port::FindOrDie(kMap, "b"));
-
-  EXPECT_EQ("A", port::FindWithDefault(kMap, "a", "x"));
-  EXPECT_EQ("B", port::FindWithDefault(kMap, "b", "x"));
-  EXPECT_EQ("x", port::FindWithDefault(kMap, "d", "x"));
-
-  EXPECT_EQ("A", port::FindOrDie(kMap, "a"));
-}
-
-TEST(UtilTest, InputOutputBufferTest) {
-  const std::vector<std::string> kData = {
-      "This"
-      "is"
-      "a"
-      "test"};
-
-  {
-    auto output = filesystem::NewWritableFile(
-        util::JoinPath(::testing::TempDir(), "test_file"));
-    for (size_t i = 0; i < kData.size(); ++i) {
-      output->WriteLine(kData[i]);
-    }
-  }
-
-  {
-    auto input = filesystem::NewReadableFile(
-        util::JoinPath(::testing::TempDir(), "test_file"));
-    std::string line;
-    for (size_t i = 0; i < kData.size(); ++i) {
-      EXPECT_TRUE(input->ReadLine(&line));
-      EXPECT_EQ(kData[i], line);
-    }
-    EXPECT_FALSE(input->ReadLine(&line));
-  }
-}
-
-TEST(UtilTest, InputOutputBufferInvalidFileTest) {
-  auto input = filesystem::NewReadableFile("__UNKNOWN__FILE__");
-  EXPECT_FALSE(input->status().ok());
-}
-
 TEST(UtilTest, StatusTest) {
   const absl::Status ok;
   EXPECT_TRUE(ok.ok());
@@ -347,18 +284,6 @@ TEST(UtilTest, StatusTest) {
     EXPECT_TRUE(s.ToString().find("message") != std::string::npos)
         << s.ToString();
   }
-}
-
-TEST(UtilTest, JoinPathTest) {
-#ifdef OS_WIN
-  EXPECT_EQ("foo\\bar\\buz", util::JoinPath("foo", "bar", "buz"));
-  EXPECT_EQ("foo\\\\buz", util::JoinPath("foo", "", "buz"));
-#else
-  EXPECT_EQ("foo/bar/buz", util::JoinPath("foo", "bar", "buz"));
-  EXPECT_EQ("foo//buz", util::JoinPath("foo", "", "buz"));
-#endif
-  EXPECT_EQ("foo", util::JoinPath("foo"));
-  EXPECT_EQ("", util::JoinPath(""));
 }
 
 TEST(UtilTest, ReservoirSamplerTest) {

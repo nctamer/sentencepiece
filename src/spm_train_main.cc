@@ -12,17 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
+#include <cstdint>
+#include <limits>
 #include <map>
+#include <string>
+#include <vector>
 
+#include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
 #include "filesystem.h"
 #include "init.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_trainer.h"
-#include "third_party/absl/flags/flag.h"
-#include "third_party/absl/strings/ascii.h"
-#include "third_party/absl/strings/str_join.h"
-#include "third_party/absl/strings/str_split.h"
-#include "third_party/absl/strings/string_view.h"
 #include "util.h"
 
 using sentencepiece::NormalizerSpec;
@@ -43,9 +49,6 @@ ABSL_FLAG(int32_t, vocab_size, kDefaultTrainerSpec.vocab_size(),
           "vocabulary size");
 ABSL_FLAG(std::string, accept_language, "",
           "comma-separated list of languages this model can accept");
-ABSL_FLAG(int32_t, self_test_sample_size,
-          kDefaultTrainerSpec.self_test_sample_size(),
-          "the size of self test samples");
 ABSL_FLAG(double, character_coverage, kDefaultTrainerSpec.character_coverage(),
           "character coverage to determine the minimum symbols");
 ABSL_FLAG(std::uint64_t, input_sentence_size,
@@ -60,6 +63,27 @@ ABSL_FLAG(int32_t, seed_sentencepiece_size,
           "the size of seed sentencepieces");
 ABSL_FLAG(std::string, seed_sentencepieces_file, "",
           "file to load seed sentencepieces from");
+ABSL_FLAG(std::string, expansion_spec, "",
+          "serialized ExpansionSpec for tokenizer continuation");
+ABSL_FLAG(std::string, expansion_result, "",
+          "optional output path for the serialized ExpansionResult");
+ABSL_FLAG(std::string, unigram_prior_model, "",
+          "prior Unigram ModelProto for true Unigram continuation");
+// Legacy intermo compatibility flags (TrainerSpec extensions 200/201/204/205).
+// Superseded by --expansion_spec / --unigram_prior_model; see
+// README_expansion.md.
+ABSL_FLAG(bool, split_by_interval, false,
+          "legacy: split only at whitespace followed by digit or | (intermo "
+          "interval/barline)");
+ABSL_FLAG(bool, split_by_barline, false,
+          "legacy: split only at whitespace followed by | (intermo barline "
+          "only)");
+ABSL_FLAG(std::string, protected_pieces_file, "",
+          "legacy: pieces to protect from pruning (one per line). This is "
+          "protected-vocabulary fresh training, NOT continuation");
+ABSL_FLAG(std::string, seed_merges_file, "",
+          "legacy bpe: seed tokenizer's merges, left<TAB>right per line in "
+          "rank order; replayed onto the corpus before learning");
 ABSL_FLAG(double, shrinking_factor, kDefaultTrainerSpec.shrinking_factor(),
           "Keeps top shrinking_factor pieces with respect to the loss");
 ABSL_FLAG(int32_t, num_threads, kDefaultTrainerSpec.num_threads(),
@@ -81,12 +105,6 @@ ABSL_FLAG(bool, split_by_whitespace, kDefaultTrainerSpec.split_by_whitespace(),
           "use a white space to split sentence pieces");
 ABSL_FLAG(bool, split_digits, kDefaultTrainerSpec.split_digits(),
           "split all digits (0-9) into separate pieces");
-ABSL_FLAG(bool, split_by_interval, false,
-          "split only at whitespace followed by digit or | (intermo interval/barline)");
-ABSL_FLAG(bool, split_by_barline, false,
-          "split only at whitespace followed by | (intermo barline only)");
-ABSL_FLAG(std::string, protected_pieces_file, "",
-          "unigram: pieces to protect from pruning (one per line)");
 ABSL_FLAG(std::string, pretokenization_delimiter,
           kDefaultTrainerSpec.pretokenization_delimiter(),
           "specifies the delimiter of pre-tokenization");
@@ -157,20 +175,7 @@ ABSL_FLAG(bool, train_extremely_large_corpus,
 ABSL_FLAG(uint32_t, random_seed, std::numeric_limits<uint32_t>::max(),
           "Seed value for random generator.");
 
-// DP related.
-ABSL_FLAG(bool, enable_differential_privacy, false,
-          "Whether to add DP while training. Currently supported only by "
-          "UNIGRAM model.");
-
-ABSL_FLAG(float, differential_privacy_noise_level, 0.0f,
-          "Amount of noise to add for"
-          " DP");
-ABSL_FLAG(std::uint64_t, differential_privacy_clipping_threshold, 0,
-          "Threshold for"
-          " clipping the counts for DP");
-
 int main(int argc, char* argv[]) {
-  sentencepiece::ScopedResourceDestructor cleaner;
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
 
   sentencepiece::TrainerSpec trainer_spec;
@@ -227,12 +232,24 @@ int main(int argc, char* argv[]) {
   SetTrainerSpecFromFlag(input_format);
   SetTrainerSpecFromFlag(model_prefix);
   SetTrainerSpecFromFlag(vocab_size);
-  SetTrainerSpecFromFlag(self_test_sample_size);
   SetTrainerSpecFromFlag(character_coverage);
   SetTrainerSpecFromFlag(input_sentence_size);
   SetTrainerSpecFromFlag(shuffle_input_sentence);
   SetTrainerSpecFromFlag(seed_sentencepiece_size);
   SetTrainerSpecFromFlag(seed_sentencepieces_file);
+  SetTrainerSpecFromFlag(expansion_spec);
+  SetTrainerSpecFromFlag(expansion_result);
+  SetTrainerSpecFromFlag(unigram_prior_model);
+  // Legacy intermo extensions live in the extension range, so they are set
+  // with SetExtension rather than a generated set_X accessor.
+  trainer_spec.SetExtension(::sentencepiece::split_by_interval,
+                            absl::GetFlag(FLAGS_split_by_interval));
+  trainer_spec.SetExtension(::sentencepiece::split_by_barline,
+                            absl::GetFlag(FLAGS_split_by_barline));
+  trainer_spec.SetExtension(::sentencepiece::protected_pieces_file,
+                            absl::GetFlag(FLAGS_protected_pieces_file));
+  trainer_spec.SetExtension(::sentencepiece::seed_merges_file,
+                            absl::GetFlag(FLAGS_seed_merges_file));
   SetTrainerSpecFromFlag(shrinking_factor);
   SetTrainerSpecFromFlag(num_threads);
   SetTrainerSpecFromFlag(num_sub_iterations);
@@ -242,13 +259,6 @@ int main(int argc, char* argv[]) {
   SetTrainerSpecFromFlag(split_by_whitespace);
   SetTrainerSpecFromFlag(split_by_number);
   SetTrainerSpecFromFlag(split_digits);
-  // intermo extensions (use SetExtension, not set_X)
-  trainer_spec.SetExtension(::sentencepiece::split_by_interval,
-                            absl::GetFlag(FLAGS_split_by_interval));
-  trainer_spec.SetExtension(::sentencepiece::split_by_barline,
-                            absl::GetFlag(FLAGS_split_by_barline));
-  trainer_spec.SetExtension(::sentencepiece::protected_pieces_file,
-                            absl::GetFlag(FLAGS_protected_pieces_file));
   SetTrainerSpecFromFlag(pretokenization_delimiter);
   SetTrainerSpecFromFlag(byte_fallback);
   SetTrainerSpecFromFlag(treat_whitespace_as_suffix);
@@ -271,11 +281,6 @@ int main(int argc, char* argv[]) {
   SetRepeatedTrainerSpecFromFlag(control_symbols);
   SetRepeatedTrainerSpecFromFlag(user_defined_symbols);
   SetTrainerSpecFromFlag(train_extremely_large_corpus);
-  // DP related.
-  SetTrainerSpecFromFlag(enable_differential_privacy);
-  SetTrainerSpecFromFlag(differential_privacy_noise_level);
-  SetTrainerSpecFromFlag(differential_privacy_clipping_threshold);
-
   SetRepeatedTrainerSpecFromFile(control_symbols);
   SetRepeatedTrainerSpecFromFile(user_defined_symbols);
 

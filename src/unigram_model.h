@@ -15,17 +15,17 @@
 #ifndef UNIGRAM_MODEL_H_
 #define UNIGRAM_MODEL_H_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "common.h"
+#include "absl/strings/string_view.h"
 #include "freelist.h"
 #include "model_interface.h"
 #include "sentencepiece_model.pb.h"
-#include "third_party/absl/strings/string_view.h"
-#include "third_party/darts_clone/darts.h"
+#include "darts.h"
 
 namespace sentencepiece {
 namespace unigram {
@@ -102,9 +102,6 @@ class Lattice {
   // `theta` is a smoothing parameter.
   std::vector<Node*> Sample(float theta);
 
-  // Calculates the entropy of the lattice.
-  float CalculateEntropy(float theta) const;
-
   // Populates marginal probability of every node in this lattice.
   // |freq| is the frequency of the sentence.
   //  for (auto *node : all_nodes_) {
@@ -139,18 +136,7 @@ class Model : public ModelInterface {
   EncodeResult SampleEncode(absl::string_view normalized,
                             float theta) const override;
 
-  NBestEncodeResult SampleEncodeAndScore(absl::string_view normalized,
-                                         float theta, int samples, bool wor,
-                                         bool include_best) const override;
-
-  float CalculateEntropy(absl::string_view normalized,
-                         float theta) const override;
-
   bool IsSampleEncodeAvailable() const override { return true; }
-
-  bool IsSampleEncodeAndScoreAvailable() const override { return true; }
-
-  bool IsCalculateEntropyAvailable() const override { return true; }
 
   bool IsNBestEncodeAvailable() const override { return true; }
 
@@ -165,10 +151,6 @@ class Model : public ModelInterface {
 
   // Returns a vocab id of |piece|.
   int PieceToId(absl::string_view piece) const override;
-
-  // Verifies if two outputs are equivalent by comparing their scores.
-  bool VerifyOutputsEquivalent(absl::string_view expected,
-                               absl::string_view actual) const override;
 
  protected:
   // Builds a Trie index.

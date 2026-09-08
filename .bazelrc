@@ -1,0 +1,22 @@
+# Common C++ settings
+build --cxxopt=-std=c++20
+
+# Opt-in config for benchmarking: match CMake Release's -O3 (GCC/Clang only)
+build:bench --compilation_mode=opt
+build:bench --copt=-O3
+
+# Linux / GCC / Clang
+build:linux --copt=-Wall
+build:linux --copt=-Wno-deprecated-declarations
+
+# macOS / Clang
+build:macos --copt=-Wall
+build:macos --copt=-Wno-deprecated-declarations
+
+# Windows MSVC settings
+build:windows --copt=/utf-8
+build:windows --copt=/DNOMINMAX
+build:windows --copt=/wd4267
+build:windows --copt=/wd4244
+build:windows --copt=/wd4305
+build:windows --copt=/wd4996

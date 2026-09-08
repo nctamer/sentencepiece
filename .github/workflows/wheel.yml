@@ -21,17 +21,30 @@ jobs:
       digests-macos: ${{ steps.hash-macos.outputs.digests }}
       digests-windows: ${{ steps.hash-windows.outputs.digests }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest]
+        include:
+          - os: ubuntu-latest
+            cibw_arch: auto
+          - os: ubuntu-24.04-arm
+            cibw_arch: auto
+          - os: windows-latest
+            cibw_arch: auto
+          - os: windows-11-arm
+            cibw_arch: auto
+          - os: macos-latest
+            cibw_arch: arm64
     runs-on: ${{ matrix.os }}
-    name: Build wheels on ${{ matrix.os }}
+    name: Build wheels on ${{ matrix.os }} (${{ matrix.cibw_arch }})
 
     permissions:
       contents: write # svenstaro/upload-release-action
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.x"
 
@@ -54,7 +67,7 @@ jobs:
           cmake --build build --config Release --target install --parallel 8
         env:
           MACOSX_DEPLOYMENT_TARGET: 10.13
-          CMAKE_OSX_ARCHITECTURES: arm64;x86_64
+          CMAKE_OSX_ARCHITECTURES: ${{ matrix.cibw_arch }}
 
       - name: Install cibuildwheel
         working-directory: python
@@ -65,38 +78,37 @@ jobs:
       - name: Build wheels
         working-directory: python
         run: |
-          mkdir -p src/sentencepiece/package_data
-          cp ../data/*.bin src/sentencepiece/package_data
+          python build_sdist.py
           python -m cibuildwheel --output-dir wheelhouse
         env:
           CIBW_ARCHS_LINUX: auto
-          CIBW_ARCHS_MACOS: x86_64 universal2 arm64
+          CIBW_ARCHS_MACOS: ${{ matrix.cibw_arch }}
           CIBW_ARCHS_WINDOWS: auto
           CIBW_SKIP: "*-musllinux_* *-win32"
           CIBW_ENVIRONMENT: "CMAKE_BUILD_PARALLEL_LEVEL=8"
+          CIBW_BEFORE_ALL_LINUX: "sh build_bundled.sh"
           CIBW_BUILD_VERBOSITY: 1
-          CIBW_ENABLE: cpython-freethreading
-
-      - name: Build sdist archive
-        working-directory: python
-        run: |
-          sh build_sdist.sh
 
       - name: Fetch sdist archive
+        if: matrix.os == 'ubuntu-latest'
         uses: tj-actions/glob@2deae40528141fc53131606d56b4e4ce2a486b29 # v22.0.2
         id: sdist
         with:
           files: python/dist/*.tar.gz
 
       - name: Build wheel from sdist
-        run: python -m pip wheel "${{ steps.sdist.outputs.paths }}" --verbose
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          SDIST_PATHS: ${{ steps.sdist.outputs.paths }}
+        run: python -m pip wheel "$SDIST_PATHS" --verbose
 
       - name: Copy sdist
         working-directory: python
-        if: runner.os == 'macOS'
+        if: matrix.os == 'ubuntu-latest'
         run: |
           mkdir -p wheelhouse
           cp -f dist/*.tar.gz wheelhouse/
+
 
       - name: Validate artifact
         run: |
@@ -104,7 +116,7 @@ jobs:
           twine check --strict python/wheelhouse/*
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-${{ matrix.os }}
           path: python/wheelhouse/*
@@ -112,7 +124,7 @@ jobs:
 
       - name: Upload wheel release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: svenstaro/upload-release-action@29e53e917877a24fad85510ded594ab3c9ca12de # v2.11.5
+        uses: svenstaro/upload-release-action@29e53e917877a24fad85510ded594ab3c9ca12de # v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: python/wheelhouse/*
@@ -140,14 +152,15 @@ jobs:
     needs: [build_wheels]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           sparse-checkout: |
             python/test
             python/tools
             data/botchan.txt
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13t"
 
@@ -193,7 +206,7 @@ jobs:
       actions: read   # To read the workflow path.
       id-token: write # To sign the provenance.
       contents: write # To add assets to a release.
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
     with:
       base64-subjects: "${{ needs.gather-digests.outputs.digests }}"
       upload-assets: true # Optional: Upload to a new release

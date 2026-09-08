@@ -12,27 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
+#include <gtest/gtest.h>
+
+#include <cstdlib>
 #include <string>
 #include <vector>
 
-#include "common.h"
+#include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/flags.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
 #include "filesystem.h"
+#include "init.h"
 #include "model_factory.h"
 #include "model_interface.h"
 #include "normalizer.h"
 #include "sentencepiece.pb.h"
 #include "sentencepiece_processor.h"
-#include "testharness.h"
-#include "third_party/absl/log/check.h"
-#include "third_party/absl/log/flags.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/str_split.h"
-#include "third_party/absl/strings/string_view.h"
-#include "third_party/benchmark/include/benchmark/benchmark.h"
+#include "benchmark/benchmark.h"
 #include "util.h"
 
-ABSL_FLAG(std::string, test_srcdir, sentencepiece::util::JoinPath("..", "data"),
-          "Data directory.");
+ABSL_FLAG(std::string, test_srcdir,
+          sentencepiece::filesystem::JoinPath("..", "data"), "Data directory.");
 ABSL_FLAG(std::string, test_tmpdir, "test_tmp", "Temporary directory.");
 
 namespace sentencepiece {
@@ -69,13 +72,13 @@ template <BenchmarkMode kMode>
 void BM_Encode(benchmark::State& state, absl::string_view model_filename,
                absl::string_view input_filename) {
   const std::string model_fullpath =
-      util::JoinPath(testing::SrcDir(), model_filename);
+      filesystem::JoinPath(testing::SrcDir(), model_filename);
   const ModelProto model_proto = LoadModelProto(model_fullpath);
   SentencePieceProcessor processor;
   CHECK_OK(processor.Load(model_proto));
 
   const std::string input_fullpath =
-      util::JoinPath(testing::SrcDir(), input_filename);
+      filesystem::JoinPath(testing::SrcDir(), input_filename);
   std::string input = LoadInput(input_fullpath);
   std::vector<int> ids;
   ThreadPool thread_pool(kNumThreads);
@@ -103,13 +106,13 @@ void BM_Encode_ShortLines(benchmark::State& state,
                           absl::string_view model_filename,
                           absl::string_view input_filename) {
   const std::string model_fullpath =
-      util::JoinPath(testing::SrcDir(), model_filename);
+      filesystem::JoinPath(testing::SrcDir(), model_filename);
   const ModelProto model_proto = LoadModelProto(model_fullpath);
   SentencePieceProcessor processor;
   CHECK_OK(processor.Load(model_proto));
 
   const std::string input_fullpath =
-      util::JoinPath(testing::SrcDir(), input_filename);
+      filesystem::JoinPath(testing::SrcDir(), input_filename);
   std::string input = LoadInput(input_fullpath);
   std::vector<absl::string_view> lines = absl::StrSplit(input, '\n');
   std::vector<int> ids;
@@ -134,13 +137,13 @@ template <DecodeInputMode kInputMode>
 void BM_Decode(benchmark::State& state, absl::string_view model_filename,
                absl::string_view input_filename) {
   const std::string model_fullpath =
-      util::JoinPath(testing::SrcDir(), model_filename);
+      filesystem::JoinPath(testing::SrcDir(), model_filename);
   const ModelProto model_proto = LoadModelProto(model_fullpath);
   SentencePieceProcessor processor;
   CHECK_OK(processor.Load(model_proto));
 
   const std::string input_fullpath =
-      util::JoinPath(testing::SrcDir(), input_filename);
+      filesystem::JoinPath(testing::SrcDir(), input_filename);
   std::string input = LoadInput(input_fullpath);
 
   std::vector<int> ids;
@@ -168,73 +171,90 @@ void BM_Decode(benchmark::State& state, absl::string_view model_filename,
 }
 
 void BM_EncodeBotchan_Sequential(benchmark::State& state) {
-  BM_Encode<BenchmarkMode::kSequential>(state, "botchan_1000_bpe.model",
+  BM_Encode<BenchmarkMode::kSequential>(state, "botchan_en_bpe_1000.model",
                                         "botchan.txt");
 }
 BENCHMARK(BM_EncodeBotchan_Sequential);
 
 void BM_EncodeBotchan_Parallel(benchmark::State& state) {
-  BM_Encode<BenchmarkMode::kParallel>(state, "botchan_1000_bpe.model",
+  BM_Encode<BenchmarkMode::kParallel>(state, "botchan_en_bpe_1000.model",
                                       "botchan.txt");
 }
 BENCHMARK(BM_EncodeBotchan_Parallel);
 
 void BM_EncodeBotchan_ShortLines(benchmark::State& state) {
-  BM_Encode_ShortLines(state, "botchan_1000_bpe.model", "botchan.txt");
+  BM_Encode_ShortLines(state, "botchan_en_bpe_1000.model", "botchan.txt");
 }
 BENCHMARK(BM_EncodeBotchan_ShortLines);
 
 void BM_EncodeWagahaiwaNekodearu_Sequential(benchmark::State& state) {
   BM_Encode<BenchmarkMode::kSequential>(
-      state, "wagahaiwa_nekodearu_2000_bpe_byte.model",
+      state, "wagahaiwa_nekodearu_ja_bpe_byte_2000.model",
       "wagahaiwa_nekodearu.txt");
 }
 BENCHMARK(BM_EncodeWagahaiwaNekodearu_Sequential);
 
 void BM_EncodeWagahaiwaNekodearu_Parallel(benchmark::State& state) {
-  BM_Encode<BenchmarkMode::kParallel>(state,
-                                      "wagahaiwa_nekodearu_2000_bpe_byte.model",
-                                      "wagahaiwa_nekodearu.txt");
+  BM_Encode<BenchmarkMode::kParallel>(
+      state, "wagahaiwa_nekodearu_ja_bpe_byte_2000.model",
+      "wagahaiwa_nekodearu.txt");
 }
 BENCHMARK(BM_EncodeWagahaiwaNekodearu_Parallel);
 
 void BM_OSSModel_Sequential(benchmark::State& state) {
-  BM_Encode<BenchmarkMode::kSequential>(state, "test_oss_model.model",
+  BM_Encode<BenchmarkMode::kSequential>(state, "botchan_en_unigram_1000.model",
                                         "botchan.txt");
 }
 BENCHMARK(BM_OSSModel_Sequential);
 
 void BM_OSSModel_Parallel(benchmark::State& state) {
-  BM_Encode<BenchmarkMode::kParallel>(state, "test_oss_model.model",
+  BM_Encode<BenchmarkMode::kParallel>(state, "botchan_en_unigram_1000.model",
                                       "botchan.txt");
 }
 BENCHMARK(BM_OSSModel_Parallel);
 
 void BM_DecodeBotchan_Ids(benchmark::State& state) {
-  BM_Decode<DecodeInputMode::kIds>(state, "botchan_1000_bpe.model",
-                                    "botchan.txt");
+  BM_Decode<DecodeInputMode::kIds>(state, "botchan_en_bpe_1000.model",
+                                   "botchan.txt");
 }
 BENCHMARK(BM_DecodeBotchan_Ids);
 
 void BM_DecodeBotchan_Pieces(benchmark::State& state) {
-  BM_Decode<DecodeInputMode::kPieces>(state, "botchan_1000_bpe.model",
-                                       "botchan.txt");
+  BM_Decode<DecodeInputMode::kPieces>(state, "botchan_en_bpe_1000.model",
+                                      "botchan.txt");
 }
 BENCHMARK(BM_DecodeBotchan_Pieces);
 
 void BM_DecodeWagahaiwaNekodearu_Ids(benchmark::State& state) {
-  BM_Decode<DecodeInputMode::kIds>(
-      state, "wagahaiwa_nekodearu_2000_bpe_byte.model",
-      "wagahaiwa_nekodearu.txt");
+  BM_Decode<DecodeInputMode::kIds>(state,
+                                   "wagahaiwa_nekodearu_ja_bpe_byte_2000.model",
+                                   "wagahaiwa_nekodearu.txt");
 }
 BENCHMARK(BM_DecodeWagahaiwaNekodearu_Ids);
 
 void BM_DecodeOSSModel_Ids(benchmark::State& state) {
-  BM_Decode<DecodeInputMode::kIds>(state, "test_oss_model.model",
-                                    "botchan.txt");
+  BM_Decode<DecodeInputMode::kIds>(state, "botchan_en_unigram_1000.model",
+                                   "botchan.txt");
 }
 BENCHMARK(BM_DecodeOSSModel_Ids);
 
 }  // namespace sentencepiece
 
-BENCHMARK_MAIN();
+// BENCHMARK_MAIN() rejects flags it does not recognize, so parse the
+// benchmark flags first and hand the remainder (e.g. --test_srcdir) to Abseil.
+// As in test_main.cc, TEST_SRCDIR must be exported and GoogleTest initialized
+// before testing::SrcDir() can locate the test data files.
+int main(int argc, char **argv) {
+  benchmark::Initialize(&argc, argv);
+  sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv,
+                                       /*remove_arg=*/true);
+#if defined(_WIN32) && !defined(__CYGWIN__)
+  _putenv_s("TEST_SRCDIR", absl::GetFlag(FLAGS_test_srcdir).c_str());
+#else
+  setenv("TEST_SRCDIR", absl::GetFlag(FLAGS_test_srcdir).c_str(), 1);
+#endif
+  testing::InitGoogleTest(&argc, argv);
+  benchmark::RunSpecifiedBenchmarks();
+  benchmark::Shutdown();
+  return 0;
+}
