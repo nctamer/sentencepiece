@@ -12,21 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <string>
 #include <vector>
 
-#include "common.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "filesystem.h"
 #include "init.h"
 #include "sentencepiece.pb.h"
 #include "sentencepiece_processor.h"
-#include "third_party/absl/container/flat_hash_map.h"
-#include "third_party/absl/flags/flag.h"
-#include "third_party/absl/strings/str_cat.h"
-#include "third_party/absl/strings/str_join.h"
-#include "third_party/absl/strings/string_view.h"
 #include "trainer_interface.h"
 
 ABSL_FLAG(std::string, model, "", "model file name");
@@ -43,18 +45,10 @@ ABSL_FLAG(double, alpha, 0.5, "Smoothing parameter for sampling mode.");
 ABSL_FLAG(uint32_t, random_seed, std::numeric_limits<uint32_t>::max(),
           "Seed value for random generator.");
 
-// Piece restriction with vocabulary file.
-// https://github.com/rsennrich/subword-nmt#best-practice-advice-for-byte-pair-encoding-in-nmt
-ABSL_FLAG(std::string, vocabulary, "",
-          "Restrict the vocabulary. The encoder only emits the "
-          "tokens in \"vocabulary\" file");
-ABSL_FLAG(int32_t, vocabulary_threshold, 0,
-          "Words with frequency < threshold will be treated as OOV");
 ABSL_FLAG(bool, generate_vocabulary, false,
           "Generates vocabulary file instead of segmentation");
 
 int main(int argc, char* argv[]) {
-  sentencepiece::ScopedResourceDestructor cleaner;
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
   std::vector<std::string> rest_args;
 
@@ -79,11 +73,6 @@ int main(int argc, char* argv[]) {
   sentencepiece::SentencePieceProcessor sp;
   QCHECK_OK(sp.Load(absl::GetFlag(FLAGS_model)));
   QCHECK_OK(sp.SetEncodeExtraOptions(absl::GetFlag(FLAGS_extra_options)));
-
-  if (!absl::GetFlag(FLAGS_vocabulary).empty()) {
-    QCHECK_OK(sp.LoadVocabulary(absl::GetFlag(FLAGS_vocabulary),
-                                absl::GetFlag(FLAGS_vocabulary_threshold)));
-  }
 
   auto output =
       sentencepiece::filesystem::NewWritableFile(absl::GetFlag(FLAGS_output));
@@ -169,8 +158,7 @@ int main(int argc, char* argv[]) {
 
   if (absl::GetFlag(FLAGS_generate_vocabulary)) {
     for (const auto& it : sentencepiece::Sorted(vocab)) {
-      output->WriteLine(it.first + "\t" +
-                        sentencepiece::string_util::SimpleItoa(it.second));
+      output->WriteLine(absl::StrCat(it.first, "\t", it.second));
     }
   }
 

@@ -13,13 +13,15 @@
 // limitations under the License.!
 
 #include <sstream>
+#include <string>
 
-#include "common.h"
+#include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "filesystem.h"
 #include "init.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
-#include "third_party/absl/flags/flag.h"
 
 ABSL_FLAG(std::string, output, "", "Output filename");
 ABSL_FLAG(std::string, model, "", "input model file name");
@@ -27,8 +29,7 @@ ABSL_FLAG(std::string, output_format, "vocab",
           "output format. choose from vocab or syms. vocab outputs pieces "
           "and scores, syms outputs pieces and indices.");
 
-int main(int argc, char *argv[]) {
-  sentencepiece::ScopedResourceDestructor cleaner;
+int main(int argc, char* argv[]) {
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
 
   sentencepiece::SentencePieceProcessor sp;
@@ -39,7 +40,7 @@ int main(int argc, char *argv[]) {
   QCHECK_OK(output->status());
 
   if (absl::GetFlag(FLAGS_output_format) == "vocab") {
-    for (const auto &piece : sp.model_proto().pieces()) {
+    for (const auto& piece : sp.model_proto().pieces()) {
       std::ostringstream os;
       os << piece.piece() << "\t" << piece.score();
       output->WriteLine(os.str());

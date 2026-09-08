@@ -14,6 +14,9 @@
 
 #include "model_factory.h"
 
+#include <memory>
+
+#include "absl/log/log.h"
 #include "bpe_model.h"
 #include "char_model.h"
 #include "unigram_model.h"

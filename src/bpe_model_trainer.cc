@@ -15,24 +15,23 @@
 #include "bpe_model_trainer.h"
 
 #include <algorithm>
+#include <memory>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
-#include "pretokenizer_for_training.h"
-#include "third_party/absl/container/flat_hash_set.h"
-#include "third_party/absl/flags/flag.h"
-#include "third_party/absl/hash/hash.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/str_join.h"
-#include "third_party/absl/strings/str_replace.h"
-#include "third_party/absl/strings/string_view.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/flags/flag.h"
+#include "absl/hash/hash.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/status_macros.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/str_replace.h"
+#include "absl/strings/string_view.h"
+#include "ret_check.h"
 #include "util.h"
-
-#ifdef SPM_NLCODEC_BPE
-#include "contrib/nlcodec/bpe_model_trainer_nlcodec.h"
-ABSL_DECLARE_FLAG(bool, nlcodec_bpe);
-#endif  // SPM_NLCODEC_BPE
 
 namespace sentencepiece::bpe {
 
@@ -41,8 +40,9 @@ std::string Trainer::Symbol::ToString() const {
 }
 
 Trainer::Symbol* Trainer::GetCharSymbol(char32_t c) {
-  const uint64_t freq = port::FindWithDefault(required_chars_, c, 1);
-  CHECK_GT(freq, 0);
+  const auto req_it = required_chars_.find(c);
+  const uint64_t freq = (req_it != required_chars_.end()) ? req_it->second : 1;
+  CHECK_GT(freq, uint64_t{0});
   const auto it = symbols_cache_.find(c);
   if (it != symbols_cache_.end()) {
     return it->second;
@@ -52,7 +52,7 @@ Trainer::Symbol* Trainer::GetCharSymbol(char32_t c) {
   s->fp = c;
   s->chars.push_back(c);
   s->freq = freq;
-  port::InsertOrDie(&symbols_cache_, s->fp, s.get());
+  symbols_cache_.emplace(s->fp, s.get());
   Symbol* s_ptr = s.get();
   allocated_.push_back(std::move(s));
   return s_ptr;
@@ -90,7 +90,7 @@ Trainer::Symbol* Trainer::GetPairSymbol(const Symbol* left,
   s->left = left;
   s->right = right;
   s->chars = ut;
-  port::InsertOrDie(&symbols_cache_, s->fp, s.get());
+  symbols_cache_.emplace(s->fp, s.get());
   Symbol* s_ptr = s.get();
   allocated_.push_back(std::move(s));
   return s_ptr;
@@ -200,13 +200,7 @@ absl::Status Trainer::AcceptSymbol(Symbol* symbol) {
 }
 
 absl::Status Trainer::Train() {
-  RETURN_IF_ERROR(status());
-
-#ifdef SPM_NLCODEC_BPE
-  if (absl::GetFlag(FLAGS_nlcodec_bpe)) {
-    return TrainFast();
-  }
-#endif  // SPM_NLCODEC_BPE
+  ABSL_RETURN_IF_ERROR(status());
 
   RET_CHECK(normalizer_spec_.escape_whitespaces());
   RET_CHECK_EQ(TrainerSpec::BPE, trainer_spec_.model_type());
@@ -218,31 +212,9 @@ absl::Status Trainer::Train() {
   pending_queue_.clear();
 
   // Load all sentences
-  RETURN_IF_ERROR(LoadSentences());
-
-  if (trainer_spec_.split_by_whitespace() ||
-      trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
-      trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
+  ABSL_RETURN_IF_ERROR(LoadSentences());
+  if (trainer_spec_.split_by_whitespace()) {
     SplitSentencesByWhitespace();
-  }
-
-  // Pretokenizer applied only in training time.
-  // Pretokenizer is used as a constraint of piece extractions.
-  const auto* pretokenizer = SentencePieceTrainer::GetPretokenizerForTraining();
-
-  if ((pretokenizer != nullptr) ||
-      !trainer_spec_.pretokenization_delimiter().empty()) {
-    absl::string_view delimiter = trainer_spec_.pretokenization_delimiter();
-    LOG(INFO) << "Preprocessing with pretokenizer...";
-    for (auto& w : sentences_) {
-      if (pretokenizer != nullptr) {
-        w.first = absl::StrJoin(pretokenizer->PreTokenize(w.first),
-                                TrainerInterface::kUPPBoundaryStr);
-      } else if (!delimiter.empty()) {
-        w.first = absl::StrReplaceAll(
-            w.first, {{delimiter, TrainerInterface::kUPPBoundaryStr}});
-      }
-    }
   }
 
   // Initializes symbols_. symbols_[sid][i] stores an unary symbol.
@@ -272,43 +244,13 @@ absl::Status Trainer::Train() {
       trainer_spec_.vocab_size() - meta_pieces_.size() - required_chars_.size();
   RET_CHECK_GE(vocab_size, 0);
 
-  // Load protected pieces if specified. These are pre-loaded into final_pieces_
-  // before the merge loop. BPE learns new merges alongside them.
-  // Skip pieces that are single characters (they'll be in required_chars_).
-  const std::string &protected_file =
-      trainer_spec_.GetExtension(::sentencepiece::protected_pieces_file);
-  if (!protected_file.empty()) {
-    absl::flat_hash_set<std::string> required_strs;
-    for (const auto &w : required_chars_) {
-      required_strs.insert(string_util::UnicodeCharToUTF8(w.first));
-    }
-    auto input = filesystem::NewReadableFile(protected_file);
-    RET_CHECK(input->status().ok())
-        << "Cannot open protected_pieces_file: " << protected_file;
-    std::string line;
-    while (input->ReadLine(&line)) {
-      if (!line.empty() && !required_strs.count(line)) {
-        final_pieces_.emplace_back(line,
-                                   -static_cast<float>(final_pieces_.size()));
-      }
-    }
-    LOG(INFO) << "Loaded " << final_pieces_.size()
-              << " protected pieces for BPE";
-  }
-
   // We may see duplicated pieces that are extracted with different path.
   // In real segmentation phase, we can consider them as one symbol.
   // e.g., "aaa" => "aa" + "a" or "a" + "aa".
   absl::flat_hash_set<std::string> dup;
 
-  // Pre-populate dup with protected pieces so BPE doesn't re-add them.
-  for (const auto &p : final_pieces_) {
-    dup.insert(p.first);
-  }
-
   // Main loop.
-  // Note: final_pieces_ may already contain protected pieces, so (unlike
-  // upstream) we do not RET_CHECK(final_pieces_.empty()) here.
+  RET_CHECK(final_pieces_.empty());
   while (final_pieces_.size() < static_cast<size_t>(vocab_size)) {
     Symbol* best_symbol = nullptr;
     while (!pq_.empty()) {
@@ -356,7 +298,7 @@ absl::Status Trainer::Train() {
                 << " piece=" << best_symbol->ToString();
     }
 
-    RETURN_IF_ERROR(AcceptSymbol(best_symbol));
+    ABSL_RETURN_IF_ERROR(AcceptSymbol(best_symbol));
 
     for (Symbol* symbol : pending_queue_) {
       symbol->pending = false;
@@ -381,41 +323,4 @@ absl::Status Trainer::Train() {
   return Save();
 }
 
-#ifdef SPM_NLCODEC_BPE
-absl::Status Trainer::TrainFast() {
-  RET_CHECK(normalizer_spec_.escape_whitespaces());
-  RET_CHECK_EQ(TrainerSpec::BPE, trainer_spec_.model_type());
-
-  RETURN_IF_ERROR(LoadSentences());
-
-  if (trainer_spec_.split_by_whitespace() ||
-      trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
-      trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
-    SplitSentencesByWhitespace();
-  }
-
-  const int vocab_size =
-      trainer_spec_.vocab_size() - meta_pieces_.size() - required_chars_.size();
-  RET_CHECK_GE(vocab_size, 0);
-  RET_CHECK(final_pieces_.empty());
-
-  RETURN_IF_ERROR(
-      nlcodec::RunFastBPEMerges(sentences_, vocab_size, &final_pieces_,
-                                [this](const string_util::UnicodeText& ut) {
-                                  return IsValidSentencePiece(ut);
-                                }));
-
-  // Add required_chars_
-  for (const auto& w : Sorted(required_chars_)) {
-    const Symbol* symbol = GetCharSymbol(w.first);
-    final_pieces_.emplace_back(symbol->ToString(),
-                               -static_cast<float>(final_pieces_.size()));
-  }
-
-  allocated_.clear();
-  symbols_cache_.clear();
-
-  return Save();
-}
-#endif  // SPM_NLCODEC_BPE
 }  // namespace sentencepiece::bpe

@@ -14,12 +14,17 @@
 
 #include "sentencepiece_trainer.h"
 
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
 #include "filesystem.h"
 #include "sentencepiece_model.pb.h"
-#include "testharness.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/str_cat.h"
-#include "third_party/absl/strings/string_view.h"
 #include "util.h"
 
 namespace sentencepiece {
@@ -52,20 +57,14 @@ void CheckNormalizer(absl::string_view filename, bool expected_has_normalizer,
 }
 
 TEST(SentencePieceTrainerTest, TrainFromArgsTest) {
-  const std::string input = util::JoinPath(::testing::SrcDir(), kTestData);
-  const std::string model = util::JoinPath(::testing::TempDir(), "m");
+  const std::string input =
+      filesystem::JoinPath(::testing::SrcDir(), kTestData);
+  const std::string model = filesystem::JoinPath(::testing::TempDir(), "m");
 
   ASSERT_TRUE(SentencePieceTrainer::Train(
                   absl::StrCat("--input=", input, " --model_prefix=", model,
                                " --vocab_size=1000"))
                   .ok());
-  CheckVocab(model + ".model", 1000);
-
-  ASSERT_TRUE(
-      SentencePieceTrainer::Train(
-          absl::StrCat("--input=", input, " --model_prefix=", model,
-                       " --vocab_size=1000 --self_test_sample_size=100"))
-          .ok());
   CheckVocab(model + ".model", 1000);
 
   ASSERT_TRUE(SentencePieceTrainer::Train(
@@ -117,8 +116,9 @@ TEST(SentencePieceTrainerTest, TrainFromIterator) {
     size_t idx_ = 0;
   };
 
-  const std::string input = util::JoinPath(::testing::SrcDir(), kTestData);
-  const std::string model = util::JoinPath(::testing::TempDir(), "m");
+  const std::string input =
+      filesystem::JoinPath(::testing::SrcDir(), kTestData);
+  const std::string model = filesystem::JoinPath(::testing::TempDir(), "m");
 
   std::vector<std::string> sentences;
   {
@@ -151,9 +151,9 @@ TEST(SentencePieceTrainerTest, TrainFromIterator) {
 }
 
 TEST(SentencePieceTrainerTest, TrainWithCustomNormalizationRule) {
-  std::string input = util::JoinPath(::testing::SrcDir(), kTestData);
-  std::string rule = util::JoinPath(::testing::SrcDir(), kNfkcTestData);
-  const std::string model = util::JoinPath(::testing::TempDir(), "m");
+  std::string input = filesystem::JoinPath(::testing::SrcDir(), kTestData);
+  std::string rule = filesystem::JoinPath(::testing::SrcDir(), kNfkcTestData);
+  const std::string model = filesystem::JoinPath(::testing::TempDir(), "m");
 
   EXPECT_TRUE(SentencePieceTrainer::Train(
                   absl::StrCat("--input=", input, " --model_prefix=", model,
@@ -165,12 +165,12 @@ TEST(SentencePieceTrainerTest, TrainWithCustomNormalizationRule) {
 
 TEST(SentencePieceTrainerTest, TrainWithCustomDenormalizationRule) {
   const std::string input_file =
-      util::JoinPath(::testing::SrcDir(), kTestDataJa);
-  const std::string model = util::JoinPath(::testing::TempDir(), "m");
+      filesystem::JoinPath(::testing::SrcDir(), kTestDataJa);
+  const std::string model = filesystem::JoinPath(::testing::TempDir(), "m");
   const std::string norm_rule_tsv =
-      util::JoinPath(::testing::SrcDir(), kIdsNormTsv);
+      filesystem::JoinPath(::testing::SrcDir(), kIdsNormTsv);
   const std::string denorm_rule_tsv =
-      util::JoinPath(::testing::SrcDir(), kIdsDenormTsv);
+      filesystem::JoinPath(::testing::SrcDir(), kIdsDenormTsv);
   EXPECT_TRUE(
       SentencePieceTrainer::Train(
           absl::StrCat("--input=", input_file, " --model_prefix=", model,
@@ -192,8 +192,9 @@ TEST(SentencePieceTrainerTest, TrainErrorTest) {
 
 TEST(SentencePieceTrainerTest, TrainTest) {
   TrainerSpec trainer_spec;
-  trainer_spec.add_input(util::JoinPath(::testing::SrcDir(), kTestData));
-  trainer_spec.set_model_prefix(util::JoinPath(::testing::TempDir(), "m"));
+  trainer_spec.add_input(filesystem::JoinPath(::testing::SrcDir(), kTestData));
+  trainer_spec.set_model_prefix(
+      filesystem::JoinPath(::testing::TempDir(), "m"));
   trainer_spec.set_vocab_size(1000);
   NormalizerSpec normalizer_spec;
   ASSERT_TRUE(SentencePieceTrainer::Train(trainer_spec, normalizer_spec).ok());
@@ -357,11 +358,11 @@ TEST(SentencePieceTrainerTest, PopulateModelTypeFromStringTest) {
 }
 
 TEST(SentencePieceTrainerTest, NormalizationTest) {
-  const auto model_prefix = util::JoinPath(::testing::TempDir(), "m");
+  const auto model_prefix = filesystem::JoinPath(::testing::TempDir(), "m");
   const auto model_file = absl::StrCat(model_prefix, ".model");
 
   TrainerSpec trainer_spec;
-  trainer_spec.add_input(util::JoinPath(::testing::SrcDir(), kTestData));
+  trainer_spec.add_input(filesystem::JoinPath(::testing::SrcDir(), kTestData));
   trainer_spec.set_model_prefix(model_prefix);
   trainer_spec.set_vocab_size(1000);
   ASSERT_TRUE(SentencePieceTrainer::Train(trainer_spec).ok());
@@ -370,13 +371,13 @@ TEST(SentencePieceTrainerTest, NormalizationTest) {
 
   {
     SentencePieceProcessor sp;
-    EXPECT_OK(sp.Load(model_file));
+    ABSL_EXPECT_OK(sp.Load(model_file));
     EXPECT_EQ(sp.Normalize(kInput), "▁KADOKAWA▁ABC");
 
     std::string normalized;
     std::vector<size_t> offsets;
 
-    EXPECT_OK(sp.Normalize(kInput, &normalized, &offsets));
+    ABSL_EXPECT_OK(sp.Normalize(kInput, &normalized, &offsets));
     EXPECT_EQ(normalized, "▁KADOKAWA▁ABC");
     EXPECT_EQ(offsets, std::vector<size_t>({0, 0, 0, 0, 3, 6, 9, 12, 15, 18, 21,
                                             24, 24, 24, 27, 28, 29, 30}));
@@ -384,12 +385,12 @@ TEST(SentencePieceTrainerTest, NormalizationTest) {
     EXPECT_EQ(offsets, std::vector<size_t>(
                            {0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14}));
 
-    EXPECT_OK(sp.Normalize("㍻元年", &normalized, &offsets));
+    ABSL_EXPECT_OK(sp.Normalize("㍻元年", &normalized, &offsets));
     EXPECT_EQ(normalized, "▁平成元年");
     ConvertToUnicodeAlignment(kInput, normalized, &offsets);
     EXPECT_EQ(offsets, std::vector<size_t>({0, 0, 0, 1, 2, 3}));
 
-    EXPECT_OK(sp.Normalize("ｶﾞｲﾀﾞﾝｽ", &normalized, &offsets));
+    ABSL_EXPECT_OK(sp.Normalize("ｶﾞｲﾀﾞﾝｽ", &normalized, &offsets));
     EXPECT_EQ(normalized, "▁ガイダンス");
     ConvertToUnicodeAlignment(kInput, normalized, &offsets);
     EXPECT_EQ(offsets, std::vector<size_t>({0, 0, 2, 3, 5, 6, 7}));
@@ -407,26 +408,26 @@ TEST(SentencePieceTrainerTest, NormalizationTest) {
   }
 
   auto set_normalization_only = [](SentencePieceNormalizer* normalizer) {
-    EXPECT_OK(SentencePieceTrainer::SetProtoField(
+    ABSL_EXPECT_OK(SentencePieceTrainer::SetProtoField(
         "add_dummy_prefix", "false", normalizer->mutable_normalizer_spec()));
-    EXPECT_OK(SentencePieceTrainer::SetProtoField(
+    ABSL_EXPECT_OK(SentencePieceTrainer::SetProtoField(
         "escape_whitespaces", "false", normalizer->mutable_normalizer_spec()));
-    EXPECT_OK(SentencePieceTrainer::SetProtoField(
+    ABSL_EXPECT_OK(SentencePieceTrainer::SetProtoField(
         "remove_extra_whitespaces", "false",
         normalizer->mutable_normalizer_spec()));
   };
 
   {
     SentencePieceNormalizer sp;
-    EXPECT_OK(sp.Load(model_file));
+    ABSL_EXPECT_OK(sp.Load(model_file));
     set_normalization_only(&sp);
     EXPECT_EQ(sp.Normalize(kInput), "KADOKAWA   ABC ");
   }
 
   {
     SentencePieceNormalizer sp;
-    EXPECT_OK(
-        sp.LoadFromRuleTSV(util::JoinPath(::testing::SrcDir(), "nfkc_cf.tsv")));
+    ABSL_EXPECT_OK(sp.LoadFromRuleTSV(
+        filesystem::JoinPath(::testing::SrcDir(), "nfkc_cf.tsv")));
     set_normalization_only(&sp);
     EXPECT_EQ(sp.Normalize("ABCD"), "abcd");
   }
@@ -438,14 +439,14 @@ TEST(SentencePieceTrainerTest, NormalizationTest) {
 
   {
     SentencePieceNormalizer sp;
-    EXPECT_OK(sp.LoadFromRuleName("nfkc_cf"));
+    ABSL_EXPECT_OK(sp.LoadFromRuleName("nfkc_cf"));
     set_normalization_only(&sp);
     EXPECT_EQ(sp.Normalize("ABCD"), "abcd");
   }
 
   {
     SentencePieceNormalizer sp;
-    EXPECT_OK(sp.LoadFromRuleName("identity"));
+    ABSL_EXPECT_OK(sp.LoadFromRuleName("identity"));
     set_normalization_only(&sp);
     EXPECT_EQ(sp.Normalize("ＡＢＣＤ"), "ＡＢＣＤ");
   }
@@ -463,15 +464,14 @@ TEST(SentencePieceTrainerTest, NormalizerMapTest) {
   };
 
   SentencePieceNormalizer sp;
-  EXPECT_OK(sp.LoadFromMap(norm_map));
+  ABSL_EXPECT_OK(sp.LoadFromMap(norm_map));
 
-  EXPECT_OK(SentencePieceTrainer::SetProtoField(
+  ABSL_EXPECT_OK(SentencePieceTrainer::SetProtoField(
       "add_dummy_prefix", "false", sp.mutable_normalizer_spec()));
-  EXPECT_OK(SentencePieceTrainer::SetProtoField(
+  ABSL_EXPECT_OK(SentencePieceTrainer::SetProtoField(
       "escape_whitespaces", "false", sp.mutable_normalizer_spec()));
-  EXPECT_OK(SentencePieceTrainer::SetProtoField(
-      "remove_extra_whitespaces", "false",
-      sp.mutable_normalizer_spec()));
+  ABSL_EXPECT_OK(SentencePieceTrainer::SetProtoField(
+      "remove_extra_whitespaces", "false", sp.mutable_normalizer_spec()));
 
   EXPECT_EQ(sp.Normalize("foo"), "bar");
   EXPECT_EQ(sp.Normalize("apple"), "orange");
@@ -479,7 +479,7 @@ TEST(SentencePieceTrainerTest, NormalizerMapTest) {
   EXPECT_EQ(sp.Normalize("foo apple"), "bar orange");
 
   std::vector<std::pair<std::string, std::string>> decompiled_map;
-  EXPECT_OK(sp.Decompile(&decompiled_map));
+  ABSL_EXPECT_OK(sp.Decompile(&decompiled_map));
 
   ASSERT_EQ(decompiled_map.size(), 2);
   EXPECT_EQ(decompiled_map[0].first, "apple");
@@ -487,11 +487,12 @@ TEST(SentencePieceTrainerTest, NormalizerMapTest) {
   EXPECT_EQ(decompiled_map[1].first, "foo");
   EXPECT_EQ(decompiled_map[1].second, "bar");
 
-  // Test invalid UTF-8 validation, empty source, identity conversion, and duplicate keys
+  // Test invalid UTF-8 validation, empty source, identity conversion, and
+  // duplicate keys
   SentencePieceNormalizer sp_invalid;
   EXPECT_FALSE(sp_invalid.LoadFromMap({{"\xFF", "bar"}}).ok());
   EXPECT_FALSE(sp_invalid.LoadFromMap({{"foo", "\xFF"}}).ok());
-  EXPECT_FALSE(sp_invalid.LoadFromMap({{"" , "bar"}}).ok());
+  EXPECT_FALSE(sp_invalid.LoadFromMap({{"", "bar"}}).ok());
   EXPECT_FALSE(sp_invalid.LoadFromMap({{"foo", "foo"}}).ok());
   EXPECT_FALSE(sp_invalid.LoadFromMap({{"foo", "bar"}, {"foo", "baz"}}).ok());
 }
@@ -499,8 +500,8 @@ TEST(SentencePieceTrainerTest, NormalizerMapTest) {
 TEST(SentencePieceTrainerTest, NormalizerConflictTest) {
   SentencePieceNormalizer normalizer;
   std::vector<std::pair<std::string, std::string>> norm_map = {{"foo", "bar"}};
-  EXPECT_OK(normalizer.LoadFromMap(norm_map));
-  EXPECT_OK(SentencePieceTrainer::SetProtoField(
+  ABSL_EXPECT_OK(normalizer.LoadFromMap(norm_map));
+  ABSL_EXPECT_OK(SentencePieceTrainer::SetProtoField(
       "escape_whitespaces", "true", normalizer.mutable_normalizer_spec()));
 
   const std::string serialized_spec = normalizer.serialized_normalizer_spec();
@@ -518,14 +519,126 @@ TEST(SentencePieceTrainerTest, NormalizerConflictTest) {
 
   EXPECT_FALSE(train_with_kwargs("normalization_rule_name", "nfkc").ok());
   EXPECT_FALSE(train_with_kwargs("normalization_rule_tsv", "rules.tsv").ok());
-  EXPECT_OK(train_with_kwargs("denormalization_rule_tsv", "rules.tsv"));
+  ABSL_EXPECT_OK(train_with_kwargs("denormalization_rule_tsv", "rules.tsv"));
   EXPECT_FALSE(train_with_kwargs("add_dummy_prefix", "true").ok());
   EXPECT_FALSE(train_with_kwargs("escape_whitespaces", "true").ok());
   EXPECT_FALSE(train_with_kwargs("remove_extra_whitespaces", "true").ok());
 
-  EXPECT_OK(train_with_kwargs("character_coverage", "0.99"));
+  ABSL_EXPECT_OK(train_with_kwargs("character_coverage", "0.99"));
 }
 
+TEST(SentencePieceTrainerTest, TrainWithTrainerComponentsTest) {
+  const std::string input =
+      filesystem::JoinPath(::testing::SrcDir(), kTestData);
+  const std::string model =
+      filesystem::JoinPath(::testing::TempDir(), "m_components");
+
+  TrainerComponents components;
+  components.pretokenizer =
+      [](absl::string_view text) -> std::vector<std::string> {
+    return absl::StrSplit(text, ' ');
+  };
+
+  ASSERT_TRUE(SentencePieceTrainer::Train(
+                  absl::StrCat("--input=", input, " --model_prefix=", model,
+                               " --vocab_size=1000 --model_type=unigram"),
+                  components)
+                  .ok());
+  CheckVocab(model + ".model", 1000);
+}
+
+TEST(SentencePieceTrainerTest, InconsistentPretokenizerTest) {
+  const std::string input =
+      filesystem::JoinPath(::testing::SrcDir(), kTestData);
+  const std::string model =
+      filesystem::JoinPath(::testing::TempDir(), "m_inconsistent");
+
+  TrainerComponents components;
+  // Dropping characters causes mismatch.
+  components.pretokenizer =
+      [](absl::string_view text) -> std::vector<std::string> {
+    return {"hello"};
+  };
+
+  // Default allow_inconsistent_pretokenization = false, must fail.
+  EXPECT_FALSE(SentencePieceTrainer::Train(
+                   absl::StrCat("--input=", input, " --model_prefix=", model,
+                                " --vocab_size=1000 --model_type=unigram "
+                                "--hard_vocab_limit=false"),
+                   components)
+                   .ok());
+
+  // Set allow_inconsistent_pretokenization = true, must succeed.
+  components.allow_inconsistent_pretokenization = true;
+  ABSL_EXPECT_OK(SentencePieceTrainer::Train(
+      absl::StrCat(
+          "--input=", input, " --model_prefix=", model,
+          " --vocab_size=1000 --model_type=unigram --hard_vocab_limit=false"),
+      components));
+}
+
+TEST(SentencePieceTrainerTest, PretokenizerAndDelimiterMutuallyExclusiveTest) {
+  const std::string input =
+      filesystem::JoinPath(::testing::SrcDir(), kTestData);
+  const std::string model =
+      filesystem::JoinPath(::testing::TempDir(), "m_exclusive");
+
+  TrainerComponents components;
+  components.pretokenizer =
+      [](absl::string_view text) -> std::vector<std::string> {
+    return absl::StrSplit(text, ' ');
+  };
+
+  // Specifying pretokenizer AND pretokenization_delimiter must return error.
+  EXPECT_FALSE(SentencePieceTrainer::Train(
+                   absl::StrCat("--input=", input, " --model_prefix=", model,
+                                " --vocab_size=1000 --model_type=unigram "
+                                "--pretokenization_delimiter=||||"),
+                   components)
+                   .ok());
+}
+
+TEST(SentencePieceTrainerTest, ComplexPretokenizerTest) {
+  const std::string input =
+      filesystem::JoinPath(::testing::SrcDir(), kTestData);
+  const std::string model =
+      filesystem::JoinPath(::testing::TempDir(), "m_complex");
+
+  // Complex pretokenizer splitting by space ' ', punctuation ',', '.', and
+  // digits. Pretokenization Examples:
+  //   "Hello, world 123" -> ["Hello", ",", " ", "world", " ", "1", "2", "3"]
+  //   "foo.bar"          -> ["foo", ".", "bar"]
+  TrainerComponents components;
+  components.pretokenizer =
+      [](absl::string_view text) -> std::vector<std::string> {
+    std::vector<std::string> chunks;
+    std::string current;
+    for (char c : text) {
+      if (c == ' ' || c == ',' || c == '.' || (c >= '0' && c <= '9')) {
+        if (!current.empty()) {
+          chunks.push_back(current);
+          current.clear();
+        }
+        chunks.push_back(std::string(1, c));
+      } else {
+        current.push_back(c);
+      }
+    }
+    if (!current.empty()) {
+      chunks.push_back(current);
+    }
+    return chunks;
+  };
+
+  ABSL_EXPECT_OK(SentencePieceTrainer::Train(
+      absl::StrCat("--input=", input, " --model_prefix=", model,
+                   " --vocab_size=1000 --model_type=unigram"),
+      components));
+
+  SentencePieceProcessor sp;
+  ABSL_EXPECT_OK(sp.Load(model + ".model"));
+  EXPECT_EQ(1000, sp.GetPieceSize());
+}
 
 }  // namespace
 }  // namespace sentencepiece

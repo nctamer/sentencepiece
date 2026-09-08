@@ -14,10 +14,15 @@
 
 #include "model_interface.h"
 
+#include <gtest/gtest.h>
+
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "absl/container/flat_hash_map.h"
 #include "model_factory.h"
-#include "testharness.h"
-#include "third_party/absl/container/flat_hash_map.h"
-#include "util.h"
+#include "sentencepiece_model.pb.h"
 
 namespace sentencepiece {
 namespace {
@@ -31,9 +36,9 @@ const std::vector<TrainerSpec::ModelType> kModelTypes = {
 ModelProto MakeBaseModelProto(TrainerSpec::ModelType type,
                               bool byte_fallback = false) {
   ModelProto model_proto;
-  auto *sp1 = model_proto.add_pieces();
-  auto *sp2 = model_proto.add_pieces();
-  auto *sp3 = model_proto.add_pieces();
+  auto* sp1 = model_proto.add_pieces();
+  auto* sp2 = model_proto.add_pieces();
+  auto* sp3 = model_proto.add_pieces();
   model_proto.mutable_trainer_spec()->set_model_type(type);
   model_proto.mutable_trainer_spec()->set_byte_fallback(byte_fallback);
 
@@ -47,15 +52,15 @@ ModelProto MakeBaseModelProto(TrainerSpec::ModelType type,
   return model_proto;
 }
 
-void AddPiece(ModelProto *model_proto, const std::string &piece,
+void AddPiece(ModelProto* model_proto, const std::string& piece,
               float score = 0.0) {
-  auto *sp = model_proto->add_pieces();
+  auto* sp = model_proto->add_pieces();
   sp->set_piece(piece);
   sp->set_score(score);
 }
 
-void AddBytePiece(ModelProto *model_proto, unsigned char byte) {
-  auto *sp = model_proto->add_pieces();
+void AddBytePiece(ModelProto* model_proto, unsigned char byte) {
+  auto* sp = model_proto->add_pieces();
   sp->set_piece(ByteToPiece(byte));
   sp->set_type(ModelProto::SentencePiece::BYTE);
 }
@@ -308,10 +313,10 @@ TEST(ModelInterfaceTest, PieceToIdStressTest) {
       }
 
       auto model = ModelFactory::Create(model_proto);
-      for (const auto &it : expected_p2i) {
+      for (const auto& it : expected_p2i) {
         EXPECT_EQ(it.second, model->PieceToId(it.first));
       }
-      for (const auto &it : expected_i2p) {
+      for (const auto& it : expected_i2p) {
         EXPECT_EQ(it.second, model->IdToPiece(it.first));
       }
     }
@@ -457,72 +462,6 @@ TEST(ModelInterfaceTest, SplitIntoWordsWhiteSpaceOnly) {
   }
 }
 
-TEST(ModelInterfaceTest, SplitIntoWordsByIntervalTest) {
-  // intermo: |4/4k0 PR: C5 1/4 PL: A-3
-  // With split_by_interval=true, only split before WS+digit or WS+|
-  // Moments: [|4/4k0 PR: C5] [1/4 PL: A-3]
-  {
-    const auto v = SplitIntoWords(
-        WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3",
-        false, false, true, false);
-    EXPECT_EQ(2, v.size());
-    EXPECT_EQ(WS "|4/4k0" WS "PR:" WS "C5", v[0]);
-    EXPECT_EQ(WS "1/4" WS "PL:" WS "A-3", v[1]);
-  }
-
-  // Multiple moments
-  {
-    const auto v = SplitIntoWords(
-        WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3" WS "1/8" WS "PR:" WS "c5",
-        false, false, true, false);
-    EXPECT_EQ(3, v.size());
-    EXPECT_EQ(WS "|4/4k0" WS "PR:" WS "C5", v[0]);
-    EXPECT_EQ(WS "1/4" WS "PL:" WS "A-3", v[1]);
-    EXPECT_EQ(WS "1/8" WS "PR:" WS "c5", v[2]);
-  }
-
-  // WS followed by non-digit/non-pipe does NOT create boundary
-  {
-    const auto v = SplitIntoWords(
-        WS "PR:" WS "C5" WS "D4",
-        false, false, true, false);
-    EXPECT_EQ(1, v.size());
-    EXPECT_EQ(WS "PR:" WS "C5" WS "D4", v[0]);
-  }
-
-  // Text starting without WS
-  {
-    const auto v = SplitIntoWords(
-        "|4/4k0" WS "PR:" WS "1/4" WS "c5",
-        false, false, true, false);
-    EXPECT_EQ(2, v.size());
-    EXPECT_EQ("|4/4k0" WS "PR:", v[0]);
-    EXPECT_EQ(WS "1/4" WS "c5", v[1]);
-  }
-}
-
-TEST(ModelInterfaceTest, SplitIntoWordsByBarlineTest) {
-  // With split_by_barline=true, only split before WS+|
-  // Bars: [|4/4k0 PR: C5 1/4 PL: A-3] [|3/4k0 D5]
-  {
-    const auto v = SplitIntoWords(
-        WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3" WS "|3/4k0" WS "D5",
-        false, false, false, true);
-    EXPECT_EQ(2, v.size());
-    EXPECT_EQ(WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3", v[0]);
-    EXPECT_EQ(WS "|3/4k0" WS "D5", v[1]);
-  }
-
-  // WS+digit does NOT create boundary in barline mode
-  {
-    const auto v = SplitIntoWords(
-        WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3",
-        false, false, false, true);
-    EXPECT_EQ(1, v.size());
-    EXPECT_EQ(WS "|4/4k0" WS "PR:" WS "C5" WS "1/4" WS "PL:" WS "A-3", v[0]);
-  }
-}
-
 TEST(ModelInterfaceTest, ByteToPieceTest) {
   EXPECT_EQ(ByteToPiece(0), "<0x00>");
   EXPECT_EQ(ByteToPiece(1), "<0x01>");
@@ -548,25 +487,9 @@ TEST(ModelInterfaceTest, PieceToByteTest) {
   EXPECT_EQ(PieceToByte("a"), -1);
 }
 
-TEST(ModelInterfaceTest, VerifyOutputsEquivalent) {
-  for (const auto type : kModelTypes) {
-    ModelProto model_proto = MakeBaseModelProto(type);
-    AddPiece(&model_proto, "a", 1.0);
-    AddPiece(&model_proto, "b", 2.0);
-    auto model = ModelFactory::Create(model_proto);
-
-    // Equivalent outputs.
-    EXPECT_TRUE(model->VerifyOutputsEquivalent("", ""));
-    EXPECT_TRUE(model->VerifyOutputsEquivalent("a b", "a b"));
-
-    // Inequivalent outputs.
-    EXPECT_FALSE(model->VerifyOutputsEquivalent("a", "a b"));
-  }
-}
-
 TEST(ModelInterfaceTest, TooLongPieceModelTest) {
   ModelProto model_proto;
-  auto *sp = model_proto.add_pieces();
+  auto* sp = model_proto.add_pieces();
   std::string s(10000, 'a');
   sp->set_piece(s);
   auto model = ModelFactory::Create(model_proto);

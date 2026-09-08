@@ -12,20 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
-#include <functional>
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "builder.h"
 #include "filesystem.h"
 #include "init.h"
-#include "sentencepiece_processor.h"
-#include "third_party/absl/flags/flag.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/str_cat.h"
-#include "third_party/absl/strings/string_view.h"
 
 using sentencepiece::normalizer::Builder;
 
@@ -161,7 +164,6 @@ struct BinaryBlob {
 }  // namespace sentencepiece
 
 int main(int argc, char** argv) {
-  sentencepiece::ScopedResourceDestructor cleaner;
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
 
   const std::vector<

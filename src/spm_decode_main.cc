@@ -12,18 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
-#include <functional>
 #include <string>
 #include <vector>
 
-#include "common.h"
+#include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_split.h"
+#include "absl/types/span.h"
 #include "filesystem.h"
 #include "init.h"
 #include "sentencepiece.pb.h"
 #include "sentencepiece_processor.h"
-#include "third_party/absl/flags/flag.h"
-#include "third_party/absl/strings/str_split.h"
-#include "util.h"
 
 ABSL_FLAG(std::string, model, "", "model file name");
 ABSL_FLAG(std::string, input, "", "input filename");
@@ -33,8 +34,7 @@ ABSL_FLAG(std::string, output_format, "string", "choose from string or proto");
 ABSL_FLAG(std::string, extra_options, "",
           "':' separated encoder extra options, e.g., \"reverse:bos:eos\"");
 
-int main(int argc, char *argv[]) {
-  sentencepiece::ScopedResourceDestructor cleaner;
+int main(int argc, char* argv[]) {
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
   std::vector<std::string> rest_args;
 
@@ -61,25 +61,28 @@ int main(int argc, char *argv[]) {
 
   std::string detok, line;
   sentencepiece::SentencePieceText spt;
-  std::function<void(const std::vector<std::string> &pieces)> process;
+  std::function<void(absl::Span<const absl::string_view> pieces)> process;
 
-  auto ToIds = [&](const std::vector<std::string> &pieces) {
+  auto ToIds = [&](absl::Span<const absl::string_view> pieces) {
     std::vector<int> ids;
     ids.reserve(pieces.size());
-    for (const auto &s : pieces) {
-      ids.push_back(atoi(s.c_str()));
+    for (const auto& s : pieces) {
+      int id;
+      if (absl::SimpleAtoi(s, &id)) {
+        ids.push_back(id);
+      }
     }
     return ids;
   };
 
   if (absl::GetFlag(FLAGS_input_format) == "piece") {
     if (absl::GetFlag(FLAGS_output_format) == "string") {
-      process = [&](const std::vector<std::string> &pieces) {
+      process = [&](absl::Span<const absl::string_view> pieces) {
         QCHECK_OK(sp.Decode(pieces, &detok));
         output->WriteLine(detok);
       };
     } else if (absl::GetFlag(FLAGS_output_format) == "proto") {
-      process = [&](const std::vector<std::string> &pieces) {
+      process = [&](absl::Span<const absl::string_view> pieces) {
         QCHECK_OK(sp.Decode(pieces, &spt));
       };
     } else {
@@ -88,12 +91,12 @@ int main(int argc, char *argv[]) {
     }
   } else if (absl::GetFlag(FLAGS_input_format) == "id") {
     if (absl::GetFlag(FLAGS_output_format) == "string") {
-      process = [&](const std::vector<std::string> &pieces) {
+      process = [&](absl::Span<const absl::string_view> pieces) {
         QCHECK_OK(sp.Decode(ToIds(pieces), &detok));
         output->WriteLine(detok);
       };
     } else if (absl::GetFlag(FLAGS_output_format) == "proto") {
-      process = [&](const std::vector<std::string> &pieces) {
+      process = [&](absl::Span<const absl::string_view> pieces) {
         QCHECK_OK(sp.Decode(ToIds(pieces), &spt));
       };
     } else {
@@ -104,11 +107,11 @@ int main(int argc, char *argv[]) {
     LOG(FATAL) << "Unknown input format: " << absl::GetFlag(FLAGS_input_format);
   }
 
-  for (const auto &filename : rest_args) {
+  for (const auto& filename : rest_args) {
     auto input = sentencepiece::filesystem::NewReadableFile(filename);
     QCHECK_OK(input->status());
     while (input->ReadLine(&line)) {
-      const auto pieces = absl::StrSplit(line, " ");
+      const std::vector<absl::string_view> pieces = absl::StrSplit(line, " ");
       process(pieces);
     }
   }

@@ -14,15 +14,32 @@
 
 #include "util.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
 #include <memory>
+#include <queue>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
-#include "third_party/absl/random/random.h"
-#include "third_party/absl/status/status.h"
-#include "third_party/absl/strings/string_view.h"
-#include "third_party/absl/synchronization/blocking_counter.h"
-#include "third_party/absl/synchronization/mutex.h"
+#include "absl/base/internal/endian.h"
+#include "absl/log/check.h"
+#include "absl/log/globals.h"
+#include "absl/random/random.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "absl/synchronization/blocking_counter.h"
+#include "absl/synchronization/mutex.h"
+#include "config.h"
+#include "sentencepiece_processor.h"
 
 namespace sentencepiece {
 
@@ -79,7 +96,7 @@ char32_t DecodeUTF8(const char* begin, const char* end, size_t* mblen) {
     }
   } else if (len >= 3 && (begin[0] & 0xF0) == 0xE0) {
     const char32_t cp = (((begin[0] & 0x0F) << 12) | ((begin[1] & 0x3F) << 6) |
-                       ((begin[2] & 0x3F)));
+                         ((begin[2] & 0x3F)));
     if (IsTrailByte(begin[1]) && IsTrailByte(begin[2]) && cp >= 0x0800 &&
         IsValidCodepoint(cp)) {
       *mblen = 3;
@@ -87,7 +104,7 @@ char32_t DecodeUTF8(const char* begin, const char* end, size_t* mblen) {
     }
   } else if (len >= 4 && (begin[0] & 0xf8) == 0xF0) {
     const char32_t cp = (((begin[0] & 0x07) << 18) | ((begin[1] & 0x3F) << 12) |
-                       ((begin[2] & 0x3F) << 6) | ((begin[3] & 0x3F)));
+                         ((begin[2] & 0x3F) << 6) | ((begin[3] & 0x3F)));
     if (IsTrailByte(begin[1]) && IsTrailByte(begin[2]) &&
         IsTrailByte(begin[3]) && cp >= 0x10000 && IsValidCodepoint(cp)) {
       *mblen = 4;
@@ -151,7 +168,9 @@ size_t EncodeUTF8(char32_t c, char* output) {
 }
 
 std::string UnicodeCharToUTF8(const char32_t c) {
-  return UnicodeTextToUTF8({c});
+  char buf[8];
+  const size_t mblen = EncodeUTF8(c, buf);
+  return std::string(buf, mblen);
 }
 
 UnicodeText UTF8ToUnicodeText(absl::string_view utf8) {
@@ -213,22 +232,6 @@ absl::BitGen* GetRandomGenerator() {
 
 namespace util {
 
-std::string StrError(int errnum) {
-  constexpr int kStrErrorSize = 1024;
-  char buffer[kStrErrorSize];
-  char* str = nullptr;
-#if defined(__GLIBC__) && defined(_GNU_SOURCE)
-  str = strerror_r(errnum, buffer, kStrErrorSize - 1);
-#elif defined(_WIN32)
-  strerror_s(buffer, kStrErrorSize - 1, errnum);
-  str = buffer;
-#else
-  strerror_r(errnum, buffer, kStrErrorSize - 1);
-  str = buffer;
-#endif
-  return absl::StrCat(str, " Error #", errnum);
-}
-
 std::vector<std::string> StrSplitAsCSV(absl::string_view text) {
   std::string buf = std::string(text);
   char* str = const_cast<char*>(buf.data());
@@ -261,20 +264,6 @@ std::vector<std::string> StrSplitAsCSV(absl::string_view text) {
   return result;
 }
 
-#ifdef OS_WIN
-std::wstring Utf8ToWide(absl::string_view input) {
-  const int output_length = ::MultiByteToWideChar(
-      CP_UTF8, 0, input.data(), static_cast<int>(input.size()), nullptr, 0);
-  if (output_length == 0) {
-    return L"";
-  }
-  std::wstring output(output_length, 0);
-  const int result = ::MultiByteToWideChar(CP_UTF8, 0, input.data(),
-                                           static_cast<int>(input.size()),
-                                           output.data(), output.size());
-  return result == output_length ? output : L"";
-}
-#endif
 }  // namespace util
 
 class ThreadPool::Impl {
@@ -399,7 +388,7 @@ double LogSum(const std::vector<double>& xs) {
     }
     return xb + std::log1p(std::exp(xa - xb));
   };
-  for (int i = 1; i < xs.size(); ++i) {
+  for (size_t i = 1; i < xs.size(); ++i) {
     sum = log_add(sum, xs[i]);
   }
   return sum;

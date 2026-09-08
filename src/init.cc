@@ -14,26 +14,21 @@
 
 #include "init.h"
 
-#include "common.h"
-#include "config.h"
-#include "third_party/absl/flags/flag.h"
-#include "third_party/absl/flags/parse.h"
-#include "third_party/absl/flags/usage.h"
-#include "third_party/absl/flags/usage_config.h"
-#include "third_party/absl/log/initialize.h"
-#include "third_party/absl/strings/str_cat.h"
-#include "util.h"
+#include <algorithm>
 
-#ifdef _USE_EXTERNAL_PROTOBUF
-#include "google/protobuf/message_lite.h"
-#else
-#include "third_party/protobuf-lite/google/protobuf/message_lite.h"
-#endif
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
+#include "absl/flags/usage.h"
+#include "absl/flags/usage_config.h"
+#include "absl/log/globals.h"
+#include "absl/log/initialize.h"
+#include "absl/strings/str_cat.h"
+#include "config.h"
 
 ABSL_FLAG(bool, quiet, false, "Suppress logging message.");
 
 namespace sentencepiece {
-void ParseCommandLineFlags(const char *usage, int *argc, char ***argv,
+void ParseCommandLineFlags(const char* usage, int* argc, char*** argv,
                            bool remove_arg) {
   absl::InitializeLog();
   absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
@@ -50,7 +45,7 @@ void ParseCommandLineFlags(const char *usage, int *argc, char ***argv,
   const auto unused_args = absl::ParseCommandLine(*argc, *argv);
 
   if (remove_arg) {
-    char **argv_val = *argv;
+    char** argv_val = *argv;
     *argv = argv_val = argv_val + *argc - unused_args.size();
     std::copy(unused_args.begin(), unused_args.end(), argv_val);
     *argc = static_cast<int>(unused_args.size());
@@ -60,7 +55,5 @@ void ParseCommandLineFlags(const char *usage, int *argc, char ***argv,
     absl::SetMinLogLevel(static_cast<absl::LogSeverityAtLeast>(100));
   }
 }
-
-void ShutdownLibrary() { google::protobuf::ShutdownProtobufLibrary(); }
 
 }  // namespace sentencepiece
