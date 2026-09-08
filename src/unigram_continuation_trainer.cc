@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -19,14 +18,11 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/flag.h"
-#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-#include "filesystem.h"
-#include "libsais.h"
 #include "ret_check.h"
 #include "unigram_model.h"
 #include "unigram_model_trainer.h"
@@ -35,67 +31,20 @@
 namespace sentencepiece::unigram {
 namespace {
 
-class WeightedCandidateQueue {
- public:
-  explicit WeightedCandidateQueue(size_t capacity)
-      : capacity_(std::max<size_t>(1, capacity)) {}
-
-  void Add(absl::string_view piece, uint64_t freq) {
-    uint64_t& value = data_[std::string(piece)];
-    if (freq > std::numeric_limits<uint64_t>::max() - value) {
-      value = std::numeric_limits<uint64_t>::max();
-    } else {
-      value += freq;
-    }
-    if (data_.size() > capacity_ * 16) Gc();
-  }
-
-  std::vector<std::pair<std::string, uint64_t>> Take() {
-    auto items = SortedItems();
-    if (items.size() > capacity_) items.resize(capacity_);
-    data_.clear();
-    return items;
-  }
-
- private:
-  static double Score(absl::string_view piece, uint64_t freq) {
-    const double len = static_cast<double>(string_util::UTF8Len(piece));
-    const double power = static_cast<double>(
-        absl::GetFlag(FLAGS_seed_piece_length_power));
-    return static_cast<double>(freq) * std::pow(len, power);
-  }
-
-  std::vector<std::pair<std::string, uint64_t>> SortedItems() const {
-    std::vector<std::pair<std::string, uint64_t>> items(data_.begin(),
-                                                        data_.end());
-    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
-      const double sa = Score(a.first, a.second);
-      const double sb = Score(b.first, b.second);
-      if (sa != sb) return sa > sb;
-      const size_t la = string_util::UTF8Len(a.first);
-      const size_t lb = string_util::UTF8Len(b.first);
-      if (la != lb) return la > lb;
-      return a.first < b.first;
-    });
-    return items;
-  }
-
-  void Gc() {
-    auto items = SortedItems();
-    const size_t keep = std::min(items.size(), capacity_ * 8);
-    absl::flat_hash_map<std::string, uint64_t> next;
-    next.reserve(keep);
-    for (size_t i = 0; i < keep; ++i) {
-      next.emplace(std::move(items[i].first), items[i].second);
-    }
-    data_ = std::move(next);
-  }
-
-  size_t capacity_;
-  absl::flat_hash_map<std::string, uint64_t> data_;
-};
-
 bool Finite(double x) { return std::isfinite(x); }
+
+uint64_t SaturatingAdd(uint64_t a, uint64_t b) {
+  return b > std::numeric_limits<uint64_t>::max() - a
+             ? std::numeric_limits<uint64_t>::max()
+             : a + b;
+}
+
+double CandidateScore(absl::string_view piece, uint64_t freq) {
+  const double len = static_cast<double>(string_util::UTF8Len(piece));
+  const double power =
+      static_cast<double>(absl::GetFlag(FLAGS_seed_piece_length_power));
+  return static_cast<double>(freq) * std::pow(len, power);
+}
 
 }  // namespace
 
@@ -121,6 +70,10 @@ absl::Status ContinuationTrainer::LoadAndValidatePrior() {
     return absl::InvalidArgumentError(
         "unigram_prior_model is not a Unigram ModelProto");
   }
+  if (!prior_model_.has_normalizer_spec()) {
+    return absl::InvalidArgumentError(
+        "unigram prior does not contain an authoritative normalizer spec");
+  }
   if (prior_model_.pieces_size() <= 0) {
     return absl::InvalidArgumentError("unigram prior has no pieces");
   }
@@ -128,26 +81,6 @@ absl::Status ContinuationTrainer::LoadAndValidatePrior() {
     return absl::InvalidArgumentError(absl::StrCat(
         "vocab_size is smaller than prior piece count: ",
         trainer_spec_.vocab_size(), " < ", prior_model_.pieces_size()));
-  }
-
-  // Continuation never silently substitutes a new normalization regime. The
-  // caller must either supply the same compiled spec or use an API adapter
-  // that copies the prior spec before invoking the trainer.
-  if (normalizer_spec_.SerializeAsString() !=
-      prior_model_.normalizer_spec().SerializeAsString()) {
-    return absl::InvalidArgumentError(
-        "continuation normalizer differs from prior ModelProto normalizer");
-  }
-  if (!denormalizer_spec_.SerializeAsString().empty() &&
-      denormalizer_spec_.SerializeAsString() !=
-          prior_model_.denormalizer_spec().SerializeAsString()) {
-    return absl::InvalidArgumentError(
-        "continuation denormalizer conflicts with prior ModelProto");
-  }
-  if (trainer_spec_.treat_whitespace_as_suffix() !=
-      prior_model_.trainer_spec().treat_whitespace_as_suffix()) {
-    return absl::InvalidArgumentError(
-        "treat_whitespace_as_suffix must match the prior tokenizer");
   }
 
   extension_target_ = trainer_spec_.vocab_size() - prior_model_.pieces_size();
@@ -186,8 +119,14 @@ absl::Status ContinuationTrainer::LoadAndValidatePrior() {
     return absl::InvalidArgumentError("prior has no NORMAL Unigram pieces");
   }
 
+  // The prior ModelProto is authoritative for normalization. This avoids the
+  // CLI trap where default normalization flags accidentally disagree with a
+  // custom pretrained tokenizer even though the user supplied the exact prior
+  // model. Continuation does not silently invent a new normalization regime.
   normalizer_spec_ = prior_model_.normalizer_spec();
   denormalizer_spec_ = prior_model_.denormalizer_spec();
+  trainer_spec_.set_treat_whitespace_as_suffix(
+      prior_model_.trainer_spec().treat_whitespace_as_suffix());
   return absl::OkStatus();
 }
 
@@ -224,7 +163,6 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
   }
   candidate_limit = std::max<size_t>(candidate_limit,
                                      static_cast<size_t>(extension_target_));
-  WeightedCandidateQueue queue(candidate_limit);
 
   absl::flat_hash_set<std::string> inherited_strings;
   inherited_strings.reserve(prior_model_.pieces_size());
@@ -232,134 +170,81 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     inherited_strings.insert(piece.piece());
   }
 
-  constexpr size_t kMaxChunkBytes = 500 * 1024 * 1024;
-  size_t sentence_idx = 0;
-  size_t chunks = 0;
-  while (sentence_idx < corpus_.sentences.size()) {
-    std::string chunk_bytes;
-    std::vector<uint64_t> position_weight;
-    long double weighted_bytes = 0.0L;
+  // Exact global weighted occurrence counts. A TSV row (x, N) contributes
+  // exactly the same candidate occurrences as N physical copies of x, while
+  // the record boundary remains a hard fence. Unlike the earlier bounded
+  // suffix-array queue, no candidate loses accumulated mass through GC and no
+  // chunk-local threshold changes the result.
+  absl::flat_hash_map<std::string, uint64_t> counts;
+  long double weighted_bytes = 0.0L;
+  const size_t max_piece_length =
+      static_cast<size_t>(trainer_spec_.max_sentencepiece_length());
 
-    while (sentence_idx < corpus_.sentences.size() &&
-           chunk_bytes.size() < kMaxChunkBytes) {
-      const auto& sentence = corpus_.sentences[sentence_idx++];
-      chunk_bytes.append(sentence.first);
-      position_weight.insert(position_weight.end(), sentence.first.size(),
-                             static_cast<uint64_t>(sentence.second));
-      chunk_bytes.push_back('\0');
-      position_weight.push_back(0);
-      weighted_bytes += static_cast<long double>(sentence.first.size()) *
-                        static_cast<long double>(sentence.second);
+  for (const auto& sentence : corpus_.sentences) {
+    if (sentence.second <= 0) {
+      return absl::InvalidArgumentError(
+          "continuation corpus contains a nonpositive sentence weight");
     }
+    weighted_bytes += static_cast<long double>(sentence.first.size()) *
+                      static_cast<long double>(sentence.second);
 
-    if (chunk_bytes.empty()) break;
-    if (chunk_bytes.size() >
-        static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-      return absl::ResourceExhaustedError(
-          "weighted Unigram continuation suffix-array chunk exceeds int32");
-    }
-    ++chunks;
-    const int32_t n = static_cast<int32_t>(chunk_bytes.size());
-    const uint8_t* bytes =
-        reinterpret_cast<const uint8_t*>(chunk_bytes.data());
-    std::vector<int32_t> sa(n), lcp(n), plcp(n);
+    const string_util::UnicodeText text =
+        string_util::UTF8ToUnicodeText(sentence.first);
+    for (size_t begin = 0; begin < text.size(); ++begin) {
+      string_util::UnicodeText piece;
+      piece.reserve(std::min(max_piece_length, text.size() - begin));
+      const size_t stop =
+          std::min(text.size(), begin + std::max<size_t>(1, max_piece_length));
+      for (size_t end = begin; end < stop; ++end) {
+        piece.push_back(text[end]);
+        if (piece.size() <= 1) continue;
+        if (!IsValidSentencePiece(piece)) continue;
 
-#if defined(LIBSAIS_OPENMP)
-    if (libsais_omp(bytes, sa.data(), n, 0, nullptr,
-                    trainer_spec_.num_threads()) < 0 ||
-        libsais_plcp_omp(bytes, sa.data(), plcp.data(), n,
-                         trainer_spec_.num_threads()) < 0 ||
-        libsais_lcp_omp(plcp.data(), sa.data(), lcp.data(), n,
-                        trainer_spec_.num_threads()) < 0) {
-      return absl::InternalError("libsais_omp failed in continuation");
-    }
-#else
-    if (libsais(bytes, sa.data(), n, 0, nullptr) < 0 ||
-        libsais_plcp(bytes, sa.data(), plcp.data(), n) < 0 ||
-        libsais_lcp(plcp.data(), sa.data(), lcp.data(), n) < 0) {
-      return absl::InternalError("libsais failed in continuation");
-    }
-#endif
-
-    std::vector<uint64_t> sa_weight_prefix(static_cast<size_t>(n) + 1, 0);
-    for (int32_t i = 0; i < n; ++i) {
-      const uint64_t w = position_weight[sa[i]];
-      const uint64_t prev = sa_weight_prefix[i];
-      sa_weight_prefix[i + 1] =
-          w > std::numeric_limits<uint64_t>::max() - prev
-              ? std::numeric_limits<uint64_t>::max()
-              : prev + w;
-    }
-
-    const double alpha = static_cast<double>(absl::GetFlag(FLAGS_min_freq_alpha));
-    const double vocab = std::max<double>(1.0, trainer_spec_.vocab_size());
-    const double denom = std::max<double>(1.0, vocab * std::log(vocab));
-    const uint64_t min_freq = std::max<uint64_t>(
-        2, static_cast<uint64_t>(alpha * static_cast<double>(weighted_bytes) /
-                                 denom));
-
-    struct LCPInterval {
-      int32_t left;
-      int32_t depth;
-    };
-    std::vector<LCPInterval> stack;
-    stack.push_back({0, 0});
-
-    for (int32_t i = 1; i <= n; ++i) {
-      const int32_t lcp_value = i < n ? lcp[i] : 0;
-      int32_t last_left = i - 1;
-      while (lcp_value < stack.back().depth) {
-        const LCPInterval top = stack.back();
-        stack.pop_back();
-        last_left = top.left;
-        const int32_t left = top.left;
-        const int32_t right = i - 1;
-        const int32_t depth = top.depth;
-
-        const uint64_t weighted_freq =
-            sa_weight_prefix[right + 1] - sa_weight_prefix[left];
-        const uint64_t effective_min = depth <= 3 ? 2 : min_freq;
-        if (depth > 1 && weighted_freq >= effective_min) {
-          const int32_t offset = sa[left];
-          if (offset >= 0 && offset + depth <= n &&
-              ((bytes[offset] & 0xc0) != 0x80) &&
-              (offset + depth == n ||
-               (bytes[offset + depth] & 0xc0) != 0x80)) {
-            absl::string_view candidate(chunk_bytes.data() + offset, depth);
-            while (!candidate.empty() && candidate.back() == '\0') {
-              candidate.remove_suffix(1);
-            }
-            if (!candidate.empty() &&
-                candidate.find('\0') == absl::string_view::npos &&
-                string_util::UTF8Len(candidate) > 1 &&
-                string_util::UTF8Len(candidate) <=
-                    static_cast<size_t>(trainer_spec_.max_sentencepiece_length()) &&
-                !inherited_strings.contains(std::string(candidate)) &&
-                IsValidSentencePiece(
-                    string_util::UTF8ToUnicodeText(candidate))) {
-              queue.Add(candidate, weighted_freq);
-            }
-          }
-        }
-
-        if (lcp_value > stack.back().depth) {
-          stack.push_back({top.left, lcp_value});
-        }
-      }
-      if (lcp_value > stack.back().depth) {
-        stack.push_back({last_left, lcp_value});
+        std::string candidate = string_util::UnicodeTextToUTF8(piece);
+        if (inherited_strings.contains(candidate)) continue;
+        uint64_t& count = counts[candidate];
+        count = SaturatingAdd(count, static_cast<uint64_t>(sentence.second));
       }
     }
   }
 
-  for (auto& item : queue.Take()) {
+  const double alpha =
+      static_cast<double>(absl::GetFlag(FLAGS_min_freq_alpha));
+  const double vocab = std::max<double>(1.0, trainer_spec_.vocab_size());
+  const double denom = std::max<double>(1.0, vocab * std::log(vocab));
+  const uint64_t global_min_freq = std::max<uint64_t>(
+      2, static_cast<uint64_t>(
+             alpha * static_cast<double>(weighted_bytes) / denom));
+
+  std::vector<std::pair<std::string, uint64_t>> ranked;
+  ranked.reserve(counts.size());
+  for (auto& item : counts) {
+    const uint64_t effective_min = item.first.size() <= 3 ? 2 : global_min_freq;
+    if (item.second >= effective_min) {
+      ranked.emplace_back(item.first, item.second);
+    }
+  }
+  std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+    const double sa = CandidateScore(a.first, a.second);
+    const double sb = CandidateScore(b.first, b.second);
+    if (sa != sb) return sa > sb;
+    const size_t la = string_util::UTF8Len(a.first);
+    const size_t lb = string_util::UTF8Len(b.first);
+    if (la != lb) return la > lb;
+    return a.first < b.first;
+  });
+  if (ranked.size() > candidate_limit) ranked.resize(candidate_limit);
+
+  extension_candidates_.reserve(ranked.size());
+  for (auto& item : ranked) {
     ExtensionCandidate candidate;
     candidate.piece = std::move(item.first);
     extension_candidates_.push_back(std::move(candidate));
   }
 
   LOG(INFO) << "Unigram continuation extracted " << extension_candidates_.size()
-            << " weighted candidates from " << chunks << " suffix-array chunks";
+            << " exact globally weighted candidates from "
+            << corpus_.sentences.size() << " fenced records";
   if (static_cast<int>(extension_candidates_.size()) < extension_target_ &&
       trainer_spec_.hard_vocab_limit()) {
     return absl::FailedPreconditionError(absl::StrCat(
@@ -790,15 +675,13 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   output.mutable_trainer_spec()->set_unigram_prior_model(
       trainer_spec_.unigram_prior_model());
   output.mutable_trainer_spec()->set_model_prefix(trainer_spec_.model_prefix());
+  *output.mutable_normalizer_spec() = prior_model_.normalizer_spec();
+  *output.mutable_denormalizer_spec() = prior_model_.denormalizer_spec();
   *output.mutable_expansion_result() = result;
 
   const std::string result_path = !trainer_spec_.expansion_result().empty()
                                       ? trainer_spec_.expansion_result()
                                       : trainer_spec_.model_prefix() + ".expansion";
-  if (!result_path.empty()) {
-    ABSL_RETURN_IF_ERROR(
-        continuation::WriteExpansionResult(result_path, result));
-  }
 
   if (output_model_proto_ != nullptr) {
     *output_model_proto_ = output;
@@ -811,6 +694,13 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
         trainer_spec_.model_prefix() + ".model", output));
     ABSL_RETURN_IF_ERROR(continuation::WriteExpansionVocab(
         trainer_spec_.model_prefix() + ".vocab", all_pieces));
+  }
+
+  // As with BPE, the success sidecar is emitted only after the model/vocab
+  // artifacts have been constructed successfully.
+  if (!result_path.empty()) {
+    ABSL_RETURN_IF_ERROR(
+        continuation::WriteExpansionResult(result_path, result));
   }
 
   LOG(INFO) << "Unigram continuation: prior=" << prior_model_.pieces_size()
