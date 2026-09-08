@@ -205,8 +205,8 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
                       expansion_spec_.base_pieces().end());
   std::sort(base_pieces_.begin(), base_pieces_.end(),
             [](const ExpansionPiece& a, const ExpansionPiece& b) {
-              return std::tie(a.external_id(), a.piece()) <
-                     std::tie(b.external_id(), b.piece());
+              return std::make_tuple(a.external_id(), a.piece()) <
+                     std::make_tuple(b.external_id(), b.piece());
             });
 
   std::set<int> occupied_ids;
