@@ -183,14 +183,27 @@ void ModelInterface::InitializePieces(bool use_reserved_id_map) {
   matcher_ = std::make_unique<normalizer::PrefixMatcher>(user_defined_symbols);
 }
 
+bool IsIntervalBoundaryStart(char32_t c, bool split_by_interval,
+                             bool split_by_barline) {
+  // A barline is a Boundary interval in both modes.
+  if (c == '|') return split_by_interval || split_by_barline;
+  if (!split_by_interval) return false;
+  // Metric interval tokens: elided_num '/', fraction/whole_multiple '1'-'9'.
+  // '0' is a grace duration and never a main-chain interval.
+  return c == '/' || (c >= '1' && c <= '9');
+}
+
 std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
                                               bool treat_ws_as_suffix,
-                                              bool allow_ws_only_pieces) {
+                                              bool allow_ws_only_pieces,
+                                              bool split_by_interval,
+                                              bool split_by_barline) {
   const char* begin = text.data();
   const char* end = text.data() + text.size();
 
   // Space symbol (U+2581)
   constexpr absl::string_view kSpaceSymbol = "\xe2\x96\x81";
+  constexpr int kSpaceLen = 3;
   bool in_ws_sequence = false;
 
   std::vector<absl::string_view> result;
@@ -227,9 +240,21 @@ std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
           std::min<int>(string_util::OneCharLen(begin), end - begin);
       bool is_ws = absl::string_view(begin, mblen) == kSpaceSymbol;
 
+      // LEGACY interval/barline mode splits only at whitespace that actually
+      // begins an interval token; every other whitespace stays interior.
+      bool should_split = is_ws;
+      if ((split_by_interval || split_by_barline) && is_ws) {
+        const char* after_ws = begin + kSpaceLen;
+        should_split =
+            after_ws < end &&
+            IsIntervalBoundaryStart(
+                static_cast<char32_t>(static_cast<unsigned char>(*after_ws)),
+                split_by_interval, split_by_barline);
+      }
+
       // if is whitespace (and not in sequence if allow_ws_only_pieces is True)
       if (begin == text.data() ||
-          (is_ws && (!in_ws_sequence || !allow_ws_only_pieces))) {
+          (should_split && (!in_ws_sequence || !allow_ws_only_pieces))) {
         result.emplace_back(begin, 0);  // add empty string piece.
         in_ws_sequence = true;
       }

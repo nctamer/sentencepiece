@@ -152,6 +152,18 @@ inline std::string PrintProto(const TrainerSpec& message,
   PRINT_PARAM(split_by_number);
   PRINT_PARAM(split_by_whitespace);
   PRINT_PARAM(split_digits);
+  PRINT_PARAM(expansion_spec);
+  PRINT_PARAM(expansion_result);
+  PRINT_PARAM(unigram_prior_model);
+  // Legacy intermo extensions (TrainerSpec 200/201/204/205).
+  os << "  split_by_interval: " << message.GetExtension(split_by_interval)
+     << "\n";
+  os << "  split_by_barline: " << message.GetExtension(split_by_barline)
+     << "\n";
+  os << "  protected_pieces_file: "
+     << message.GetExtension(protected_pieces_file) << "\n";
+  os << "  seed_merges_file: " << message.GetExtension(seed_merges_file)
+     << "\n";
   PRINT_PARAM(pretokenization_delimiter);
   PRINT_PARAM(treat_whitespace_as_suffix);
   PRINT_PARAM(allow_whitespace_only_pieces);
@@ -228,6 +240,29 @@ absl::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_BOOL(split_by_number);
   PARSE_BOOL(split_by_whitespace);
   PARSE_BOOL(split_digits);
+  PARSE_STRING(expansion_spec);
+  PARSE_STRING(expansion_result);
+  PARSE_STRING(unigram_prior_model);
+  // Legacy intermo extensions. Kept so pre-continuation CLI/API callers keep
+  // parsing; these names are compatibility shims, not the continuation model.
+  if (name == "split_by_interval" || name == "split_by_barline") {
+    bool v;
+    if (!absl::SimpleAtob(value.empty() ? "true" : value, &v)) {
+      return absl::StatusBuilder(absl::StatusCode::kInvalidArgument)
+             << "cannot parse \"" << value << "\" as bool.";
+    }
+    message->SetExtension(
+        name == "split_by_interval" ? split_by_interval : split_by_barline, v);
+    return absl::OkStatus();
+  }
+  if (name == "protected_pieces_file") {
+    message->SetExtension(protected_pieces_file, std::string(value));
+    return absl::OkStatus();
+  }
+  if (name == "seed_merges_file") {
+    message->SetExtension(seed_merges_file, std::string(value));
+    return absl::OkStatus();
+  }
   PARSE_STRING(pretokenization_delimiter);
   PARSE_BOOL(treat_whitespace_as_suffix);
   PARSE_BOOL(allow_whitespace_only_pieces);

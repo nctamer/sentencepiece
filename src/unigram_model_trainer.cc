@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -578,12 +579,19 @@ TrainerModel::SentencePieces Trainer::RunMStep(
 
   float sum = 0.0;
   for (size_t i = 0; i < expected.size(); ++i) {
-    const float freq = expected[i];
+    float freq = expected[i];
 
     // Filter infrequent sentencepieces here.
     constexpr float kExpectedFrequencyThreshold = 0.5;
     if (freq < kExpectedFrequencyThreshold) {
-      continue;
+      // LEGACY protected_pieces_file: a protected piece is floored instead of
+      // dropped. Fresh-training protection only; Unigram continuation uses the
+      // constrained M-step in unigram_continuation_trainer.cc, never this one.
+      if (protected_pieces_.count(sentencepieces[i].first)) {
+        freq = kExpectedFrequencyThreshold;
+      } else {
+        continue;
+      }
     }
 
     new_sentencepieces.emplace_back(sentencepieces[i].first, freq);
@@ -616,6 +624,11 @@ TrainerModel::SentencePieces Trainer::PruneSentencePieces(
   // To do so, we take the second best segmentation of sentencepiece[i].
   // alternatives[i] stores the sequence of second best sentencepieces.
   for (size_t i = 0; i < sentencepieces.size(); ++i) {
+    // LEGACY protected_pieces_file: protected pieces are always kept.
+    if (protected_pieces_.count(sentencepieces[i].first)) {
+      always_keep[i] = true;
+      continue;
+    }
     const auto& w = sentencepieces[i];
     lattice.SetSentence(w.first);
     model.PopulateNodes(&lattice);
@@ -680,6 +693,11 @@ TrainerModel::SentencePieces Trainer::PruneSentencePieces(
   // loss approximately by assuming that all sentencepiece[i] in the sentences
   // are replaced with alternatives[i] when sentencepiece[i] is removed.
   for (size_t i = 0; i < sentencepieces.size(); ++i) {
+    if (freq[i] == 0 && protected_pieces_.count(sentencepieces[i].first)) {
+      // LEGACY protected_pieces_file: a zero-frequency protected piece is kept.
+      new_sentencepieces.push_back(sentencepieces[i]);
+      continue;
+    }
     if (freq[i] == 0 || !always_keep[i]) {
       // not found in Viterbi path. Can remove this entry safely.
       continue;
@@ -737,6 +755,12 @@ TrainerModel::SentencePieces Trainer::PruneUnreachableSentencePieces(
 
   for (size_t i = 0; i < sentencepieces.size(); ++i) {
     const auto& w = sentencepieces[i];
+    // LEGACY protected_pieces_file: this upstream shadowing prune must not
+    // silently defeat the protection guarantee.
+    if (protected_pieces_.count(w.first)) {
+      new_sentencepieces.push_back(w);
+      continue;
+    }
     lattice.SetSentence(w.first);
     model.PopulateNodes(&lattice);
 
@@ -789,6 +813,20 @@ TrainerModel::SentencePieces Trainer::FinalizeSentencePieces(
   absl::flat_hash_map<std::string, float> sp(sentencepieces.begin(),
                                              sentencepieces.end());
 
+  // LEGACY protected_pieces_file: protected pieces must be present in the
+  // final table. Iterated directly (not via model pieces) to catch any that an
+  // earlier stage dropped. Deterministically ordered.
+  std::vector<std::string> sorted_protected(protected_pieces_.begin(),
+                                            protected_pieces_.end());
+  std::sort(sorted_protected.begin(), sorted_protected.end());
+  for (const std::string& piece : sorted_protected) {
+    if (const auto it = sp.find(piece); it != sp.end()) {
+      final_sentencepieces[piece] = it->second;
+    } else {
+      final_sentencepieces[piece] = model.min_score();
+    }
+  }
+
   // required_chars_ must be included in the final sentencepieces ONLY IF
   // auto_character_coverage is false.
   if (!absl::GetFlag(FLAGS_auto_character_coverage)) {
@@ -839,8 +877,47 @@ absl::Status Trainer::Train() {
     RET_CHECK(!required_chars_.empty());
   }
 
+  // LEGACY protected_pieces_file. Fresh-training protection only: these
+  // strings are guaranteed a slot in the final model, but they carry no
+  // inherited ID, no inherited score geometry and no provenance. This is NOT
+  // Unigram continuation; --unigram_prior_model is (see README_expansion.md).
+  protected_pieces_.clear();
+  const std::string& protected_file =
+      trainer_spec_.GetExtension(::sentencepiece::protected_pieces_file);
+  if (!protected_file.empty()) {
+    auto input = filesystem::NewReadableFile(protected_file);
+    RET_CHECK(input->status().ok())
+        << "Cannot open protected_pieces_file: " << protected_file;
+    std::string line;
+    while (input->ReadLine(&line)) {
+      if (!line.empty()) protected_pieces_.insert(line);
+    }
+    LOG(INFO) << "Loaded " << protected_pieces_.size() << " protected pieces";
+  }
+
   auto seed_sentencepieces = MakeSeedSentencePieces();
   RET_CHECK(!seed_sentencepieces.empty());
+
+  // Inject protected pieces into the seed set if the corpus did not produce
+  // them, so protection cannot be defeated by simple absence from the seed.
+  if (!protected_pieces_.empty()) {
+    absl::flat_hash_set<std::string> seed_set;
+    for (const auto& sp : seed_sentencepieces) seed_set.insert(sp.first);
+    std::vector<std::string> injected;
+    for (const std::string& piece : protected_pieces_) {
+      if (!seed_set.count(piece)) injected.push_back(piece);
+    }
+    // flat_hash_set iteration order is unspecified; sort so the seed table is
+    // byte-identical across runs.
+    std::sort(injected.begin(), injected.end());
+    for (const std::string& piece : injected) {
+      seed_sentencepieces.emplace_back(piece, 0.0);
+    }
+    if (!injected.empty()) {
+      LOG(INFO) << "Injected " << injected.size()
+                << " protected pieces into seed set";
+    }
+  }
 
   ABSL_RETURN_IF_ERROR(model.SetSentencePieces(std::move(seed_sentencepieces)));
 

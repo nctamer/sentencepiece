@@ -20,6 +20,7 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/container/btree_set.h"
@@ -93,6 +94,17 @@ class Trainer : public TrainerInterface {
     p.right = n & 0xffff;
     return p;
   }
+
+  // LEGACY seed_merges_file: replays the seed tokenizer's merges onto the
+  // corpus before learning, so new merges are learned on top of the seed's
+  // segmentation instead of contradicting it. Superseded by --expansion_spec.
+  absl::Status ApplySeedMerges();
+
+  // Writes <model_prefix>.merges - the pair each learned piece was merged
+  // from, in learned order. Upstream discards this, forcing every consumer of
+  // a merge list to guess the split back from the piece string.
+  absl::Status SaveMerges(
+      const std::vector<std::pair<std::string, std::string>>& merges) const;
 
   // Gets unary (character) symbol from the char code |c|.
   // The return value is cached.

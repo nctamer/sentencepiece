@@ -34,10 +34,33 @@
 
 namespace sentencepiece {
 
+// LEGACY intermo compatibility (TrainerSpec extensions 200/201). True when `c`
+// may begin a main-chain interval token, i.e. when a whitespace immediately
+// before `c` is an interval boundary. THE one copy of this rule: both the
+// pretokenizer (SplitIntoWords) and the piece validator
+// (TrainerInterface::IsValidSentencePiece) call here, so a boundary can never
+// mean two different things in training.
+//
+// The character set is the first-character set of the intermo productions that
+// establish a main-chain interval:
+//   elided_num     = "/" , positive           -> '/'
+//   fraction       = positive , "/" , positive -> '1'-'9'
+//   whole_multiple = positive                  -> '1'-'9'
+//   barline        = "|" , ...                 -> '|'
+// '0' is deliberately EXCLUDED: "0/..." can only be a grace duration, which is
+// a nested sub-Moment and never a main-chain interval.
+//
+// This predicate belongs to the pre-continuation compatibility surface. First-
+// class continuation carries its boundary rule in ExpansionSpec.boundary_policy
+// and never consults this function.
+bool IsIntervalBoundaryStart(char32_t c, bool split_by_interval,
+                             bool split_by_barline);
+
 // "_this_is_a_pen" => ["_this", "_is", "_a", "_pen"]
 std::vector<absl::string_view> SplitIntoWords(
     absl::string_view text, bool treat_ws_as_suffix = false,
-    bool allow_ws_only_pieces = false);
+    bool allow_ws_only_pieces = false, bool split_by_interval = false,
+    bool split_by_barline = false);
 
 // Converts byte (0-255) to piece (e.g., 58 -> "<0x3A>").
 const std::string& ByteToPiece(unsigned char c);

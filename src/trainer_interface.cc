@@ -99,6 +99,31 @@ absl::Status VerifySpec(const TrainerSpec& trainer_spec,
         << "seed_sentencepieces_file is only supported for UNIGRAM model.";
   }
 
+  // First-class continuation and the legacy compatibility shims name different
+  // things. protected_pieces_file is fresh-training protected vocabulary; it
+  // never denotes inherited state, so combining it with a continuation request
+  // is ambiguous rather than additive and is rejected here, before any corpus
+  // is read.
+  {
+    const bool legacy_protected =
+        !trainer_spec.GetExtension(::sentencepiece::protected_pieces_file)
+             .empty();
+    const bool legacy_seed_merges =
+        !trainer_spec.GetExtension(::sentencepiece::seed_merges_file).empty();
+    const bool continuation = !trainer_spec.expansion_spec().empty() ||
+                              !trainer_spec.unigram_prior_model().empty();
+    RET_CHECK(!(continuation && (legacy_protected || legacy_seed_merges)))
+        << "protected_pieces_file/seed_merges_file are legacy fresh-training "
+           "compatibility shims and cannot be combined with expansion_spec or "
+           "unigram_prior_model.";
+    RET_CHECK(trainer_spec.expansion_spec().empty() ||
+              trainer_spec.unigram_prior_model().empty())
+        << "expansion_spec and unigram_prior_model are mutually exclusive.";
+    RET_CHECK(!legacy_seed_merges ||
+              trainer_spec.model_type() == TrainerSpec::BPE)
+        << "seed_merges_file is only supported for BPE model.";
+  }
+
 #define CHECK_RANGE(variable, minval, maxval) \
   RET_CHECK(variable >= minval && variable <= maxval)
 
@@ -309,8 +334,32 @@ bool TrainerInterface::IsValidSentencePiece(
       // whitespace is treated as a prefix/infix of symbol or
       // independent symbol, unless allow_whitespace_only_pieces() is true,
       // in which case whitespace only pieces can occur.
-      if (!trainer_spec_.allow_whitespace_only_pieces() ||
-          !all_whitespace_piece) {
+      //
+      // LEGACY interval/barline mode: no piece may CONTAIN an interval
+      // boundary, at any position. Two cases, and the second is not symmetric
+      // with the first:
+      //
+      //   internal (pos+1 < size) - the following character is known, so the
+      //     piece is rejected exactly when that character starts an interval.
+      //
+      //   trailing (pos+1 == size) - the following character is NOT known
+      //     here, and sentencepiece does no pretokenization at ENCODE time. A
+      //     piece ending in whitespace is therefore free to swallow the next
+      //     interval's leading whitespace at inference even though every
+      //     training occurrence was interior. Unknowable == unsafe.
+      const bool interval_mode =
+          trainer_spec_.GetExtension(::sentencepiece::split_by_interval);
+      const bool barline_mode =
+          trainer_spec_.GetExtension(::sentencepiece::split_by_barline);
+      if (interval_mode || barline_mode) {
+        if (pos > 0 && pos + 1 == sentencepiece.size()) return false;
+        if (pos > 0 && pos + 1 < sentencepiece.size() &&
+            IsIntervalBoundaryStart(sentencepiece[pos + 1], interval_mode,
+                                    barline_mode)) {
+          return false;
+        }
+      } else if (!trainer_spec_.allow_whitespace_only_pieces() ||
+                 !all_whitespace_piece) {
         if (trainer_spec_.treat_whitespace_as_suffix()) {
           if ((trainer_spec_.split_by_whitespace() &&
                pos < sentencepiece.size() - 1) ||
@@ -618,8 +667,11 @@ void TrainerInterface::SplitSentencesByWhitespace() {
   absl::flat_hash_map<std::string, int64_t> tokens;
   for (const auto& s : sentences_) {
     for (const auto& w :
-         SplitIntoWords(s.first, trainer_spec_.treat_whitespace_as_suffix(),
-                        trainer_spec_.allow_whitespace_only_pieces())) {
+         SplitIntoWords(
+             s.first, trainer_spec_.treat_whitespace_as_suffix(),
+             trainer_spec_.allow_whitespace_only_pieces(),
+             trainer_spec_.GetExtension(::sentencepiece::split_by_interval),
+             trainer_spec_.GetExtension(::sentencepiece::split_by_barline))) {
       tokens[w] += s.second;
     }
   }

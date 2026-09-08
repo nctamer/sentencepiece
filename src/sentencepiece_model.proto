@@ -129,11 +129,68 @@ message TrainerSpec {
   reserved 51;
   reserved 52;
 
-  // The old fork used extension IDs 200-205 for Intermo-specific splitting,
-  // protected-piece files and seed-merge files. Continuation is a clean break:
-  // never reuse those numbers for a new wire meaning.
-  reserved 200 to 205;
-  extensions 206 to max;
+  // Extension range. 200-205 are the fork's pre-continuation intermo surface
+  // and keep their original wire meanings; see the `extend TrainerSpec` block
+  // below. First-class continuation state lives in ordinary TrainerSpec fields
+  // (55-57), not here.
+  //
+  // 202/203 are excluded from the range on purpose: they were the progressive
+  // BPE phase budgets (phase1_merge_budget / phase2_merge_budget) and must
+  // never be reused for a new wire meaning. `reserved` is not valid inside an
+  // `extend` block, so the range itself carries the reservation and protoc
+  // enforces it.
+  extensions 200 to 201, 204 to max;
+}
+
+// Legacy intermo extensions for TrainerSpec, kept for wire/CLI compatibility
+// with models and scripts produced before first-class continuation existed.
+//
+// These are COMPATIBILITY SHIMS, not the continuation model. `protected_pieces_file`
+// alone is protected-vocabulary fresh training and is NOT BPE continuation;
+// see README_expansion.md. New work should use --expansion_spec (BPE) or
+// --unigram_prior_model (Unigram).
+extend TrainerSpec {
+  // Split only at whitespace followed by digit (0-9) or pipe (|).
+  // For intermo music notation: interval/barline boundaries.
+  // When true, split_by_whitespace must be false.
+  optional bool split_by_interval = 200 [default = false];
+
+  // Split only at whitespace followed by pipe (|).
+  // For intermo music notation: barline boundaries only.
+  // When true, split_by_whitespace must be false.
+  optional bool split_by_barline = 201 [default = false];
+
+  // Field numbers 202/203 were the progressive BPE phase budgets
+  // (phase1_merge_budget / phase2_merge_budget), removed in favor of the
+  // simpler split_by_interval / split_by_barline pretokenization constraints.
+  // They are permanently retired: TrainerSpec's extension range above omits
+  // them, so protoc rejects any attempt to reuse either number.
+
+  // Path to file of pieces to protect from pruning.
+  // One piece per line. These pieces are guaranteed to survive EM pruning
+  // and appear in the final model. Their probabilities are freely estimated.
+  // Works for both BPE and unigram model types.
+  //
+  // Legacy fresh-training semantics only. It never denotes inherited state:
+  // combining it with unigram_prior_model or expansion_spec is rejected.
+  optional string protected_pieces_file = 204 [default = ""];
+
+  // Path to the seed tokenizer's merge list, "left<TAB>right" per line in
+  // rank order - the format this trainer writes as <model_prefix>.merges.
+  //
+  // BPE only, and only meaningful with protected_pieces_file. Those pieces
+  // enter the VOCABULARY but, on their own, never touch the corpus: the
+  // trainer keeps segmenting from raw characters, so it learns merges that
+  // contradict the seed's own. Such a merge cannot fire in any rank-ordered
+  // tokenizer built from the result, because the seed merge outranks it.
+  // Replaying the seed's merges first makes the corpus look the way the seed
+  // tokenizer sees it, so every merge learned on top of it composes seed
+  // pieces and stays reachable.
+  //
+  // This pair is the legacy approximation of BPE continuation. It has no
+  // external ID ABI, no exact merge provenance and no reachability proof;
+  // --expansion_spec supersedes it.
+  optional string seed_merges_file = 205 [default = ""];
 }
 
 message NormalizerSpec {

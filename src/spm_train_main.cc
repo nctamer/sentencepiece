@@ -69,6 +69,21 @@ ABSL_FLAG(std::string, expansion_result, "",
           "optional output path for the serialized ExpansionResult");
 ABSL_FLAG(std::string, unigram_prior_model, "",
           "prior Unigram ModelProto for true Unigram continuation");
+// Legacy intermo compatibility flags (TrainerSpec extensions 200/201/204/205).
+// Superseded by --expansion_spec / --unigram_prior_model; see
+// README_expansion.md.
+ABSL_FLAG(bool, split_by_interval, false,
+          "legacy: split only at whitespace followed by digit or | (intermo "
+          "interval/barline)");
+ABSL_FLAG(bool, split_by_barline, false,
+          "legacy: split only at whitespace followed by | (intermo barline "
+          "only)");
+ABSL_FLAG(std::string, protected_pieces_file, "",
+          "legacy: pieces to protect from pruning (one per line). This is "
+          "protected-vocabulary fresh training, NOT continuation");
+ABSL_FLAG(std::string, seed_merges_file, "",
+          "legacy bpe: seed tokenizer's merges, left<TAB>right per line in "
+          "rank order; replayed onto the corpus before learning");
 ABSL_FLAG(double, shrinking_factor, kDefaultTrainerSpec.shrinking_factor(),
           "Keeps top shrinking_factor pieces with respect to the loss");
 ABSL_FLAG(int32_t, num_threads, kDefaultTrainerSpec.num_threads(),
@@ -225,6 +240,16 @@ int main(int argc, char* argv[]) {
   SetTrainerSpecFromFlag(expansion_spec);
   SetTrainerSpecFromFlag(expansion_result);
   SetTrainerSpecFromFlag(unigram_prior_model);
+  // Legacy intermo extensions live in the extension range, so they are set
+  // with SetExtension rather than a generated set_X accessor.
+  trainer_spec.SetExtension(::sentencepiece::split_by_interval,
+                            absl::GetFlag(FLAGS_split_by_interval));
+  trainer_spec.SetExtension(::sentencepiece::split_by_barline,
+                            absl::GetFlag(FLAGS_split_by_barline));
+  trainer_spec.SetExtension(::sentencepiece::protected_pieces_file,
+                            absl::GetFlag(FLAGS_protected_pieces_file));
+  trainer_spec.SetExtension(::sentencepiece::seed_merges_file,
+                            absl::GetFlag(FLAGS_seed_merges_file));
   SetTrainerSpecFromFlag(shrinking_factor);
   SetTrainerSpecFromFlag(num_threads);
   SetTrainerSpecFromFlag(num_sub_iterations);
