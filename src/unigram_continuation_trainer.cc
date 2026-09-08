@@ -33,12 +33,6 @@ namespace {
 
 bool Finite(double x) { return std::isfinite(x); }
 
-uint64_t SaturatingAdd(uint64_t a, uint64_t b) {
-  return b > std::numeric_limits<uint64_t>::max() - a
-             ? std::numeric_limits<uint64_t>::max()
-             : a + b;
-}
-
 double CandidateScore(absl::string_view piece, uint64_t freq) {
   const double len = static_cast<double>(string_util::UTF8Len(piece));
   const double power =
@@ -203,7 +197,13 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
         std::string candidate = string_util::UnicodeTextToUTF8(piece);
         if (inherited_strings.contains(candidate)) continue;
         uint64_t& count = counts[candidate];
-        count = SaturatingAdd(count, static_cast<uint64_t>(sentence.second));
+        const uint64_t delta = static_cast<uint64_t>(sentence.second);
+        if (delta > std::numeric_limits<uint64_t>::max() - count) {
+          return absl::OutOfRangeError(absl::StrCat(
+              "weighted Unigram candidate count overflow for piece: ",
+              candidate));
+        }
+        count += delta;
       }
     }
   }
@@ -455,7 +455,24 @@ double ContinuationTrainer::SolveMStepLambda(
     }
   }
   const double boundary = 0.5 * (boundary_lo + boundary_hi);
-  if (ca <= 1e-30 || l0 <= 1e-30) return boundary;
+
+  // If no extension token was used, the constrained optimum is the upper
+  // boundary where inherited NORMAL mass is one. Conversely, if extensions
+  // were used but inherited expected additive length is zero, the objective is
+  // monotone toward lambda -> -infinity: inherited mass must go to zero rather
+  // than to one. Represent that limiting solution by a deterministic finite
+  // lambda whose inherited mass is <= 1e-30.
+  if (ca <= 1e-30) return boundary;
+  if (l0 <= 1e-30) {
+    constexpr double kTargetLogBaseMass = -69.07755278982137;  // log(1e-30)
+    double step = 1.0;
+    double lo = boundary - step;
+    for (int i = 0; i < 200 && LogBaseMass(lo) > kTargetLogBaseMass; ++i) {
+      step *= 2.0;
+      lo = boundary - step;
+    }
+    return lo;
+  }
 
   auto derivative = [&](double lambda) {
     double zprime = 0.0;
