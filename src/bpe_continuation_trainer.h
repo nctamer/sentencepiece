@@ -18,6 +18,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "continuation_io.h"
 #include "sentencepiece_model.pb.h"
 #include "trainer_interface.h"
@@ -79,7 +80,7 @@ class ContinuationTrainer : public TrainerInterface {
   static uint64_t EncodePos(int sid, int l, int r);
   static Position DecodePos(uint64_t n);
 
-  Symbol* GetCharSymbol(char32_t c);
+  Symbol* GetAtomicSymbol(absl::string_view atom);
   Symbol* GetPairSymbol(const Symbol* left, const Symbol* right);
   void ComputeFreq(Symbol* symbol) const;
   int GetNextIndex(int sid, int index) const;
@@ -89,7 +90,16 @@ class ContinuationTrainer : public TrainerInterface {
   absl::Status AcceptSymbol(Symbol* symbol);
   void DrainPendingQueue();
 
+  // Segments `text` into the declared reversible atomic alphabet. Exactly one
+  // segmentation is required: zero parses means the adapter omitted an atom,
+  // and multiple parses mean the alphabet representation is ambiguous.
+  absl::Status SegmentAtoms(absl::string_view text,
+                            std::vector<std::string>* atoms) const;
+
   absl::Status LoadAndValidateSpec();
+  absl::Status ValidateMergeProgram(
+      const std::vector<ExpansionMerge>& merges,
+      bool require_all_declared_pieces) const;
   absl::Status InitializeCorpusSymbols();
   absl::Status ReplayMerges(const std::vector<ExpansionMerge>& merges,
                             absl::string_view label);
@@ -111,6 +121,7 @@ class ContinuationTrainer : public TrainerInterface {
 
   absl::flat_hash_set<std::string> existing_piece_strings_;
   absl::flat_hash_set<std::string> atomic_piece_strings_;
+  std::vector<std::string> atomic_pieces_ordered_;
   absl::flat_hash_map<std::string, Symbol*> live_by_string_;
 
   int first_new_external_id_ = -1;
