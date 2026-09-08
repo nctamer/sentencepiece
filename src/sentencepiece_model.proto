@@ -20,7 +20,7 @@ option optimize_for = LITE_RUNTIME;
 package sentencepiece;
 
 // TrainerSpec encodes a various parameters for SentencePiece training.
-// Next id: 55
+// Next id: 58
 message TrainerSpec {
   ///////////////////////////////////////////////////////////////////
   // General parameters
@@ -60,7 +60,6 @@ message TrainerSpec {
   // Since the model is language-agnostic, this field is used as a reference.
   repeated string accept_language = 5;
 
-
   ///////////////////////////////////////////////////////////////////
   // Training parameters.
   //
@@ -75,7 +74,6 @@ message TrainerSpec {
   // It is better to shuffle the input corpus randomly.
   optional uint64 input_sentence_size = 11 [default = 0];
   optional bool shuffle_input_sentence = 19 [default = true];
-
 
   // The size of seed sentencepieces.
   // `seed_sentencepiece_size` must be larger than `vocab_size`.
@@ -142,7 +140,7 @@ message TrainerSpec {
   // in the vocab. Then the delimiter string is virtually ignored
   // during the training. This field can allows constraints on the vocabulary
   // selection. Note that this field is available on unigram mode.
-  optional string pretokenization_delimiter = 53 [ default = ""];
+  optional string pretokenization_delimiter = 53 [default = ""];
 
   ///////////////////////////////////////////////////////////////////
   // Vocabulary management
@@ -212,9 +210,26 @@ message TrainerSpec {
   // is increased memory usage.
   optional bool train_extremely_large_corpus = 49 [default = false];
 
- // Path to a seed sentencepieces file, with one tab-separated
+  // Path to a seed sentencepieces file, with one tab-separated
   // seed sentencepiece <tab> frequency per line.
   optional string seed_sentencepieces_file = 54 [default = ""];
+
+  ///////////////////////////////////////////////////////////////////
+  // Tokenizer continuation / expansion.
+  //
+  // `expansion_spec` is a serialized ExpansionSpec. It is authoritative for
+  // inherited external IDs, piece roles, BPE merge ranks, bootstrap state and
+  // fingerprints. It is currently the canonical BPE-continuation input.
+  optional string expansion_spec = 55 [default = ""];
+
+  // Optional output path for the serialized ExpansionResult. If empty,
+  // continuation trainers write <model_prefix>.expansion.
+  optional string expansion_result = 56 [default = ""];
+
+  // Native SentencePiece Unigram continuation input. The complete prior
+  // ModelProto is authoritative: piece index is the inherited token ID, and
+  // piece/type/score/normalizer state is inherited from that model.
+  optional string unigram_prior_model = 57 [default = ""];
 
   reserved 6;   // Deprecated self_test_sample_size.
   reserved 12;  // Deprecated mining_sentence_size.
@@ -223,9 +238,10 @@ message TrainerSpec {
   reserved 51;  // Deprecated differential_privacy_noise_level.
   reserved 52;  // Deprecated differential_privacy_clipping_threshold.
 
-  // Customized extensions: the range of field numbers
-  // are open to third-party extensions.
-  extensions 200 to max;
+  // Extension ids 200-205 were used by an earlier Intermo-specific fork
+  // (interval/barline splitting, retired phase controls, protected pieces and
+  // seed-merges). They are intentionally retired and must not be reused.
+  extensions 206 to max;
 }
 
 // NormalizerSpec encodes a various parameters for string normalizaiton
@@ -297,9 +313,96 @@ message ModelProto {
   // Spec for text de-normalization.
   optional NormalizerSpec denormalizer_spec = 5;
 
+  // Continuation provenance, when this native ModelProto is itself the output
+  // of a continuation trainer. External-tokenizer expansion remains governed
+  // by the standalone ExpansionResult sidecar.
+  optional ExpansionResult expansion_result = 6;
+
   reserved 4;  // Deprecated self_test_data.
 
   // Customized extensions: the range of field numbers
   // are open to third-party extensions.
   extensions 200 to max;
+}
+
+// Tokenizer-family-neutral state used by continuation adapters.
+enum ExpansionModelType {
+  EXPANSION_MODEL_UNSPECIFIED = 0;
+  EXPANSION_BPE = 1;
+  EXPANSION_UNIGRAM = 2;
+}
+
+// One externally visible tokenizer piece. `external_id` is the embedding-row
+// ABI, not an incidental trainer-local index. `atomic` means the piece is one
+// atom of the reversible training alphabet; `mergeable` excludes specials or
+// AddedTokens which must retain identity but must not participate in BPE.
+message ExpansionPiece {
+  optional int32 external_id = 1 [default = -1];
+  optional string piece = 2;
+  optional ModelProto.SentencePiece.Type type = 3 [default = NORMAL];
+  optional float score = 4 [default = 0.0];
+  optional bool mergeable = 5 [default = true];
+  optional bool atomic = 6 [default = false];
+}
+
+// One exact binary BPE construction. Ranks are total and deterministic within
+// each list. The child is always `left + right` and is therefore not stored.
+message ExpansionMerge {
+  optional int32 rank = 1 [default = -1];
+  optional string left = 2;
+  optional string right = 3;
+  optional int32 external_id = 4 [default = -1];
+}
+
+// Authoritative input for external-tokenizer continuation.
+message ExpansionSpec {
+  optional uint32 schema_version = 1 [default = 1];
+  optional ExpansionModelType model_type = 2
+      [default = EXPANSION_MODEL_UNSPECIFIED];
+  repeated ExpansionPiece base_pieces = 3;
+  repeated ExpansionMerge base_merges = 4;
+  repeated ExpansionPiece bootstrap_pieces = 5;
+  repeated ExpansionMerge bootstrap_merges = 6;
+  optional bool preserve_base_ids = 7 [default = true];
+  optional bool allow_rank_prepend = 8 [default = false];
+  optional int32 first_new_external_id = 9 [default = -1];
+  // Number of ordinary learned expansion pieces. Bootstrap pieces are tracked
+  // separately and do not consume this budget.
+  optional int32 requested_new_pieces = 10 [default = 0];
+  optional string vocab_sha256 = 11;
+  optional string merges_sha256 = 12;
+  optional string tokenizer_sha256 = 13;
+  optional string pretokenizer_sha256 = 14;
+  optional string boundary_policy = 15;
+}
+
+// Self-auditing continuation output. A consumer can reconstruct the complete
+// external token-ID ABI and final BPE merge program without guessing a split
+// from token strings.
+message ExpansionResult {
+  optional uint32 schema_version = 1 [default = 1];
+  optional ExpansionModelType model_type = 2
+      [default = EXPANSION_MODEL_UNSPECIFIED];
+  repeated ExpansionPiece base_pieces = 3;
+  repeated ExpansionPiece bootstrap_pieces = 4;
+  repeated ExpansionPiece learned_pieces = 5;
+  repeated ExpansionMerge base_merges = 6;
+  repeated ExpansionMerge bootstrap_merges = 7;
+  repeated ExpansionMerge learned_merges = 8;
+  optional int32 first_new_external_id = 9 [default = -1];
+  optional int32 requested_new_pieces = 10 [default = 0];
+  optional int32 actual_new_pieces = 11 [default = 0];
+  optional int32 unreachable_pieces = 12 [default = 0];
+  optional bool rank_prepend = 13 [default = false];
+  optional string vocab_sha256 = 14;
+  optional string merges_sha256 = 15;
+  optional string tokenizer_sha256 = 16;
+  optional string pretokenizer_sha256 = 17;
+  optional string boundary_policy = 18;
+
+  // Native Unigram continuation provenance.
+  optional string prior_model_sha256 = 19;
+  optional int32 prior_piece_count = 20 [default = 0];
+  optional double unigram_lambda = 21 [default = 0.0];
+  optional double unigram_score_gauge_max_error = 22 [default = 0.0];
 }
