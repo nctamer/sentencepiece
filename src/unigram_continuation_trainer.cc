@@ -50,6 +50,8 @@ bool ScoresTie(double a, double b) {
   return std::abs(a - b) <= 1e-9 * scale;
 }
 
+}  // namespace
+
 // Deterministic bracketed bisection for a monotone objective.
 //
 // Every continuation lambda is the root of a monotone function, so a bracket
@@ -140,7 +142,6 @@ double CandidateScore(absl::string_view piece, uint64_t freq) {
   return static_cast<double>(freq) * std::pow(len, power);
 }
 
-}  // namespace
 
 absl::Status ContinuationTrainer::LoadAndValidatePrior() {
   if (trainer_spec_.unigram_prior_model().empty()) {
@@ -801,9 +802,10 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
   return absl::OkStatus();
 }
 
-absl::Status ContinuationTrainer::VerifyPriorPrefixInvariant(
-    const ModelProto& output) const {
-  const int prior_n = prior_model_.pieces_size();
+absl::Status VerifyPriorPrefixInvariant(const ModelProto& prior_model,
+                                        const ModelProto& output,
+                                        double lambda) {
+  const int prior_n = prior_model.pieces_size();
   if (output.pieces_size() < prior_n) {
     return absl::FailedPreconditionError(absl::StrCat(
         "continuation output has ", output.pieces_size(),
@@ -813,7 +815,7 @@ absl::Status ContinuationTrainer::VerifyPriorPrefixInvariant(
   // Identity first: an inherited ID keeps its index, its bytes and its type.
   // Anything else silently repoints an embedding row.
   for (int id = 0; id < prior_n; ++id) {
-    const auto& prior = prior_model_.pieces(id);
+    const auto& prior = prior_model.pieces(id);
     const auto& out = output.pieces(id);
     if (out.piece() != prior.piece()) {
       return absl::FailedPreconditionError(absl::StrCat(
@@ -839,12 +841,17 @@ absl::Status ContinuationTrainer::VerifyPriorPrefixInvariant(
   // lambda * length. That single degree of freedom is what lets inherited
   // segmentation decisions survive continuation, so a per-piece drift here is
   // a silent re-estimation, not a rounding detail.
-  for (const auto& inherited : inherited_normal_) {
-    const double prior_score = inherited.prior_score;
-    const double expected_shift = lambda_ * inherited.additive_length;
+  for (int id = 0; id < prior_n; ++id) {
+    if (prior_model.pieces(id).type() !=
+        ModelProto::SentencePiece::NORMAL) {
+      continue;
+    }
+    const std::string& piece = prior_model.pieces(id).piece();
+    const int additive_length = static_cast<int>(string_util::UTF8Len(piece));
+    const double prior_score = prior_model.pieces(id).score();
+    const double expected_shift = lambda * additive_length;
     const double actual_shift =
-        static_cast<double>(output.pieces(inherited.external_id).score()) -
-        prior_score;
+        static_cast<double>(output.pieces(id).score()) - prior_score;
     // The score is stored as float32, so one rounding of (prior + shift) is
     // unavoidable and is the whole budget.
     const double magnitude =
@@ -856,10 +863,10 @@ absl::Status ContinuationTrainer::VerifyPriorPrefixInvariant(
     if (!Finite(actual_shift) ||
         std::abs(actual_shift - expected_shift) > tolerance) {
       return absl::FailedPreconditionError(absl::StrCat(
-          "inherited NORMAL piece \"", inherited.piece, "\" (ID ",
-          inherited.external_id, ") violates the additive-length gauge: "
-          "expected shift ", expected_shift, " (lambda=", lambda_,
-          " * length=", inherited.additive_length, ") but the score moved by ",
+          "inherited NORMAL piece \"", piece, "\" (ID ", id,
+          ") violates the additive-length gauge: expected shift ",
+          expected_shift, " (lambda=", lambda,
+          " * length=", additive_length, ") but the score moved by ",
           actual_shift, ", which exceeds the float32 tolerance ", tolerance));
     }
   }
@@ -872,6 +879,11 @@ absl::Status ContinuationTrainer::VerifyPriorPrefixInvariant(
     }
   }
   return absl::OkStatus();
+}
+
+absl::Status ContinuationTrainer::VerifyPriorPrefix(
+    const ModelProto& output) const {
+  return VerifyPriorPrefixInvariant(prior_model_, output, lambda_);
 }
 
 absl::Status ContinuationTrainer::FinalizeArtifacts() {
@@ -950,7 +962,7 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
 
   // Nothing is written until the prior prefix has been proven intact. A
   // recorded max error is a report; this is the gate.
-  ABSL_RETURN_IF_ERROR(VerifyPriorPrefixInvariant(output));
+  ABSL_RETURN_IF_ERROR(VerifyPriorPrefix(output));
 
   const std::string result_path = !trainer_spec_.expansion_result().empty()
                                       ? trainer_spec_.expansion_result()

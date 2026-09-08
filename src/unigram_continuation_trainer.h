@@ -7,6 +7,7 @@
 #define UNIGRAM_CONTINUATION_TRAINER_H_
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,26 @@
 #include "trainer_interface.h"
 
 namespace sentencepiece::unigram {
+
+// Both of these are the continuation contract's two hardest guards, and both
+// are stated over values rather than over trainer state so a test can reach
+// them. A guard nothing can trigger is a guard nobody has checked.
+
+// Deterministic bracketed bisection for a monotone objective. Fails - rather
+// than returning a bracket endpoint - when the root is not bracketed, when the
+// objective leaves the finite range, or when the interval never closes.
+absl::Status BisectMonotoneRoot(absl::string_view what,
+                                const std::function<double(double)>& f,
+                                bool increasing, double seed_lo, double seed_hi,
+                                double* root);
+
+// The prior-prefix invariant: every inherited ID keeps its index, its bytes
+// and its type; inherited non-NORMAL scores are bit-identical; and every
+// inherited NORMAL score moved by exactly `lambda * length` within one float32
+// rounding. A property of the two protos and the gauge, nothing else.
+absl::Status VerifyPriorPrefixInvariant(const ModelProto& prior,
+                                        const ModelProto& output,
+                                        double lambda);
 
 // True continuation of a native Unigram ModelProto. Inherited NORMAL scores
 // are constrained to s_i + lambda * length(i); only extension probabilities
@@ -68,10 +89,8 @@ class ContinuationTrainer : public TrainerInterface {
   ModelProto BuildWorkingModel(
       const std::vector<ExtensionCandidate>& extensions,
       double lambda) const;
-  // Proves, before anything is written, that every inherited ID kept its
-  // string, its type and - for NORMAL pieces - the one shared additive-length
-  // gauge. A violation fails the run; it is not merely reported.
-  absl::Status VerifyPriorPrefixInvariant(const ModelProto& output) const;
+  // Applies the free function above to this run's prior and gauge.
+  absl::Status VerifyPriorPrefix(const ModelProto& output) const;
   absl::Status FinalizeArtifacts();
 
   ModelProto prior_model_;

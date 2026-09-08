@@ -21,6 +21,7 @@
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
 #include "trainer_factory.h"
+#include "unigram_continuation_trainer.h"
 #include "util.h"
 
 namespace sentencepiece {
@@ -1412,6 +1413,158 @@ TEST(UnigramContinuationContractTest, RejectsSeedSentencepiecesConflict) {
   // The prior already fixes the starting vocabulary; a second seed source is
   // ambiguous rather than additive.
   EXPECT_FALSE(RunTrainer(trainer, NormalizerSpec()).ok());
+}
+
+
+// ---------------------------------------------------------------------------
+// The guards themselves. Everything above proves the happy path keeps the
+// contract; these prove that when the contract is broken the run stops. A
+// guard nothing can trigger is a guard nobody has checked.
+// ---------------------------------------------------------------------------
+
+TEST(UnigramContinuationContractTest, GaugeInvariantRejectsAPerturbedScore) {
+  const ModelProto prior = MakeMultiPathUnigramPrior();
+  constexpr double kLambda = -0.25;
+
+  // A faithful continuation: every inherited NORMAL score moved by exactly
+  // lambda * length, and an extension appended.
+  ModelProto output = prior;
+  for (int id = 0; id < output.pieces_size(); ++id) {
+    if (output.pieces(id).type() != ModelProto::SentencePiece::NORMAL) continue;
+    const int length = static_cast<int>(
+        string_util::UTF8Len(output.pieces(id).piece()));
+    output.mutable_pieces(id)->set_score(static_cast<float>(
+        prior.pieces(id).score() + kLambda * length));
+  }
+  auto* added = output.add_pieces();
+  added->set_piece("abab");
+  added->set_score(-4.0f);
+  added->set_type(ModelProto::SentencePiece::NORMAL);
+
+  ASSERT_TRUE(unigram::VerifyPriorPrefixInvariant(prior, output, kLambda).ok())
+      << "a correctly gauged model must pass";
+
+  {  // One inherited score nudged off the shared gauge.
+    ModelProto bad = output;
+    for (int id = 0; id < bad.pieces_size(); ++id) {
+      if (bad.pieces(id).type() == ModelProto::SentencePiece::NORMAL) {
+        bad.mutable_pieces(id)->set_score(bad.pieces(id).score() - 0.01f);
+        break;
+      }
+    }
+    const absl::Status status =
+        unigram::VerifyPriorPrefixInvariant(prior, bad, kLambda);
+    EXPECT_EQ(absl::StatusCode::kFailedPrecondition, status.code()) << status;
+    EXPECT_NE(std::string::npos,
+              std::string(status.message()).find("additive-length gauge"));
+  }
+  {  // An inherited piece restrung: same ID, different bytes.
+    ModelProto bad = output;
+    bad.mutable_pieces(1)->set_piece("zzz");
+    EXPECT_FALSE(unigram::VerifyPriorPrefixInvariant(prior, bad, kLambda).ok());
+  }
+  {  // An inherited piece retyped.
+    ModelProto bad = output;
+    bad.mutable_pieces(1)->set_type(ModelProto::SentencePiece::USER_DEFINED);
+    EXPECT_FALSE(unigram::VerifyPriorPrefixInvariant(prior, bad, kLambda).ok());
+  }
+  {  // A non-NORMAL inherited score is not allowed to drift at all.
+    ModelProto bad = output;
+    bad.mutable_pieces(0)->set_score(prior.pieces(0).score() - 0.5f);
+    EXPECT_FALSE(unigram::VerifyPriorPrefixInvariant(prior, bad, kLambda).ok());
+  }
+  {  // Truncating the prior prefix.
+    ModelProto bad = output;
+    bad.mutable_pieces()->RemoveLast();
+    bad.mutable_pieces()->RemoveLast();
+    EXPECT_FALSE(unigram::VerifyPriorPrefixInvariant(prior, bad, kLambda).ok());
+  }
+}
+
+TEST(UnigramContinuationContractTest, SolverReportsItsFailuresInsteadOfGuessing) {
+  double root = 0.0;
+
+  // A genuine root is found, so the failures below are about the objective and
+  // not about the search being broken.
+  ASSERT_TRUE(unigram::BisectMonotoneRoot(
+                  "linear", [](double x) { return x - 3.0; },
+                  /*increasing=*/true, -1.0, 1.0, &root)
+                  .ok());
+  EXPECT_NEAR(3.0, root, 1e-6);
+
+  {  // Never crosses zero: unbracketed, and no lambda may be reported.
+    const absl::Status status = unigram::BisectMonotoneRoot(
+        "always positive", [](double) { return 1.0; }, true, -1.0, 1.0, &root);
+    EXPECT_EQ(absl::StatusCode::kFailedPrecondition, status.code()) << status;
+    EXPECT_NE(std::string::npos,
+              std::string(status.message()).find("not bracketed"));
+  }
+  {  // Leaves the finite range while bracketing.
+    const absl::Status status = unigram::BisectMonotoneRoot(
+        "non-finite", [](double) {
+          return std::numeric_limits<double>::quiet_NaN();
+        }, true, -1.0, 1.0, &root);
+    EXPECT_EQ(absl::StatusCode::kFailedPrecondition, status.code()) << status;
+    EXPECT_NE(std::string::npos,
+              std::string(status.message()).find("finite range"));
+  }
+  {  // Finite at the ends, non-finite in the interior.
+    const absl::Status status = unigram::BisectMonotoneRoot(
+        "non-finite interior", [](double x) {
+          if (x <= -1.0) return -1.0;
+          if (x >= 1.0) return 1.0;
+          return std::numeric_limits<double>::infinity();
+        }, true, -1.0, 1.0, &root);
+    EXPECT_EQ(absl::StatusCode::kFailedPrecondition, status.code()) << status;
+  }
+  {  // Decreasing objectives are handled by the same search.
+    ASSERT_TRUE(unigram::BisectMonotoneRoot(
+                    "decreasing", [](double x) { return 5.0 - x; },
+                    /*increasing=*/false, -1.0, 1.0, &root)
+                    .ok());
+    EXPECT_NEAR(5.0, root, 1e-6);
+  }
+}
+
+// With a soft vocabulary limit, too few candidates is not a failure: the run
+// returns the smaller extension it could actually justify, and returns the
+// same one every time.
+TEST(UnigramContinuationContractTest, SoftCapacityYieldsADeterministicSmallerExtension) {
+  const std::string input = TempPath("cont_uni_soft.txt");
+  const std::string prior_path = TempPath("cont_uni_soft.prior");
+  ASSERT_TRUE(WriteProto(prior_path, MakeMultiPathUnigramPrior()));
+  // One short repeated record offers very few distinct extension candidates.
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(30, "abab")));
+
+  auto run = [&](const std::string& tag, bool hard) {
+    const std::string result_path = TempPath("cont_uni_soft_" + tag + ".result");
+    const std::string prefix = TempPath("cont_uni_soft_" + tag + "_model");
+    TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                  result_path, prefix);
+    trainer.set_vocab_size(400);  // far more than the corpus can supply
+    trainer.set_hard_vocab_limit(hard);
+    return std::make_pair(RunTrainer(trainer, NormalizerSpec()), prefix);
+  };
+
+  // Hard limit: the shortfall is an error.
+  EXPECT_FALSE(run("hard", true).first.ok());
+
+  // Soft limit: succeed with fewer, and identically on a rerun.
+  auto first = run("a", false);
+  auto second = run("b", false);
+  ASSERT_TRUE(first.first.ok()) << first.first;
+  ASSERT_TRUE(second.first.ok()) << second.first;
+
+  ModelProto ma, mb;
+  ASSERT_TRUE(ReadProto(first.second + ".model", &ma));
+  ASSERT_TRUE(ReadProto(second.second + ".model", &mb));
+  EXPECT_LT(ma.pieces_size(), 400) << "soft capacity should return fewer";
+  EXPECT_GT(ma.pieces_size(), 0);
+  ASSERT_EQ(ma.pieces_size(), mb.pieces_size());
+  for (int i = 0; i < ma.pieces_size(); ++i) {
+    EXPECT_EQ(ma.pieces(i).piece(), mb.pieces(i).piece()) << i;
+    EXPECT_EQ(ma.pieces(i).score(), mb.pieces(i).score()) << i;
+  }
 }
 
 TEST(ContinuationContractTest, DeterministicBpeResultBytes) {
