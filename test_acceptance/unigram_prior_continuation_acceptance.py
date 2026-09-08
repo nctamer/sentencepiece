@@ -33,10 +33,49 @@ def write(path, lines):
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-# Stage 1: piano only. A few alphabet lines so character coverage includes the
-# letters violin will need - the prior must be able to segment Stage 2 at all.
-stage1 = [piano_line() for _ in range(3000)]
-stage1 += ["Vn ABCDEFG abcdefg |/-0123456789: " for _ in range(20)]
+# STAGE1_TSV / STAGE2_TSV point at "<unit><TAB><count>" corpora produced by
+# the real pretokenizer - Stage 1 without the instrument Stage 2 adds. Without
+# them, synthetic lines stand in so the script still runs.
+STAGE1_TSV = os.environ.get("STAGE1_TSV")
+STAGE2_TSV = os.environ.get("STAGE2_TSV")
+REAL = bool(STAGE1_TSV and STAGE2_TSV)
+
+def read_tsv(path, limit):
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            unit, _, count = line.rstrip("\n").rpartition("\t")
+            if unit and count.isdigit():
+                rows.append((unit, int(count)))
+    rows.sort(key=lambda uc: (-uc[1], uc[0]))
+    return rows[:limit]
+
+LIMIT = int(os.environ.get("MAX_UNITS", "20000"))
+if REAL:
+    s1_rows = read_tsv(STAGE1_TSV, LIMIT)
+    s2_rows = read_tsv(STAGE2_TSV, LIMIT)
+    print(f"Stage 1 corpus: {len(s1_rows)} real units, "
+          f"{sum(n for _, n in s1_rows)} occurrences")
+    # The prior is authoritative, and a Unigram model can only score text it
+    # can segment. Real Stage-2 data carries characters Stage 1 never saw -
+    # here, Greek staff labels on violin parts - and the trainer rightly
+    # refuses a corpus it cannot represent without <unk>. A deployment fixes
+    # that by giving Stage 1 the coverage (or byte_fallback); the acceptance
+    # run keeps to what the prior can actually represent, and says how much
+    # that removed.
+    s1_chars = set()
+    for u, _ in s1_rows:
+        s1_chars.update(u)
+    kept = [(u, n) for u, n in s2_rows if set(u) <= s1_chars]
+    dropped = len(s2_rows) - len(kept)
+    s2_rows = kept
+    print(f"Stage 2 corpus: {len(s2_rows)} real units, "
+          f"{sum(n for _, n in s2_rows)} occurrences "
+          f"({dropped} dropped as outside the prior's alphabet)")
+    stage1 = [u for u, n in s1_rows for _ in range(min(n, 40))]
+else:
+    stage1 = [piano_line() for _ in range(3000)]
+    stage1 += ["Vn ABCDEFG abcdefg |/-0123456789: " for _ in range(20)]
 s1_corpus = os.path.join(OUT, "stage1.txt")
 write(s1_corpus, stage1)
 
@@ -45,9 +84,10 @@ COMMON = ["--model_type=unigram", "--character_coverage=1.0",
           "--split_by_whitespace=true", "--split_by_unicode_script=false",
           "--split_by_number=false", "--num_threads=1",
           "--hard_vocab_limit=false"]
+S1_VOCAB = os.environ.get("S1_VOCAB", "1200" if REAL else "200")
 r = subprocess.run([SPM_TRAIN, f"--input={s1_corpus}",
-                    f"--model_prefix={s1_prefix}", "--vocab_size=200"] + COMMON,
-                   capture_output=True, text=True)
+                    f"--model_prefix={s1_prefix}", f"--vocab_size={S1_VOCAB}"]
+                   + COMMON, capture_output=True, text=True)
 if r.returncode != 0:
     print("stage 1 failed\n", r.stderr[-3000:]); sys.exit(1)
 
@@ -55,8 +95,11 @@ prior = pb.ModelProto()
 prior.ParseFromString(open(s1_prefix + ".model", "rb").read())
 print(f"Stage 1: {len(prior.pieces)} pieces")
 
-# Stage 2: piano AND violin. Violin is frequent enough to deserve pieces.
-stage2 = [piano_line() for _ in range(1500)] + [violin_line() for _ in range(1500)]
+# Stage 2: with the added instrument.
+if REAL:
+    stage2 = [u for u, n in s2_rows for _ in range(min(n, 40))]
+else:
+    stage2 = [piano_line() for _ in range(1500)] + [violin_line() for _ in range(1500)]
 rng.shuffle(stage2)
 s2_corpus = os.path.join(OUT, "stage2.txt")
 write(s2_corpus, stage2)
@@ -72,7 +115,7 @@ for line, n in sorted(counts.items()):
     rep += [line] * n
 write(s2_rep, rep)
 
-TARGET = 260
+TARGET = int(os.environ.get("TARGET_VOCAB", "1500" if REAL else "260"))
 def continue_run(tag, corpus, fmt):
     prefix = os.path.join(OUT, "stage2_" + tag)
     cmd = [SPM_TRAIN, f"--input={corpus}", f"--model_prefix={prefix}",
@@ -125,7 +168,8 @@ check(m_a.expansion_result.unigram_score_gauge_max_error < 1e-3,
       "reported gauge error is within float32 tolerance")
 
 sp_new = [p.piece for p in m_a.pieces[n_prior:]]
-violin_pieces = [p for p in sp_new if "Vn" in p or any(v in p for v in PITCH_V)]
+violin_pieces = ([p for p in sp_new if "Vn" in p] if REAL else
+                 [p for p in sp_new if "Vn" in p or any(v in p for v in PITCH_V)])
 print(f"  learned {len(sp_new)} pieces, {len(violin_pieces)} violin-specific")
 check(len(violin_pieces) > 0,
       "frequent Stage-2 specializations win extension slots")
@@ -140,10 +184,13 @@ sp2 = sentencepiece.SentencePieceProcessor(model_file=p_a + ".model")
 # for. The inherited guarantee is narrower and is what is tested here: where
 # no extension piece takes part, the segmentation must be exactly Stage 1's,
 # because the gauge cancels out of every comparison between inherited paths.
-probes = ["|4/4k0 PL: A-3 1/16", "|4/4k0 PL: B3 1/8 PL: F4 1/4",
-          "|4/4k0 Vn: E5 1/4"]
-probes += ["".join(rng.choice("ABCDEFGabcdefg-0123456789:/| ") for _ in range(12))
-           for _ in range(400)]
+if REAL:
+    probes = [u for u, _ in s2_rows[::37]][:600]
+else:
+    probes = ["|4/4k0 PL: A-3 1/16", "|4/4k0 PL: B3 1/8 PL: F4 1/4",
+              "|4/4k0 Vn: E5 1/4"]
+    probes += ["".join(rng.choice("ABCDEFGabcdefg-0123456789:/| ")
+                       for _ in range(12)) for _ in range(400)]
 
 inherited_only = 0
 mismatched = []

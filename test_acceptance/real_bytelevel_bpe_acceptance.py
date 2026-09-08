@@ -78,23 +78,43 @@ spec_path = os.path.join(OUT, "qwen.spec")
 open(spec_path, "wb").write(spec.SerializeToString())
 print(f"spec: {len(spec.base_pieces)} pieces, first_new_external_id={spec.first_new_external_id}")
 
-# A small domain corpus in intermo-ish notation plus ordinary prose, so the
-# run has both a domain to specialize on and language to leave alone.
-domain = [
-    "|4/4k0 PR: C5 1/4 PL: A-3 C4 F4 1/8 PR: c5 D-5 1/4 PL: G3 B3 D4",
-    "|4/4k0 PR: E4 1/8 PL: B-2 D3 F3 1/16 PR: g4 a4 1/4 PL: C3 E3",
-    "|3/4k0 PR: C5 1/4 PL: A-3 1/4 PR: D5 1/4 PL: F3",
-]
+# The domain corpus. UNITS_TSV points at "<unit><TAB><count>" produced by the
+# real pretokenizer; without it a few hand-written lines stand in, so the
+# script still runs where that export is not available.
+UNITS_TSV = os.environ.get("UNITS_TSV")
+if UNITS_TSV:
+    weighted = []
+    with open(UNITS_TSV, encoding="utf-8") as f:
+        for line in f:
+            unit, _, count = line.rstrip("\n").rpartition("\t")
+            if unit and count.isdigit():
+                weighted.append((unit, int(count)))
+    weighted.sort(key=lambda uc: (-uc[1], uc[0]))
+    weighted = weighted[:int(os.environ.get("MAX_UNITS", "20000"))]
+    print(f"domain corpus: {len(weighted)} distinct real units, "
+          f"{sum(c for _, c in weighted)} occurrences")
+else:
+    weighted = [(l, 60) for l in [
+        "|4/4k0 PR: C5 1/4 PL: A-3 C4 F4 1/8 PR: c5 D-5 1/4 PL: G3 B3 D4",
+        "|4/4k0 PR: E4 1/8 PL: B-2 D3 F3 1/16 PR: g4 a4 1/4 PL: C3 E3",
+        "|3/4k0 PR: C5 1/4 PL: A-3 1/4 PR: D5 1/4 PL: F3"]]
+    print("domain corpus: built-in fallback lines")
+
+# Held out, so the compression number is not read off the training units.
+holdout = [u for u, _ in weighted[::7]][:200]
+domain = [u for u, _ in weighted[:200]]
+
 prose = ["The quick brown fox jumps over the lazy dog.",
-         "SentencePiece is an unsupervised text tokenizer."]
-corpus_path = os.path.join(OUT, "qwen_corpus.txt")
+         "SentencePiece is an unsupervised text tokenizer.",
+         "Continuation must leave ordinary language exactly as it was."]
+
+# Weighted TSV, so the run also exercises repetition-equivalence at scale.
+corpus_path = os.path.join(OUT, "qwen_corpus.tsv")
 with open(corpus_path, "w", encoding="utf-8") as f:
-    for _ in range(60):
-        for line in domain:
-            f.write(encode_bytelevel(line) + "\n")
-    for _ in range(10):
-        for line in prose:
-            f.write(encode_bytelevel(line) + "\n")
+    for unit, count in weighted:
+        f.write(f"{encode_bytelevel(unit)}\t{count}\n")
+    for line in prose:
+        f.write(f"{encode_bytelevel(line)}\t10\n")
 
 prefix = os.path.join(OUT, "qwen_cont")
 cmd = [SPM, f"--input={corpus_path}", f"--model_prefix={prefix}",
@@ -105,7 +125,7 @@ cmd = [SPM, f"--input={corpus_path}", f"--model_prefix={prefix}",
        "--split_by_whitespace=false", "--split_by_unicode_script=false",
        "--split_by_number=false", "--shuffle_input_sentence=false",
        "--max_sentencepiece_length=512", "--max_sentence_length=100000",
-       "--hard_vocab_limit=false"]
+       "--input_format=tsv", "--hard_vocab_limit=false"]
 print("running:", " ".join(cmd[:4]), "...")
 r = subprocess.run(cmd, capture_output=True, text=True)
 if r.returncode != 0:
@@ -179,8 +199,8 @@ def toklen(text, table):
         return len(bpe_apply(encode_bytelevel(text)))
     finally:
         rank_of = saved
-before = sum(toklen(l, base_rank) for l in domain)
-after = sum(toklen(l, rank_of) for l in domain)
+before = sum(toklen(l, base_rank) for l in holdout)
+after = sum(toklen(l, rank_of) for l in holdout)
 print(f"  domain tokens: base={before} continued={after} "
       f"({100.0 * (before - after) / before:.1f}% fewer)")
 check(after < before, "compression on the domain corpus improves")

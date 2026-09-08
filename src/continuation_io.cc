@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -94,6 +95,8 @@ absl::Status LoadPreparedCorpus(const TrainerSpec& trainer_spec,
   if (!normalizer.status().ok()) return normalizer.status();
 
   const bool is_tsv = trainer_spec.input_format() == "tsv";
+  // Ordered, so the canonical corpus order does not depend on a hash seed.
+  std::map<std::string, int64_t> aggregated;
   for (; !iterator->done(); iterator->Next()) {
     std::string sentence = iterator->value();
     int64_t freq = 1;
@@ -125,11 +128,37 @@ absl::Status LoadPreparedCorpus(const TrainerSpec& trainer_spec,
       return absl::OutOfRangeError("weighted continuation corpus count overflow");
     }
     corpus->weighted_sentence_count += freq;
-    corpus->sentences.emplace_back(std::move(normalized), freq);
+
+    // Continuation reads its corpus as a MULTISET of weighted records, not as
+    // a sequence of lines. Identical records are folded together and the
+    // result is kept in one canonical order.
+    //
+    // That is what makes "a weighted TSV equals physical repetition" true by
+    // construction rather than approximately. Otherwise the two spellings of
+    // the same corpus take different summation paths - n*p once against p
+    // added n times - and float addition is not associative, so they disagree
+    // in the last bits. Those bits then decide which of two equally scored
+    // extension pieces gets the lower external ID, and an ID is an ABI.
+    //
+    // It also makes a run independent of the order lines happen to sit in the
+    // input file, which is the same reproducibility promise stated once more.
+    auto inserted = aggregated.emplace(std::move(normalized), freq);
+    if (!inserted.second) {
+      int64_t& total = inserted.first->second;
+      if (freq > std::numeric_limits<int64_t>::max() - total) {
+        return absl::OutOfRangeError(
+            "weighted continuation corpus count overflow for a single record");
+      }
+      total += freq;
+    }
   }
   if (!iterator->status().ok()) return iterator->status();
-  if (corpus->sentences.empty()) {
+  if (aggregated.empty()) {
     return absl::InvalidArgumentError("continuation corpus is empty");
+  }
+  corpus->sentences.reserve(aggregated.size());
+  for (auto& entry : aggregated) {
+    corpus->sentences.emplace_back(entry.first, entry.second);
   }
   return absl::OkStatus();
 }

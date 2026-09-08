@@ -34,6 +34,22 @@ namespace {
 
 bool Finite(double x) { return std::isfinite(x); }
 
+// Two scores that differ only by floating-point accumulation noise rank as a
+// tie, so the piece string decides.
+//
+// This exists because a weighted corpus and its physical repetition are the
+// same corpus stated two ways, but not the same sum: n*p and p added n times
+// differ in the last bits, and addition is not associative. Without a tie
+// band, that noise decides which of two equally-scored pieces gets the lower
+// external ID - and an ID is an ABI, not a presentation detail.
+//
+// The band sits far below any meaningful score difference and far above the
+// accumulated noise of a corpus with ~10^6 records.
+bool ScoresTie(double a, double b) {
+  const double scale = std::max({std::abs(a), std::abs(b), 1.0});
+  return std::abs(a - b) <= 1e-9 * scale;
+}
+
 // Deterministic bracketed bisection for a monotone objective.
 //
 // Every continuation lambda is the root of a monotone function, so a bracket
@@ -714,9 +730,9 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
     std::vector<size_t> order(extension_candidates_.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-      const float ea = expected[base_n + a];
-      const float eb = expected[base_n + b];
-      if (ea != eb) return ea > eb;
+      const double ea = expected[base_n + a];
+      const double eb = expected[base_n + b];
+      if (!ScoresTie(ea, eb)) return ea > eb;
       return extension_candidates_[a].piece < extension_candidates_[b].piece;
     });
 
@@ -779,7 +795,7 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
 
   std::sort(extension_candidates_.begin(), extension_candidates_.end(),
             [](const ExtensionCandidate& a, const ExtensionCandidate& b) {
-              if (a.score != b.score) return a.score > b.score;
+              if (!ScoresTie(a.score, b.score)) return a.score > b.score;
               return a.piece < b.piece;
             });
   return absl::OkStatus();
