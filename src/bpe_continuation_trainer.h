@@ -108,7 +108,18 @@ class ContinuationTrainer : public TrainerInterface {
   bool IsReachable(absl::string_view piece,
                    const std::vector<ExpansionMerge>& merges) const;
   absl::Status FinalizeArtifacts();
-  absl::Status BuildNativeModel(ModelProto* model) const;
+
+  // Native SentencePiece BPE inference does not read a merge table. It merges
+  // whichever adjacent pair has the best-scoring CONCATENATION in the
+  // vocabulary. That is a different rule from an explicit (left, right)
+  // program, and the two agree only under the conditions checked here. Returns
+  // OK when a native ModelProto can reproduce `merges` exactly; otherwise the
+  // status explains which condition failed and names an offending piece.
+  absl::Status VerifyNativeMergeEquivalence(
+      const std::vector<ExpansionPiece>& pieces,
+      const std::vector<ExpansionMerge>& merges) const;
+  absl::Status BuildNativeModel(const std::vector<ExpansionMerge>& merges,
+                                ModelProto* model) const;
 
   ExpansionSpec expansion_spec_;
   continuation::PreparedCorpus corpus_;

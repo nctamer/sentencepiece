@@ -786,7 +786,101 @@ bool ContinuationTrainer::IsReachable(
   return symbols.size() == 1 && symbols.front() == piece;
 }
 
-absl::Status ContinuationTrainer::BuildNativeModel(ModelProto* model) const {
+absl::Status ContinuationTrainer::VerifyNativeMergeEquivalence(
+    const std::vector<ExpansionPiece>& pieces,
+    const std::vector<ExpansionMerge>& merges) const {
+  // Native inference merges a pair when the CONCATENATION is in the
+  // vocabulary. Only NORMAL pieces are eligible: CONTROL sits in the reserved
+  // id map, USER_DEFINED is prefix-matched and frozen, and neither can be a
+  // merge participant. A non-mergeable NORMAL piece has no such protection, so
+  // it would silently join merges the program never declared.
+  absl::flat_hash_set<std::string> normal;
+  for (const auto& piece : pieces) {
+    const bool is_normal = piece.type() == ModelProto::SentencePiece::NORMAL;
+    if (is_normal && !piece.mergeable()) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "piece is NORMAL but declared nonmergeable, which native BPE cannot "
+          "express: ",
+          piece.piece()));
+    }
+    if (is_normal) normal.insert(piece.piece());
+  }
+
+  // Rank is carried as a float32 score. Beyond 2^24 consecutive integers stop
+  // being distinguishable, and two merges sharing a score is an ordering the
+  // program did not ask for.
+  constexpr int kMaxExactFloatRank = 1 << 24;
+  if (static_cast<int64_t>(merges.size()) > kMaxExactFloatRank) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "merge program has ", merges.size(),
+        " ranks, which float32 piece scores cannot order exactly (limit ",
+        kMaxExactFloatRank, ")"));
+  }
+
+  absl::flat_hash_map<std::string, std::pair<std::string, std::string>> recorded;
+  for (const auto& merge : merges) {
+    recorded[merge.left() + merge.right()] = {merge.left(), merge.right()};
+  }
+
+  // Native inference starts from a longest-prefix match over USER_DEFINED
+  // pieces and falls back to single characters. A multi-codepoint atom is
+  // therefore never produced as a starting unit, and no merge may build it.
+  for (const std::string& atom : atomic_pieces_ordered_) {
+    if (string_util::UTF8Len(atom) != 1) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "atomic alphabet symbol spans multiple Unicode scalars, which native "
+          "BPE cannot reconstruct: ",
+          atom));
+    }
+  }
+
+  // The decisive condition. An explicit program merges the pair (l, r); native
+  // inference merges any adjacent pair whose concatenation is in the
+  // vocabulary. They agree only when each piece admits a single such split.
+  for (const auto& piece : pieces) {
+    if (piece.type() != ModelProto::SentencePiece::NORMAL) continue;
+    const std::string& child = piece.piece();
+    const auto recorded_it = recorded.find(child);
+    int splits = 0;
+    std::string offending_left;
+    for (size_t cut = 1; cut < child.size(); ++cut) {
+      // Only cut on a UTF-8 character boundary: a piece split mid-sequence is
+      // not structurally valid and can never be in the vocabulary.
+      if ((static_cast<unsigned char>(child[cut]) & 0xC0) == 0x80) continue;
+      const std::string left = child.substr(0, cut);
+      const std::string right = child.substr(cut);
+      if (!normal.contains(left) || !normal.contains(right)) continue;
+      ++splits;
+      if (recorded_it == recorded.end() ||
+          recorded_it->second != std::make_pair(left, right)) {
+        offending_left = left;
+      }
+    }
+    if (recorded_it == recorded.end()) {
+      // An atom, or any piece the program never constructs. Native inference
+      // must have no way to build it either.
+      if (splits != 0) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "piece has no merge in the program but native BPE could build it "
+            "from vocabulary pieces (\"",
+            offending_left, "\" + ...): ", child));
+      }
+      continue;
+    }
+    if (splits != 1) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "piece admits ", splits,
+          " vocabulary splits, so native BPE may merge a pair the program does "
+          "not declare (e.g. \"",
+          offending_left, "\" + ...): ", child));
+    }
+  }
+
+  return absl::OkStatus();
+}
+
+absl::Status ContinuationTrainer::BuildNativeModel(
+    const std::vector<ExpansionMerge>& merges, ModelProto* model) const {
   std::vector<ExpansionPiece> pieces = base_pieces_;
   pieces.insert(pieces.end(), bootstrap_pieces_.begin(), bootstrap_pieces_.end());
   pieces.insert(pieces.end(), learned_pieces_.begin(), learned_pieces_.end());
@@ -809,12 +903,32 @@ absl::Status ContinuationTrainer::BuildNativeModel(ModelProto* model) const {
         "ExpansionResult is authoritative and no native ModelProto is emitted");
   }
 
+  ABSL_RETURN_IF_ERROR(VerifyNativeMergeEquivalence(pieces, merges));
+
+  // Scores are the merge program, re-expressed in the only ordering native
+  // inference reads. score = -rank makes "best score" and "lowest rank" the
+  // same relation, and the adapter's own scores are deliberately discarded:
+  // they order nothing here and keeping them would order the wrong thing.
+  absl::flat_hash_map<std::string, int> rank_of;
+  for (const auto& merge : merges) {
+    rank_of[merge.left() + merge.right()] = merge.rank();
+  }
+
   model->Clear();
   for (const auto& piece : pieces) {
     auto* out = model->add_pieces();
     out->set_piece(piece.piece());
-    out->set_score(piece.score());
     out->set_type(piece.type());
+    if (piece.type() != ModelProto::SentencePiece::NORMAL) {
+      out->set_score(0.0);
+      continue;
+    }
+    const auto it = rank_of.find(piece.piece());
+    // Atoms are never merge children and never compete for a merge, so they
+    // sit above every constructed piece, as they do in a natively trained BPE
+    // model.
+    out->set_score(it == rank_of.end() ? 0.0F
+                                       : -static_cast<float>(it->second));
   }
   *model->mutable_trainer_spec() = trainer_spec_;
   model->mutable_trainer_spec()->set_vocab_size(model->pieces_size());
@@ -914,7 +1028,7 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   }
 
   ModelProto native;
-  absl::Status native_status = BuildNativeModel(&native);
+  absl::Status native_status = BuildNativeModel(effective, &native);
   if (native_status.ok()) {
     *native.mutable_expansion_result() = result;
     if (output_model_proto_ != nullptr) {

@@ -5,7 +5,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -150,6 +154,73 @@ ExpansionSpec BasicAbcdSpec() {
   AddBaseMerge(&expansion, 0, "a", "b");
   AddBaseMerge(&expansion, 1, "c", "d");
   return expansion;
+}
+
+
+// ---------------------------------------------------------------------------
+// Native-model equivalence oracles.
+//
+// A continuation run is authoritative in its ExpansionResult and .merges. A
+// native .model is a second, weaker artifact: SentencePiece BPE inference does
+// not read a merge table at all, it merges whichever adjacent pair has the
+// best-scoring concatenation in the vocabulary. These tests pin both halves of
+// that contract - when a native model is emitted it must agree with the merge
+// program exactly, and when it cannot it must not be emitted at all.
+// ---------------------------------------------------------------------------
+
+bool FileExists(absl::string_view path) {
+  auto input = filesystem::NewReadableFile(path, true);
+  return input->status().ok();
+}
+
+void RemoveIfPresent(const std::string& path) { std::remove(path.c_str()); }
+
+// Every merge of the result, in effective rank order.
+std::vector<ExpansionMerge> EffectiveMerges(const ExpansionResult& result) {
+  std::vector<ExpansionMerge> merges;
+  for (const auto& m : result.base_merges()) merges.push_back(m);
+  for (const auto& m : result.bootstrap_merges()) merges.push_back(m);
+  for (const auto& m : result.learned_merges()) merges.push_back(m);
+  std::sort(merges.begin(), merges.end(),
+            [](const ExpansionMerge& a, const ExpansionMerge& b) {
+              return a.rank() < b.rank();
+            });
+  return merges;
+}
+
+// The authoritative reading of a merge program: repeatedly apply the declared
+// pair of lowest rank, leftmost occurrence first. This is what an external
+// rank-ordered tokenizer does, and what a native model has to reproduce.
+std::vector<std::string> SimulateMergeProgram(
+    const std::string& text, const std::vector<ExpansionMerge>& merges) {
+  std::map<std::pair<std::string, std::string>, int> rank;
+  for (const auto& merge : merges) {
+    rank[{merge.left(), merge.right()}] = merge.rank();
+  }
+
+  std::vector<std::string> symbols;
+  for (size_t i = 0; i < text.size();) {
+    const int len = std::min<int>(string_util::OneCharLen(text.data() + i),
+                                  text.size() - i);
+    symbols.push_back(text.substr(i, len));
+    i += len;
+  }
+
+  while (symbols.size() > 1) {
+    int best_rank = std::numeric_limits<int>::max();
+    size_t best_at = symbols.size();
+    for (size_t i = 0; i + 1 < symbols.size(); ++i) {
+      const auto it = rank.find({symbols[i], symbols[i + 1]});
+      if (it != rank.end() && it->second < best_rank) {
+        best_rank = it->second;
+        best_at = i;
+      }
+    }
+    if (best_at == symbols.size()) break;
+    symbols[best_at] += symbols[best_at + 1];
+    symbols.erase(symbols.begin() + best_at + 1);
+  }
+  return symbols;
 }
 
 TEST(BPEContinuationContractTest, ReplaysInheritedStateBeforeLearning) {
@@ -394,6 +465,144 @@ TrainerSpec UnigramContinuationSpec(absl::string_view input,
   spec.set_split_by_number(false);
   spec.set_shuffle_input_sentence(false);
   return spec;
+}
+
+
+TEST(BPEContinuationContractTest, NativeModelAgreesWithMergeProgram) {
+  const std::string input = TempPath("continuation_native_input.txt");
+  const std::string spec_path = TempPath("continuation_native.pb");
+  const std::string result_path = TempPath("continuation_native.result");
+  const std::string prefix = TempPath("continuation_native_model");
+  RemoveIfPresent(prefix + ".model");
+  ASSERT_TRUE(WriteLines(input, {"abcd", "abcd", "abcd"}));
+  ASSERT_TRUE(WriteProto(spec_path, BasicAbcdSpec()));
+
+  ASSERT_TRUE(RunTrainer(BpeContinuationSpec(input, spec_path, result_path,
+                                             prefix, 8),
+                         IdentityNormalizer())
+                  .ok());
+
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  const std::vector<ExpansionMerge> merges = EffectiveMerges(result);
+
+  // Every piece of the program is exactly one vocabulary split here, so a
+  // faithful native model is possible and must have been written.
+  ASSERT_TRUE(FileExists(prefix + ".model"))
+      << "expected an exactly-representable native model";
+
+  SentencePieceProcessor processor;
+  ASSERT_TRUE(processor.Load(prefix + ".model").ok());
+
+  for (const std::string& text : {"abcd", "abc", "abab", "dcba", "abcdabcd"}) {
+    std::vector<std::string> native;
+    ASSERT_TRUE(processor.Encode(text, &native).ok()) << text;
+    EXPECT_EQ(SimulateMergeProgram(text, merges), native)
+        << "native inference disagreed with the merge program on: " << text;
+  }
+}
+
+TEST(BPEContinuationContractTest, NativeScoresAreTheEffectiveRankProgram) {
+  const std::string input = TempPath("continuation_scores_input.txt");
+  const std::string spec_path = TempPath("continuation_scores.pb");
+  const std::string result_path = TempPath("continuation_scores.result");
+  const std::string prefix = TempPath("continuation_scores_model");
+  ASSERT_TRUE(WriteLines(input, {"abcd", "abcd", "abcd"}));
+  ASSERT_TRUE(WriteProto(spec_path, BasicAbcdSpec()));
+
+  ASSERT_TRUE(RunTrainer(BpeContinuationSpec(input, spec_path, result_path,
+                                             prefix, 8),
+                         IdentityNormalizer())
+                  .ok());
+
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  ModelProto model;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &model));
+
+  std::map<std::string, float> score;
+  for (const auto& piece : model.pieces()) score[piece.piece()] = piece.score();
+
+  // A merge child scores -rank, so "best score" and "lowest rank" are the same
+  // relation. The adapter's own scores order nothing and are discarded.
+  for (const auto& merge : EffectiveMerges(result)) {
+    const std::string child = merge.left() + merge.right();
+    ASSERT_TRUE(score.count(child)) << child;
+    EXPECT_FLOAT_EQ(-static_cast<float>(merge.rank()), score[child]) << child;
+  }
+  // Atoms are never merge children and never compete for a merge.
+  for (const std::string& atom : {"a", "b", "c", "d"}) {
+    ASSERT_TRUE(score.count(atom)) << atom;
+    EXPECT_FLOAT_EQ(0.0f, score[atom]) << atom;
+  }
+  // Learned ranks land after the whole inherited prefix.
+  ASSERT_EQ(1, result.learned_merges_size());
+  EXPECT_EQ(result.base_merges_size() + result.bootstrap_merges_size(),
+            result.learned_merges(0).rank());
+}
+
+TEST(BPEContinuationContractTest, RefusesNativeModelWhenSplitIsAmbiguous) {
+  // "abc" is reachable as both "a"+"bc" and "ab"+"c", and both halves of each
+  // are in the vocabulary. Native inference chooses by concatenation score, so
+  // it can take a pair this program never declares. The result and merge table
+  // stay authoritative; the misleading .model is not written.
+  for (const bool prepend : {false, true}) {
+    const std::string tag = prepend ? "prepend" : "append";
+    const std::string input = TempPath("continuation_ambig_" + tag + ".txt");
+    const std::string spec_path = TempPath("continuation_ambig_" + tag + ".pb");
+    const std::string result_path =
+        TempPath("continuation_ambig_" + tag + ".result");
+    const std::string prefix = TempPath("continuation_ambig_" + tag + "_model");
+    RemoveIfPresent(prefix + ".model");
+    ASSERT_TRUE(WriteLines(input, {"abc", "abc", "abc"}));
+    ASSERT_TRUE(WriteProto(spec_path, RankCompetitionSpec(prepend)));
+
+    ASSERT_TRUE(RunTrainer(BpeContinuationSpec(input, spec_path, result_path,
+                                               prefix, 7),
+                           IdentityNormalizer())
+                    .ok());
+
+    EXPECT_FALSE(FileExists(prefix + ".model"))
+        << "emitted a native model that cannot represent the program (" << tag
+        << ")";
+    // The authoritative artifacts are still produced.
+    EXPECT_TRUE(FileExists(result_path));
+    EXPECT_TRUE(FileExists(prefix + ".merges"));
+  }
+}
+
+TEST(BPEContinuationContractTest, RefusesNativeModelForMultiCodepointAtom) {
+  // Native inference starts from single characters (or frozen USER_DEFINED
+  // prefixes) and no merge may build an atom, so a multi-scalar atom can never
+  // be reconstructed natively.
+  const std::string input = TempPath("continuation_multiatom_input.txt");
+  const std::string spec_path = TempPath("continuation_multiatom.pb");
+  const std::string result_path = TempPath("continuation_multiatom.result");
+  const std::string prefix = TempPath("continuation_multiatom_model");
+  RemoveIfPresent(prefix + ".model");
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_requested_new_pieces(1);
+  AddPiece(&expansion, 0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false,
+           false);
+  AddPiece(&expansion, 1, "xy", ModelProto::SentencePiece::NORMAL, true, true);
+  AddPiece(&expansion, 2, "z", ModelProto::SentencePiece::NORMAL, true, true);
+  ASSERT_TRUE(WriteProto(spec_path, expansion));
+  ASSERT_TRUE(WriteLines(input, {"xyz", "xyz", "xyz"}));
+
+  ASSERT_TRUE(RunTrainer(BpeContinuationSpec(input, spec_path, result_path,
+                                             prefix, 4),
+                         IdentityNormalizer())
+                  .ok());
+
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  ASSERT_EQ(1, result.learned_pieces_size());
+  EXPECT_EQ("xyz", result.learned_pieces(0).piece());
+  EXPECT_FALSE(FileExists(prefix + ".model"));
 }
 
 TEST(UnigramContinuationContractTest, PreservesPriorIdsAndScoreGeometry) {
