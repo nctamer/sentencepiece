@@ -44,6 +44,9 @@ class ContinuationTrainer : public TrainerInterface {
   };
 
   absl::Status LoadAndValidatePrior();
+  // Decides between inheriting the prior's normalization, accepting an
+  // identical caller request, and refusing a conflicting one.
+  absl::Status ReconcileNormalization();
   absl::Status VerifyCorpusCoverage() const;
   absl::Status MakeWeightedExtensionCandidates();
   absl::Status InitializeContinuationScores();
@@ -54,15 +57,21 @@ class ContinuationTrainer : public TrainerInterface {
   absl::Status RunConstrainedMStep(const std::vector<float>& expected,
                                    std::vector<ExtensionCandidate>* extensions,
                                    double* lambda) const;
-  double SolveInitialLambda(
-      const std::vector<ExtensionCandidate>& extensions) const;
-  double SolveMStepLambda(const std::vector<float>& expected,
-                          size_t extension_count) const;
+  // Both lambdas are roots of monotone objectives. They report failure
+  // instead of returning a bracket endpoint that merely ran out of iterations.
+  absl::Status SolveInitialLambda(
+      const std::vector<ExtensionCandidate>& extensions, double* lambda) const;
+  absl::Status SolveMStepLambda(const std::vector<float>& expected,
+                                size_t extension_count, double* lambda) const;
   double LogBaseMass(double lambda) const;
   double BaseMass(double lambda, double* derivative) const;
   ModelProto BuildWorkingModel(
       const std::vector<ExtensionCandidate>& extensions,
       double lambda) const;
+  // Proves, before anything is written, that every inherited ID kept its
+  // string, its type and - for NORMAL pieces - the one shared additive-length
+  // gauge. A violation fails the run; it is not merely reported.
+  absl::Status VerifyPriorPrefixInvariant(const ModelProto& output) const;
   absl::Status FinalizeArtifacts();
 
   ModelProto prior_model_;

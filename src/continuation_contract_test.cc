@@ -945,6 +945,240 @@ TEST(UnigramContinuationContractTest, WeightedTsvMatchesPhysicalRepetition) {
               tsv_expansion.unigram_lambda(), 1e-10);
 }
 
+
+// ---------------------------------------------------------------------------
+// Unigram continuation: the prior is authoritative, and that has to be
+// enforced rather than assumed.
+// ---------------------------------------------------------------------------
+
+// A prior with genuinely competing inherited paths: "ab" is a piece, and so
+// are "a" and "b", so the same string has two inherited-only segmentations
+// whose scores can be compared before and after continuation.
+ModelProto MakeMultiPathUnigramPrior() {
+  ModelProto prior;
+  TrainerSpec* trainer = prior.mutable_trainer_spec();
+  trainer->set_model_type(TrainerSpec::UNIGRAM);
+  trainer->set_vocab_size(4);
+  trainer->set_unk_id(0);
+  trainer->set_bos_id(-1);
+  trainer->set_eos_id(-1);
+  trainer->set_pad_id(-1);
+  trainer->set_split_by_whitespace(false);
+  trainer->set_split_by_unicode_script(false);
+  trainer->set_split_by_number(false);
+  *prior.mutable_normalizer_spec() = IdentityNormalizer();
+
+  struct Entry {
+    const char* piece;
+    float score;
+    ModelProto::SentencePiece::Type type;
+  };
+  // score(ab) - (score(a) + score(b)) = -2.5 - (-3.0) = +0.5, so "ab" wins its
+  // own Viterbi while "a" + "b" stays a real alternative.
+  for (const Entry& e :
+       {Entry{"<unk>", 0.0f, ModelProto::SentencePiece::UNKNOWN},
+        Entry{"a", -1.0f, ModelProto::SentencePiece::NORMAL},
+        Entry{"b", -2.0f, ModelProto::SentencePiece::NORMAL},
+        Entry{"ab", -2.5f, ModelProto::SentencePiece::NORMAL}}) {
+    auto* piece = prior.add_pieces();
+    piece->set_piece(e.piece);
+    piece->set_score(e.score);
+    piece->set_type(e.type);
+  }
+  return prior;
+}
+
+double ScoreOf(const ModelProto& model, absl::string_view piece) {
+  for (const auto& p : model.pieces()) {
+    if (p.piece() == piece) return p.score();
+  }
+  ADD_FAILURE() << "piece missing from model: " << piece;
+  return std::numeric_limits<double>::quiet_NaN();
+}
+
+// The gauge exists so inherited segmentation decisions survive continuation.
+// The observable form of that promise is a score DIFFERENCE between two
+// inherited paths over the same string, which must not move at all.
+TEST(UnigramContinuationContractTest, InheritedPathGeometryIsUnchanged) {
+  const std::string input = TempPath("continuation_uni_geom_input.txt");
+  const std::string prior_path = TempPath("continuation_uni_geom.prior");
+  const std::string result_path = TempPath("continuation_uni_geom.result");
+  const std::string prefix = TempPath("continuation_uni_geom_model");
+
+  const ModelProto prior = MakeMultiPathUnigramPrior();
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  // "abab" gives the extension something worth learning.
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(40, "abab")));
+
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(6);  // four inherited + two extensions
+  ASSERT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  ModelProto output;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &output));
+
+  const double delta_before =
+      ScoreOf(prior, "ab") - (ScoreOf(prior, "a") + ScoreOf(prior, "b"));
+  const double delta_after =
+      ScoreOf(output, "ab") - (ScoreOf(output, "a") + ScoreOf(output, "b"));
+  EXPECT_NEAR(delta_before, delta_after, 1e-5)
+      << "continuation moved inherited paths relative to each other";
+
+  // And the decision that difference encodes is still the decision taken.
+  SentencePieceProcessor processor;
+  ASSERT_TRUE(processor.Load(prefix + ".model").ok());
+  std::vector<std::string> pieces;
+  ASSERT_TRUE(processor.Encode("ab", &pieces).ok());
+  EXPECT_EQ(std::vector<std::string>({"ab"}), pieces);
+
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  // Every inherited ID, string and type is untouched, and extensions append.
+  ASSERT_GE(output.pieces_size(), prior.pieces_size());
+  for (int id = 0; id < prior.pieces_size(); ++id) {
+    EXPECT_EQ(prior.pieces(id).piece(), output.pieces(id).piece()) << id;
+    EXPECT_EQ(prior.pieces(id).type(), output.pieces(id).type()) << id;
+  }
+  EXPECT_EQ(prior.pieces_size(), result.prior_piece_count());
+}
+
+// A run that is asked for no extension must hand the prior back unchanged -
+// no recalibration, no invented pieces, not even a nonzero gauge.
+TEST(UnigramContinuationContractTest, ZeroExtensionReturnsThePriorUnchanged) {
+  const std::string input = TempPath("continuation_uni_noop_input.txt");
+  const std::string prior_path = TempPath("continuation_uni_noop.prior");
+  const std::string result_path = TempPath("continuation_uni_noop.result");
+  const std::string prefix = TempPath("continuation_uni_noop_model");
+
+  const ModelProto prior = MakeMultiPathUnigramPrior();
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(20, "abab")));
+
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(prior.pieces_size());  // nothing left to learn
+  ASSERT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  ModelProto output;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &output));
+  ASSERT_EQ(prior.pieces_size(), output.pieces_size());
+  for (int id = 0; id < prior.pieces_size(); ++id) {
+    EXPECT_EQ(prior.pieces(id).piece(), output.pieces(id).piece()) << id;
+    EXPECT_EQ(prior.pieces(id).type(), output.pieces(id).type()) << id;
+    EXPECT_FLOAT_EQ(prior.pieces(id).score(), output.pieces(id).score()) << id;
+  }
+
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  EXPECT_EQ(0, result.learned_pieces_size());
+  EXPECT_EQ(0, result.actual_new_pieces());
+  EXPECT_DOUBLE_EQ(0.0, result.unigram_lambda());
+}
+
+TEST(UnigramContinuationContractTest, DeterministicAcrossRunsAndThreadCounts) {
+  const std::string input = TempPath("continuation_uni_det_input.txt");
+  const std::string prior_path = TempPath("continuation_uni_det.prior");
+  ASSERT_TRUE(WriteProto(prior_path, MakeMultiPathUnigramPrior()));
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(60, "abab")));
+
+  auto run = [&](int num_threads, const std::string& tag) {
+    const std::string result_path =
+        TempPath("continuation_uni_det_" + tag + ".result");
+    const std::string prefix =
+        TempPath("continuation_uni_det_" + tag + "_model");
+    TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                  result_path, prefix);
+    trainer.set_vocab_size(6);
+    trainer.set_num_threads(num_threads);
+    EXPECT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+    ModelProto output;
+    EXPECT_TRUE(ReadProto(prefix + ".model", &output));
+    return output;
+  };
+
+  // The piece table is the model. trainer_spec carries the output path, which
+  // necessarily differs between two runs writing to two places.
+  auto piece_table = [](const ModelProto& model) {
+    ModelProto pieces_only;
+    *pieces_only.mutable_pieces() = model.pieces();
+    return pieces_only.SerializeAsString();
+  };
+
+  const ModelProto first = run(1, "a");
+  const ModelProto again = run(1, "b");
+  EXPECT_EQ(piece_table(first), piece_table(again))
+      << "identical inputs produced different models";
+  EXPECT_DOUBLE_EQ(first.expansion_result().unigram_lambda(),
+                   again.expansion_result().unigram_lambda());
+
+  // Thread count is a scheduling detail, not a modelling one.
+  const ModelProto threaded = run(4, "c");
+  ASSERT_EQ(first.pieces_size(), threaded.pieces_size());
+  for (int id = 0; id < first.pieces_size(); ++id) {
+    EXPECT_EQ(first.pieces(id).piece(), threaded.pieces(id).piece()) << id;
+    EXPECT_EQ(first.pieces(id).type(), threaded.pieces(id).type()) << id;
+    EXPECT_NEAR(first.pieces(id).score(), threaded.pieces(id).score(), 1e-4)
+        << id;
+  }
+}
+
+// Normalization is inherited, but a caller who asked for something else is
+// told, not overruled in silence.
+TEST(UnigramContinuationContractTest, NormalizationConflictIsRejected) {
+  const std::string input = TempPath("continuation_uni_norm_input.txt");
+  const std::string prior_path = TempPath("continuation_uni_norm.prior");
+  const std::string result_path = TempPath("continuation_uni_norm.result");
+  const std::string prefix = TempPath("continuation_uni_norm_model");
+  ASSERT_TRUE(WriteProto(prior_path, MakeMultiPathUnigramPrior()));
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(20, "abab")));
+
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(6);
+
+  // Unspecified: inherit the prior.
+  EXPECT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  // Exactly the prior's: accepted.
+  EXPECT_TRUE(RunTrainer(trainer, IdentityNormalizer()).ok());
+
+  // Populated and different: refused before training.
+  NormalizerSpec conflicting = IdentityNormalizer();
+  conflicting.set_add_dummy_prefix(true);
+  const absl::Status status = RunTrainer(trainer, conflicting);
+  EXPECT_EQ(absl::StatusCode::kFailedPrecondition, status.code()) << status;
+
+  NormalizerSpec renamed = IdentityNormalizer();
+  renamed.set_name("nmt_nfkc");
+  EXPECT_FALSE(RunTrainer(trainer, renamed).ok());
+}
+
+// A prior carrying a non-default normalizer must still be honoured verbatim.
+TEST(UnigramContinuationContractTest, CustomPriorNormalizerIsCarriedThrough) {
+  const std::string input = TempPath("continuation_uni_cnorm_input.txt");
+  const std::string prior_path = TempPath("continuation_uni_cnorm.prior");
+  const std::string result_path = TempPath("continuation_uni_cnorm.result");
+  const std::string prefix = TempPath("continuation_uni_cnorm_model");
+
+  ModelProto prior = MakeMultiPathUnigramPrior();
+  // Not the identity spec the other priors use, and not the CLI default.
+  prior.mutable_normalizer_spec()->set_name("intermo_custom");
+  prior.mutable_normalizer_spec()->set_remove_extra_whitespaces(true);
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(20, "abab")));
+
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(6);
+  ASSERT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  ModelProto output;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &output));
+  EXPECT_EQ("intermo_custom", output.normalizer_spec().name());
+  EXPECT_TRUE(output.normalizer_spec().remove_extra_whitespaces());
+}
+
 TEST(ContinuationContractTest, DeterministicBpeResultBytes) {
   const ExpansionSpec expansion = BasicAbcdSpec();
   std::string first_bytes;

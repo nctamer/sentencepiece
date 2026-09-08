@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -32,6 +33,89 @@ namespace sentencepiece::unigram {
 namespace {
 
 bool Finite(double x) { return std::isfinite(x); }
+
+// Deterministic bracketed bisection for a monotone objective.
+//
+// Every continuation lambda is the root of a monotone function, so a bracket
+// plus halving is enough - and it is reproducible, which a general-purpose
+// optimizer would not be. The point of doing it by hand is that each way the
+// search can fail becomes a distinct status instead of a returned endpoint:
+// a bracket that never changes sign, an objective that leaves the finite
+// range, and an interval that stays wide are three different bugs and read as
+// three different messages.
+absl::Status BisectMonotoneRoot(absl::string_view what,
+                                const std::function<double(double)>& f,
+                                bool increasing, double seed_lo,
+                                double seed_hi, double* root) {
+  constexpr int kMaxExpansions = 400;
+  constexpr int kMaxRefinements = 200;
+
+  // Work with an increasing view so the bracket logic has one shape.
+  const auto oriented = [&](double x) {
+    const double value = f(x);
+    return increasing ? value : -value;
+  };
+
+  double lo = seed_lo;
+  double hi = seed_hi;
+  double f_lo = oriented(lo);
+  double f_hi = oriented(hi);
+
+  int expansions = 0;
+  while (Finite(f_lo) && f_lo > 0.0 && expansions < kMaxExpansions) {
+    hi = lo;
+    f_hi = f_lo;
+    lo -= std::max(1.0, std::abs(lo));
+    f_lo = oriented(lo);
+    ++expansions;
+  }
+  while (Finite(f_hi) && f_hi < 0.0 && expansions < kMaxExpansions) {
+    lo = hi;
+    f_lo = f_hi;
+    hi += std::max(1.0, std::abs(hi));
+    f_hi = oriented(hi);
+    ++expansions;
+  }
+
+  if (!Finite(f_lo) || !Finite(f_hi)) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        what, ": objective left the finite range while bracketing (lambda=",
+        lo, " gives ", f_lo, ", lambda=", hi, " gives ", f_hi, ")"));
+  }
+  if (!(f_lo <= 0.0 && f_hi >= 0.0)) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        what, ": no sign change over [", lo, ", ", hi,
+        "] after ", expansions,
+        " expansions, so the root is not bracketed and no lambda can be "
+        "reported"));
+  }
+
+  for (int i = 0; i < kMaxRefinements; ++i) {
+    const double mid = 0.5 * (lo + hi);
+    // Halving stops meaning anything once mid stops being interior.
+    if (!(mid > lo && mid < hi)) break;
+    const double f_mid = oriented(mid);
+    if (!Finite(f_mid)) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          what, ": objective became non-finite at lambda=", mid));
+    }
+    if (f_mid < 0.0) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+
+  const double width = hi - lo;
+  if (!Finite(width) ||
+      width > std::max(1e-9, 1e-9 * std::max(std::abs(lo), std::abs(hi)))) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        what, ": bisection did not converge; bracket [", lo, ", ", hi,
+        "] is still ", width, " wide"));
+  }
+  *root = 0.5 * (lo + hi);
+  return absl::OkStatus();
+}
 
 double CandidateScore(absl::string_view piece, uint64_t freq) {
   const double len = static_cast<double>(string_util::UTF8Len(piece));
@@ -113,14 +197,104 @@ absl::Status ContinuationTrainer::LoadAndValidatePrior() {
     return absl::InvalidArgumentError("prior has no NORMAL Unigram pieces");
   }
 
-  // The prior ModelProto is authoritative for normalization. This avoids the
-  // CLI trap where default normalization flags accidentally disagree with a
-  // custom pretrained tokenizer even though the user supplied the exact prior
-  // model. Continuation does not silently invent a new normalization regime.
-  normalizer_spec_ = prior_model_.normalizer_spec();
-  denormalizer_spec_ = prior_model_.denormalizer_spec();
-  trainer_spec_.set_treat_whitespace_as_suffix(
-      prior_model_.trainer_spec().treat_whitespace_as_suffix());
+  // The prior ModelProto is authoritative for normalization: continuation
+  // never invents a new normalization regime, because inherited scores are
+  // only meaningful over the text the prior was fitted on.
+  //
+  // Authoritative is not the same as silent. A caller who left normalization
+  // alone gets the prior's. A caller who asked for exactly the prior's gets
+  // it too. A caller who asked for something else has stated a requirement
+  // this trainer cannot honour, and is told so rather than having the request
+  // quietly discarded.
+  //
+  // "Left alone" has to be judged by value, not by field presence: the CLI
+  // sets every normalization field on every run, so presence would report
+  // "explicit" for a command line that never mentioned normalization.
+  ABSL_RETURN_IF_ERROR(ReconcileNormalization());
+  return absl::OkStatus();
+}
+
+namespace {
+
+// Compares the fields that decide what normalization actually does.
+// normalization_rule_tsv is excluded: it is an input to compilation, and is
+// represented by precompiled_charsmap once compiled.
+bool NormalizationEquivalent(const NormalizerSpec& a, const NormalizerSpec& b) {
+  return a.name() == b.name() &&
+         a.precompiled_charsmap() == b.precompiled_charsmap() &&
+         a.add_dummy_prefix() == b.add_dummy_prefix() &&
+         a.remove_extra_whitespaces() == b.remove_extra_whitespaces() &&
+         a.escape_whitespaces() == b.escape_whitespaces();
+}
+
+// A spec nobody populated. Production callers reach the trainer through
+// SentencePieceTrainer::Train, which fills these in, so this is the shape of a
+// direct caller who simply did not ask for normalization.
+bool NormalizationUnspecified(const NormalizerSpec& spec) {
+  return spec.name().empty() && spec.precompiled_charsmap().empty() &&
+         spec.normalization_rule_tsv().empty();
+}
+
+std::string DescribeNormalization(const NormalizerSpec& spec) {
+  return absl::StrCat("name=", spec.name(),
+                      " add_dummy_prefix=", spec.add_dummy_prefix(),
+                      " remove_extra_whitespaces=",
+                      spec.remove_extra_whitespaces(),
+                      " escape_whitespaces=", spec.escape_whitespaces(),
+                      " charsmap_bytes=", spec.precompiled_charsmap().size());
+}
+
+}  // namespace
+
+absl::Status ContinuationTrainer::ReconcileNormalization() {
+  const NormalizerSpec& prior_normalizer = prior_model_.normalizer_spec();
+  const NormalizerSpec& prior_denormalizer = prior_model_.denormalizer_spec();
+
+  // What a caller who said nothing about normalization ends up with.
+  NormalizerSpec default_normalizer;
+  ABSL_RETURN_IF_ERROR(
+      SentencePieceTrainer::PopulateNormalizerSpec(&default_normalizer));
+
+  if (!NormalizationUnspecified(normalizer_spec_) &&
+      !NormalizationEquivalent(normalizer_spec_, prior_normalizer) &&
+      !NormalizationEquivalent(normalizer_spec_, default_normalizer)) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "continuation normalization conflict: the prior model is "
+        "authoritative but the caller asked for a different normalizer. "
+        "prior [", DescribeNormalization(prior_normalizer), "] caller [",
+        DescribeNormalization(normalizer_spec_),
+        "]. Drop the normalization flags to inherit the prior's, or pass "
+        "exactly the prior's."));
+  }
+
+  // A denormalizer is opt-in, so "unset" is genuinely detectable here.
+  const bool caller_set_denormalizer =
+      !denormalizer_spec_.normalization_rule_tsv().empty() ||
+      !denormalizer_spec_.precompiled_charsmap().empty();
+  if (caller_set_denormalizer &&
+      !NormalizationEquivalent(denormalizer_spec_, prior_denormalizer)) {
+    return absl::FailedPreconditionError(
+        "continuation denormalization conflict: the prior model's "
+        "denormalizer is authoritative and the caller supplied a different "
+        "one");
+  }
+
+  // Whitespace placement is part of the same contract: it decides what the
+  // inherited pieces mean, so it cannot be re-chosen per continuation run.
+  const bool prior_suffix =
+      prior_model_.trainer_spec().treat_whitespace_as_suffix();
+  if (trainer_spec_.treat_whitespace_as_suffix() != prior_suffix &&
+      trainer_spec_.treat_whitespace_as_suffix() !=
+          TrainerSpec::default_instance().treat_whitespace_as_suffix()) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "continuation conflict: prior model has treat_whitespace_as_suffix=",
+        prior_suffix, " but the caller asked for ",
+        trainer_spec_.treat_whitespace_as_suffix()));
+  }
+
+  normalizer_spec_ = prior_normalizer;
+  denormalizer_spec_ = prior_denormalizer;
+  trainer_spec_.set_treat_whitespace_as_suffix(prior_suffix);
   return absl::OkStatus();
 }
 
@@ -288,8 +462,8 @@ double ContinuationTrainer::BaseMass(double lambda,
   return mass;
 }
 
-double ContinuationTrainer::SolveInitialLambda(
-    const std::vector<ExtensionCandidate>& extensions) const {
+absl::Status ContinuationTrainer::SolveInitialLambda(
+    const std::vector<ExtensionCandidate>& extensions, double* lambda) const {
   auto log_mass = [&](double lambda) {
     double max_term = -std::numeric_limits<double>::infinity();
     for (const auto& piece : inherited_normal_) {
@@ -313,19 +487,10 @@ double ContinuationTrainer::SolveInitialLambda(
     return max_term + std::log(sum);
   };
 
-  double hi = 0.0;
-  for (int i = 0; i < 200 && log_mass(hi) < 0.0; ++i) hi += 1.0;
-  double lo = hi - 1.0;
-  for (int i = 0; i < 400 && log_mass(lo) > 0.0; ++i) lo -= 1.0;
-  for (int i = 0; i < 120; ++i) {
-    const double mid = 0.5 * (lo + hi);
-    if (log_mass(mid) > 0.0) {
-      hi = mid;
-    } else {
-      lo = mid;
-    }
-  }
-  return 0.5 * (lo + hi);
+  // Total mass over inherited and candidate pieces rises with lambda, and the
+  // initial gauge is the lambda that makes it exactly one.
+  return BisectMonotoneRoot("initial continuation lambda", log_mass,
+                            /*increasing=*/true, -1.0, 1.0, lambda);
 }
 
 absl::Status ContinuationTrainer::InitializeContinuationScores() {
@@ -372,7 +537,8 @@ absl::Status ContinuationTrainer::InitializeContinuationScores() {
         "insufficient extension candidates have an inherited NORMAL decomposition");
   }
 
-  lambda_ = SolveInitialLambda(extension_candidates_);
+  ABSL_RETURN_IF_ERROR(
+      SolveInitialLambda(extension_candidates_, &lambda_));
   for (auto& candidate : extension_candidates_) {
     const int len = static_cast<int>(string_util::UTF8Len(candidate.piece));
     candidate.score = candidate.inherited_best_score + lambda_ * len;
@@ -425,8 +591,9 @@ absl::Status ContinuationTrainer::RunEStep(
   return absl::OkStatus();
 }
 
-double ContinuationTrainer::SolveMStepLambda(
-    const std::vector<float>& expected, size_t extension_count) const {
+absl::Status ContinuationTrainer::SolveMStepLambda(
+    const std::vector<float>& expected, size_t extension_count,
+    double* lambda) const {
   double l0 = 0.0;
   for (const auto& piece : inherited_normal_) {
     l0 += static_cast<double>(expected[piece.external_id]) *
@@ -438,23 +605,19 @@ double ContinuationTrainer::SolveMStepLambda(
     ca += expected[base_n + i];
   }
 
-  double boundary_lo = -100.0;
-  double boundary_hi = 100.0;
-  for (int i = 0; i < 20 && LogBaseMass(boundary_lo) > 0.0; ++i) {
-    boundary_lo *= 2.0;
+  if (!Finite(l0) || !Finite(ca) || l0 < 0.0 || ca < 0.0) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "constrained M-step received invalid expected counts: inherited "
+        "additive length ", l0, ", extension mass ", ca));
   }
-  for (int i = 0; i < 20 && LogBaseMass(boundary_hi) < 0.0; ++i) {
-    boundary_hi *= 2.0;
-  }
-  for (int i = 0; i < 120; ++i) {
-    const double mid = 0.5 * (boundary_lo + boundary_hi);
-    if (LogBaseMass(mid) > 0.0) {
-      boundary_hi = mid;
-    } else {
-      boundary_lo = mid;
-    }
-  }
-  const double boundary = 0.5 * (boundary_lo + boundary_hi);
+
+  // The upper boundary: the lambda at which inherited NORMAL mass is exactly
+  // one, leaving nothing for extensions. Every admissible lambda is below it.
+  const auto log_base_mass = [this](double x) { return LogBaseMass(x); };
+  double boundary = 0.0;
+  ABSL_RETURN_IF_ERROR(BisectMonotoneRoot(
+      "inherited-mass boundary lambda", log_base_mass, /*increasing=*/true,
+      -1.0, 1.0, &boundary));
 
   // If no extension token was used, the constrained optimum is the upper
   // boundary where inherited NORMAL mass is one. Conversely, if extensions
@@ -462,16 +625,21 @@ double ContinuationTrainer::SolveMStepLambda(
   // monotone toward lambda -> -infinity: inherited mass must go to zero rather
   // than to one. Represent that limiting solution by a deterministic finite
   // lambda whose inherited mass is <= 1e-30.
-  if (ca <= 1e-30) return boundary;
+  if (ca <= 1e-30) {
+    *lambda = boundary;
+    return absl::OkStatus();
+  }
   if (l0 <= 1e-30) {
+    // Extensions carry every count and the inherited side carries none, so the
+    // objective is monotone toward lambda -> -infinity. Stand in for that
+    // limit with the deterministic finite lambda whose inherited mass is 1e-30.
     constexpr double kTargetLogBaseMass = -69.07755278982137;  // log(1e-30)
-    double step = 1.0;
-    double lo = boundary - step;
-    for (int i = 0; i < 200 && LogBaseMass(lo) > kTargetLogBaseMass; ++i) {
-      step *= 2.0;
-      lo = boundary - step;
-    }
-    return lo;
+    const auto shifted = [this](double x) {
+      return LogBaseMass(x) - kTargetLogBaseMass;
+    };
+    return BisectMonotoneRoot("degenerate continuation lambda", shifted,
+                              /*increasing=*/true, boundary - 1.0, boundary,
+                              lambda);
   }
 
   auto derivative = [&](double lambda) {
@@ -483,22 +651,11 @@ double ContinuationTrainer::SolveMStepLambda(
     return l0 - ca * zprime / std::max(1e-300, 1.0 - z);
   };
 
-  double hi = boundary - 1e-10;
-  double lo = hi - 1.0;
-  double step = 1.0;
-  for (int i = 0; i < 200 && derivative(lo) < 0.0; ++i) {
-    step *= 2.0;
-    lo = hi - step;
-  }
-  for (int i = 0; i < 120; ++i) {
-    const double mid = 0.5 * (lo + hi);
-    if (derivative(mid) > 0.0) {
-      lo = mid;
-    } else {
-      hi = mid;
-    }
-  }
-  return 0.5 * (lo + hi);
+  // The stationary point of the constrained objective. The derivative falls
+  // with lambda, so the root is bracketed from below.
+  const double hi = boundary - 1e-10;
+  return BisectMonotoneRoot("constrained M-step lambda", derivative,
+                            /*increasing=*/false, hi - 1.0, hi, lambda);
 }
 
 absl::Status ContinuationTrainer::RunConstrainedMStep(
@@ -509,9 +666,15 @@ absl::Status ContinuationTrainer::RunConstrainedMStep(
     return absl::InternalError("continuation expected-count shape mismatch");
   }
 
-  *lambda = SolveMStepLambda(expected, extensions->size());
+  ABSL_RETURN_IF_ERROR(
+      SolveMStepLambda(expected, extensions->size(), lambda));
   double derivative = 0.0;
   const double base_mass = BaseMass(*lambda, &derivative);
+  if (!Finite(base_mass) || !(base_mass > 0.0) || !(base_mass <= 1.0)) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "constrained M-step produced an invalid inherited mass ", base_mass,
+        " at lambda=", *lambda, "; it must lie in (0, 1]"));
+  }
   const double epsilon = std::max(1e-300, 1.0 - base_mass);
 
   const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
@@ -622,6 +785,79 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
   return absl::OkStatus();
 }
 
+absl::Status ContinuationTrainer::VerifyPriorPrefixInvariant(
+    const ModelProto& output) const {
+  const int prior_n = prior_model_.pieces_size();
+  if (output.pieces_size() < prior_n) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "continuation output has ", output.pieces_size(),
+        " pieces, fewer than the prior's ", prior_n));
+  }
+
+  // Identity first: an inherited ID keeps its index, its bytes and its type.
+  // Anything else silently repoints an embedding row.
+  for (int id = 0; id < prior_n; ++id) {
+    const auto& prior = prior_model_.pieces(id);
+    const auto& out = output.pieces(id);
+    if (out.piece() != prior.piece()) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "inherited piece at ID ", id, " changed from \"", prior.piece(),
+          "\" to \"", out.piece(), "\""));
+    }
+    if (out.type() != prior.type()) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "inherited piece \"", prior.piece(), "\" (ID ", id,
+          ") changed type from ", static_cast<int>(prior.type()), " to ",
+          static_cast<int>(out.type())));
+    }
+    if (prior.type() != ModelProto::SentencePiece::NORMAL &&
+        out.score() != prior.score()) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "inherited non-NORMAL piece \"", prior.piece(), "\" (ID ", id,
+          ") had its score changed from ", prior.score(), " to ",
+          out.score()));
+    }
+  }
+
+  // Geometry second: every inherited NORMAL score moved by the SAME gauge,
+  // lambda * length. That single degree of freedom is what lets inherited
+  // segmentation decisions survive continuation, so a per-piece drift here is
+  // a silent re-estimation, not a rounding detail.
+  for (const auto& inherited : inherited_normal_) {
+    const double prior_score = inherited.prior_score;
+    const double expected_shift = lambda_ * inherited.additive_length;
+    const double actual_shift =
+        static_cast<double>(output.pieces(inherited.external_id).score()) -
+        prior_score;
+    // The score is stored as float32, so one rounding of (prior + shift) is
+    // unavoidable and is the whole budget.
+    const double magnitude =
+        std::max({std::abs(prior_score), std::abs(expected_shift),
+                  std::abs(prior_score + expected_shift), 1.0});
+    const double tolerance =
+        8.0 * static_cast<double>(std::numeric_limits<float>::epsilon()) *
+        magnitude;
+    if (!Finite(actual_shift) ||
+        std::abs(actual_shift - expected_shift) > tolerance) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "inherited NORMAL piece \"", inherited.piece, "\" (ID ",
+          inherited.external_id, ") violates the additive-length gauge: "
+          "expected shift ", expected_shift, " (lambda=", lambda_,
+          " * length=", inherited.additive_length, ") but the score moved by ",
+          actual_shift, ", which exceeds the float32 tolerance ", tolerance));
+    }
+  }
+
+  // Extensions append, never interleave.
+  for (int id = prior_n; id < output.pieces_size(); ++id) {
+    if (output.pieces(id).type() != ModelProto::SentencePiece::NORMAL) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "extension piece at ID ", id, " is not NORMAL"));
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ContinuationTrainer::FinalizeArtifacts() {
   ExpansionResult result;
   result.set_schema_version(1);
@@ -695,6 +931,10 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   *output.mutable_normalizer_spec() = prior_model_.normalizer_spec();
   *output.mutable_denormalizer_spec() = prior_model_.denormalizer_spec();
   *output.mutable_expansion_result() = result;
+
+  // Nothing is written until the prior prefix has been proven intact. A
+  // recorded max error is a report; this is the gate.
+  ABSL_RETURN_IF_ERROR(VerifyPriorPrefixInvariant(output));
 
   const std::string result_path = !trainer_spec_.expansion_result().empty()
                                       ? trainer_spec_.expansion_result()
