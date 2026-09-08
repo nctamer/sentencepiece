@@ -40,10 +40,10 @@
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "filesystem.h"
+#include "libsais.h"
 #include "normalizer.h"
 #include "ret_check.h"
 #include "sentencepiece_trainer.h"
-#include "libsais.h"
 #include "trainer_interface.h"
 #include "unicode_script.h"
 #include "util.h"
@@ -875,6 +875,10 @@ absl::Status Trainer::Train() {
   ABSL_RETURN_IF_ERROR(LoadSentences());
   if (!absl::GetFlag(FLAGS_auto_character_coverage)) {
     RET_CHECK(!required_chars_.empty());
+  } else {
+    RET_CHECK(absl::GetFlag(FLAGS_use_sparse_pruning))
+        << "--auto_character_coverage in UNIGRAM mode requires "
+           "--use_sparse_pruning=true.";
   }
 
   // LEGACY protected_pieces_file. Fresh-training protection only: these

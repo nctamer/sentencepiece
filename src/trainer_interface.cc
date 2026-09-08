@@ -122,6 +122,16 @@ absl::Status VerifySpec(const TrainerSpec& trainer_spec,
     RET_CHECK(!legacy_seed_merges ||
               trainer_spec.model_type() == TrainerSpec::BPE)
         << "seed_merges_file is only supported for BPE model.";
+
+    // auto_character_coverage selects a SUBSET of merge candidates by a global
+    // objective, which can drop a protected piece. Protection is the whole
+    // meaning of the flag, so the combination is refused rather than allowed
+    // to violate it quietly.
+    RET_CHECK(!(legacy_protected &&
+                absl::GetFlag(FLAGS_auto_character_coverage)))
+        << "protected_pieces_file cannot be combined with "
+           "auto_character_coverage: global search prunes candidates and "
+           "would not honour the protection guarantee.";
   }
 
 #define CHECK_RANGE(variable, minval, maxval) \
@@ -155,8 +165,15 @@ absl::Status VerifySpec(const TrainerSpec& trainer_spec,
   }
 
   if (absl::GetFlag(FLAGS_auto_character_coverage)) {
-    RET_CHECK(trainer_spec.model_type() == TrainerSpec::UNIGRAM)
-        << "--auto_character_coverage is only supported in UNIGRAM model mode.";
+    RET_CHECK(trainer_spec.model_type() == TrainerSpec::UNIGRAM ||
+              trainer_spec.model_type() == TrainerSpec::BPE)
+        << "--auto_character_coverage is only supported in UNIGRAM or BPE "
+           "model mode.";
+    if (trainer_spec.model_type() == TrainerSpec::UNIGRAM) {
+      RET_CHECK(absl::GetFlag(FLAGS_use_sparse_pruning))
+          << "--auto_character_coverage in UNIGRAM mode requires "
+             "--use_sparse_pruning=true.";
+    }
     RET_CHECK(trainer_spec.byte_fallback())
         << "--auto_character_coverage requires --byte_fallback=true.";
     RET_CHECK(trainer_spec.required_chars().empty())

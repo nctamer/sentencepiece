@@ -599,4 +599,63 @@ TEST(TrainerInterfaceTest, MultiFileSentenceIteratorErrorTest) {
   EXPECT_FALSE(it.status().ok());
 }
 
+TEST(TrainerInterfaceTest, AutoCharacterCoverageVerifySpecTest) {
+  TrainerSpec trainer_spec;
+  NormalizerSpec normalizer_spec;
+  NormalizerSpec denormalizer_spec;
+  trainer_spec.set_model_prefix("model");
+  trainer_spec.add_input("input");
+  trainer_spec.set_byte_fallback(true);
+
+  // Default: UNIGRAM with discrete pruning is valid.
+  {
+    absl::SetFlag(&FLAGS_auto_character_coverage, false);
+    absl::SetFlag(&FLAGS_use_sparse_pruning, false);
+    trainer_spec.set_model_type(TrainerSpec::UNIGRAM);
+    TrainerInterface trainer(trainer_spec, normalizer_spec, denormalizer_spec);
+    EXPECT_TRUE(trainer.status().ok());
+  }
+
+  // 1. UNIGRAM with auto_character_coverage=true and use_sparse_pruning=false
+  // MUST FAIL.
+  {
+    absl::SetFlag(&FLAGS_auto_character_coverage, true);
+    absl::SetFlag(&FLAGS_use_sparse_pruning, false);
+    trainer_spec.set_model_type(TrainerSpec::UNIGRAM);
+    TrainerInterface trainer(trainer_spec, normalizer_spec, denormalizer_spec);
+    EXPECT_FALSE(trainer.status().ok());
+  }
+
+  // 2. UNIGRAM with auto_character_coverage=true and use_sparse_pruning=true
+  // MUST SUCCEED.
+  {
+    absl::SetFlag(&FLAGS_auto_character_coverage, true);
+    absl::SetFlag(&FLAGS_use_sparse_pruning, true);
+    trainer_spec.set_model_type(TrainerSpec::UNIGRAM);
+    TrainerInterface trainer(trainer_spec, normalizer_spec, denormalizer_spec);
+    EXPECT_TRUE(trainer.status().ok());
+  }
+
+  // 3. BPE with auto_character_coverage=true MUST SUCCEED.
+  {
+    absl::SetFlag(&FLAGS_auto_character_coverage, true);
+    absl::SetFlag(&FLAGS_use_sparse_pruning, false);
+    trainer_spec.set_model_type(TrainerSpec::BPE);
+    TrainerInterface trainer(trainer_spec, normalizer_spec, denormalizer_spec);
+    EXPECT_TRUE(trainer.status().ok());
+  }
+
+  // 4. WORD with auto_character_coverage=true MUST FAIL.
+  {
+    absl::SetFlag(&FLAGS_auto_character_coverage, true);
+    trainer_spec.set_model_type(TrainerSpec::WORD);
+    TrainerInterface trainer(trainer_spec, normalizer_spec, denormalizer_spec);
+    EXPECT_FALSE(trainer.status().ok());
+  }
+
+  // Reset flags to defaults.
+  absl::SetFlag(&FLAGS_auto_character_coverage, false);
+  absl::SetFlag(&FLAGS_use_sparse_pruning, false);
+}
+
 }  // namespace sentencepiece
