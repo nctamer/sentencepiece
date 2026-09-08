@@ -145,19 +145,25 @@ set(SPM_TRAIN_SRCS
   unicode_script_map.h
   trainer_factory.h
   trainer_interface.h
+  continuation_io.h
   unigram_model_trainer.h
+  unigram_continuation_trainer.h
   word_model_trainer.h
   char_model_trainer.h
   bpe_model_trainer.h
+  bpe_continuation_trainer.h
   sentencepiece_trainer.h
   builder.cc
   unicode_script.cc
   trainer_factory.cc
   trainer_interface.cc
+  continuation_io.cc
   unigram_model_trainer.cc
+  unigram_continuation_trainer.cc
   word_model_trainer.cc
   char_model_trainer.cc
   bpe_model_trainer.cc
+  bpe_continuation_trainer.cc
   sentencepiece_trainer.cc
   ../third_party/libsais/libsais.c)
 
