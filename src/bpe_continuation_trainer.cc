@@ -353,6 +353,13 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
     return absl::InvalidArgumentError(
         "BPE continuation v1 does not support treat_whitespace_as_suffix");
   }
+  if (trainer_spec_.GetExtension(::sentencepiece::split_by_interval) ||
+      trainer_spec_.GetExtension(::sentencepiece::split_by_barline)) {
+    return absl::InvalidArgumentError(
+        "split_by_interval/split_by_barline are legacy fresh-training "
+        "pretokenization shims; continuation carries its domain fence in "
+        "ExpansionSpec.boundary_policy and one input record per training unit");
+  }
 
   ABSL_RETURN_IF_ERROR(continuation::ReadExpansionSpec(
       trainer_spec_.expansion_spec(), &expansion_spec_));
@@ -454,6 +461,10 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
           "bootstrap IDs must append contiguously; expected ", next_external_id_,
           " got ", piece.external_id()));
     }
+    if (next_external_id_ == std::numeric_limits<int>::max()) {
+      return absl::OutOfRangeError(
+          "bootstrap allocation exhausted the external ID range");
+    }
     piece.set_external_id(next_external_id_++);
     if (!occupied_ids.insert(piece.external_id()).second) {
       return absl::InvalidArgumentError(
@@ -462,14 +473,39 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
     bootstrap_ids[piece.piece()] = piece.external_id();
   }
 
-  target_new_pieces_ = expansion_spec_.requested_new_pieces();
-  if (target_new_pieces_ == 0) {
+  // Budget is the number of pieces the run may LEARN. Base and bootstrap
+  // pieces are inherited state and never spend it. An explicit zero is a
+  // replay-only run and must stay distinguishable from "unset", so the request
+  // is read by field presence rather than by value.
+  if (expansion_spec_.has_requested_new_pieces()) {
+    target_new_pieces_ = expansion_spec_.requested_new_pieces();
+    if (target_new_pieces_ < 0) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "requested_new_pieces must be nonnegative, got ",
+          target_new_pieces_));
+    }
+  } else {
+    // Unset: fall back to filling the declared final vocabulary. vocab_size is
+    // a total over the whole external ID space, so the already-occupied range
+    // is subtracted rather than added to.
     target_new_pieces_ = trainer_spec_.vocab_size() - next_external_id_;
+    if (target_new_pieces_ < 0) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "vocab_size ", trainer_spec_.vocab_size(),
+          " is smaller than the occupied external ID range after bootstrap "
+          "allocation (", next_external_id_, "); set requested_new_pieces "
+          "explicitly to make a replay-only run intentional"));
+    }
   }
-  if (target_new_pieces_ < 0) {
-    return absl::InvalidArgumentError(
-        "requested/final vocabulary is smaller than the occupied external ID "
-        "range after bootstrap allocation");
+
+  // 5.5: every ID this run will hand out must exist before any of them is
+  // handed out. next_external_id_ is a plain int and must never wrap.
+  if (target_new_pieces_ >
+      std::numeric_limits<int>::max() - next_external_id_) {
+    return absl::OutOfRangeError(absl::StrCat(
+        "continuation would allocate external IDs past the representable "
+        "range: first learned ID ", next_external_id_, " plus ",
+        target_new_pieces_, " learned pieces"));
   }
 
   base_merges_.assign(expansion_spec_.base_merges().begin(),
@@ -567,6 +603,44 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
     merge.set_external_id(child_it->second);
   }
 
+  // Shape options (max_sentencepiece_length, split_by_whitespace,
+  // split_by_unicode_script, split_by_number, split_digits) are fresh-training
+  // heuristics about what a NEW piece may look like. They are applied to merge
+  // candidates through IsValidSentencePiece, which means a contradictory
+  // setting would make an inherited merge unbuildable. Inherited state is not
+  // negotiable, so a configuration that cannot even express it is rejected
+  // here, before the corpus is read and before any merge is replayed.
+  {
+    auto check_declared = [&](const ExpansionPiece& piece,
+                              absl::string_view label) -> absl::Status {
+      if (piece.type() != ModelProto::SentencePiece::NORMAL ||
+          !piece.mergeable() || piece.atomic()) {
+        // Only constructed pieces travel through the merge machinery.
+        return absl::OkStatus();
+      }
+      const string_util::UnicodeText chars =
+          string_util::UTF8ToUnicodeText(piece.piece());
+      if (IsValidSentencePiece(chars)) return absl::OkStatus();
+      return absl::FailedPreconditionError(absl::StrCat(
+          "trainer shape constraints cannot express the ", label,
+          " piece \"", piece.piece(), "\" (", chars.size(),
+          " characters); continuation must not silently drop inherited state. "
+          "Check max_sentencepiece_length=",
+          trainer_spec_.max_sentencepiece_length(),
+          ", split_by_whitespace=", trainer_spec_.split_by_whitespace(),
+          ", split_by_unicode_script=",
+          trainer_spec_.split_by_unicode_script(),
+          ", split_by_number=", trainer_spec_.split_by_number(),
+          ", split_digits=", trainer_spec_.split_digits()));
+    };
+    for (const auto& piece : base_pieces_) {
+      ABSL_RETURN_IF_ERROR(check_declared(piece, "inherited"));
+    }
+    for (const auto& piece : bootstrap_pieces_) {
+      ABSL_RETURN_IF_ERROR(check_declared(piece, "bootstrap"));
+    }
+  }
+
   // This is the single authority for constructibility and rank semantics. With
   // allow_rank_prepend=true it validates bootstrap -> base; otherwise it
   // validates base -> bootstrap. Training will replay this exact same order and
@@ -588,9 +662,38 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
 
   sentences_ = corpus_.sentences;
   symbols_.resize(sentences_.size());
+
+  // EncodePos packs the two symbol indexes of a position into 16 bits each.
+  // An over-long record is a legitimate input, not a programming error, so it
+  // is refused here with a status instead of aborting the process inside
+  // EncodePos's CHECK.
+  constexpr size_t kMaxAtomsPerRecord = 1u << 16;
+
+  // Every pair frequency is bounded by the total weighted position mass, so
+  // proving that sum fits in uint64_t proves no accumulation can wrap. A
+  // record contributes atoms*weight positions.
+  uint64_t weighted_positions = 0;
+
   for (size_t sid = 0; sid < sentences_.size(); ++sid) {
     std::vector<std::string> atoms;
     ABSL_RETURN_IF_ERROR(SegmentAtoms(sentences_[sid].first, &atoms));
+    if (atoms.size() > kMaxAtomsPerRecord) {
+      return absl::OutOfRangeError(absl::StrCat(
+          "continuation training unit segments into ", atoms.size(),
+          " atomic symbols, which exceeds the ", kMaxAtomsPerRecord,
+          " this trainer can index; split the record or shrink "
+          "max_sentence_length"));
+    }
+    const uint64_t weight = static_cast<uint64_t>(sentences_[sid].second);
+    if (weight != 0 &&
+        atoms.size() > (std::numeric_limits<uint64_t>::max() -
+                        weighted_positions) / weight) {
+      return absl::OutOfRangeError(
+          "weighted continuation corpus exceeds the exact integer range of "
+          "BPE pair frequencies; reduce the TSV counts");
+    }
+    weighted_positions += static_cast<uint64_t>(atoms.size()) * weight;
+
     for (const std::string& atom : atoms) {
       Symbol* symbol = GetAtomicSymbol(atom);
       symbols_[sid].push_back(symbol);

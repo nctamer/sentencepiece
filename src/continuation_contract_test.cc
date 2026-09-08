@@ -605,6 +605,241 @@ TEST(BPEContinuationContractTest, RefusesNativeModelForMultiCodepointAtom) {
   EXPECT_FALSE(FileExists(prefix + ".model"));
 }
 
+
+// ---------------------------------------------------------------------------
+// Hardening: refuse rather than abort, and never spend budget on inherited
+// state.
+// ---------------------------------------------------------------------------
+
+// A minimal spec whose only atom is "a".
+ExpansionSpec SingleAtomSpec(int requested_new_pieces) {
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_requested_new_pieces(requested_new_pieces);
+  AddPiece(&expansion, 0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false,
+           false);
+  AddPiece(&expansion, 1, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  return expansion;
+}
+
+// EncodePos packs two 16-bit symbol indexes. An over-long record used to trip
+// a CHECK and take the process down; valid input must produce a status.
+TEST(BPEContinuationContractTest, RejectsRecordLongerThanPositionIndex) {
+  const std::string input = TempPath("continuation_longrec_input.txt");
+  const std::string spec_path = TempPath("continuation_longrec.pb");
+  const std::string result_path = TempPath("continuation_longrec.result");
+  const std::string prefix = TempPath("continuation_longrec_model");
+  ASSERT_TRUE(WriteLines(input, {std::string((1 << 16) + 1, 'a')}));
+  ASSERT_TRUE(WriteProto(spec_path, SingleAtomSpec(0)));
+
+  TrainerSpec trainer =
+      BpeContinuationSpec(input, spec_path, result_path, prefix, 16);
+  trainer.set_max_sentence_length(1 << 18);
+  const absl::Status status = RunTrainer(trainer, IdentityNormalizer());
+  EXPECT_EQ(absl::StatusCode::kOutOfRange, status.code()) << status;
+}
+
+// One atom shorter still fits, so the limit is a real boundary rather than a
+// blanket refusal of long records.
+TEST(BPEContinuationContractTest, AcceptsRecordAtThePositionIndexLimit) {
+  const std::string input = TempPath("continuation_atlimit_input.txt");
+  const std::string spec_path = TempPath("continuation_atlimit.pb");
+  const std::string result_path = TempPath("continuation_atlimit.result");
+  const std::string prefix = TempPath("continuation_atlimit_model");
+  ASSERT_TRUE(WriteLines(input, {std::string(1 << 16, 'a')}));
+  ASSERT_TRUE(WriteProto(spec_path, SingleAtomSpec(0)));
+
+  TrainerSpec trainer =
+      BpeContinuationSpec(input, spec_path, result_path, prefix, 16);
+  trainer.set_max_sentence_length(1 << 18);
+  EXPECT_TRUE(RunTrainer(trainer, IdentityNormalizer()).ok());
+}
+
+// Pair frequencies accumulate weight per position. The weighted position mass
+// must be proven to fit before any of it is summed.
+TEST(BPEContinuationContractTest, RejectsWeightedFrequencyOverflow) {
+  const std::string input = TempPath("continuation_ovf_input.tsv");
+  const std::string spec_path = TempPath("continuation_ovf.pb");
+  const std::string result_path = TempPath("continuation_ovf.result");
+  const std::string prefix = TempPath("continuation_ovf_model");
+  ASSERT_TRUE(WriteLines(input, {"aaaa\t9000000000000000000"}));
+  ASSERT_TRUE(WriteProto(spec_path, SingleAtomSpec(0)));
+
+  TrainerSpec trainer =
+      BpeContinuationSpec(input, spec_path, result_path, prefix, 16);
+  trainer.set_input_format("tsv");
+  const absl::Status status = RunTrainer(trainer, IdentityNormalizer());
+  EXPECT_EQ(absl::StatusCode::kOutOfRange, status.code()) << status;
+}
+
+// An explicit zero is a replay-only run, and must not be read as "unset".
+TEST(BPEContinuationContractTest, ExplicitZeroBudgetIsReplayOnly) {
+  const std::string input = TempPath("continuation_zero_input.txt");
+  const std::string spec_path = TempPath("continuation_zero.pb");
+  const std::string result_path = TempPath("continuation_zero.result");
+  const std::string prefix = TempPath("continuation_zero_model");
+  ASSERT_TRUE(WriteLines(input, {"abcd", "abcd", "abcd"}));
+  ExpansionSpec expansion = BasicAbcdSpec();
+  expansion.set_requested_new_pieces(0);
+  ASSERT_TRUE(WriteProto(spec_path, expansion));
+
+  // vocab_size is deliberately larger than the occupied range: were the budget
+  // derived from it, this run would learn a piece.
+  ASSERT_TRUE(RunTrainer(BpeContinuationSpec(input, spec_path, result_path,
+                                             prefix, 32),
+                         IdentityNormalizer())
+                  .ok());
+
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  EXPECT_EQ(0, result.learned_pieces_size());
+  EXPECT_EQ(0, result.learned_merges_size());
+  EXPECT_EQ(0, result.requested_new_pieces());
+  EXPECT_EQ(0, result.actual_new_pieces());
+  // The inherited tokenizer is returned intact.
+  EXPECT_EQ(7, result.base_pieces_size());
+  EXPECT_EQ(2, result.base_merges_size());
+  EXPECT_EQ(7, result.first_new_external_id());
+}
+
+// An inherited merge the continuation corpus never exercises stays in the
+// tokenizer and costs no budget.
+TEST(BPEContinuationContractTest, AbsentInheritedMergeIsKeptAndCostsNothing) {
+  const std::string input = TempPath("continuation_absent_input.txt");
+  const std::string spec_path = TempPath("continuation_absent.pb");
+  const std::string result_path = TempPath("continuation_absent.result");
+  const std::string prefix = TempPath("continuation_absent_model");
+  // "cd" never occurs, so the (c, d) merge cannot fire.
+  ASSERT_TRUE(WriteLines(input, {"abab", "abab", "abab"}));
+  ExpansionSpec expansion = BasicAbcdSpec();
+  expansion.set_requested_new_pieces(1);
+  ASSERT_TRUE(WriteProto(spec_path, expansion));
+
+  ASSERT_TRUE(RunTrainer(BpeContinuationSpec(input, spec_path, result_path,
+                                             prefix, 8),
+                         IdentityNormalizer())
+                  .ok());
+
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  // Both inherited merges are still exported, in their inherited order.
+  ASSERT_EQ(2, result.base_merges_size());
+  EXPECT_EQ("a", result.base_merges(0).left());
+  EXPECT_EQ("b", result.base_merges(0).right());
+  EXPECT_EQ("c", result.base_merges(1).left());
+  EXPECT_EQ("d", result.base_merges(1).right());
+  // The full budget was still available to learning.
+  ASSERT_EQ(1, result.learned_pieces_size());
+  EXPECT_EQ("abab", result.learned_pieces(0).piece());
+  EXPECT_EQ("ab", result.learned_merges(0).left());
+  EXPECT_EQ("ab", result.learned_merges(0).right());
+}
+
+// A candidate whose string already exists is not a new token: no ID, no
+// budget, and no alternative ancestry smuggled into the corpus.
+TEST(BPEContinuationContractTest, DuplicateCandidateNeitherAllocatesNorSpends) {
+  const std::string input = TempPath("continuation_dup_input.txt");
+  const std::string spec_path = TempPath("continuation_dup.pb");
+  const std::string result_path = TempPath("continuation_dup.result");
+  const std::string prefix = TempPath("continuation_dup_model");
+  // "ba" is more frequent than "cd", so it is the first candidate offered.
+  ASSERT_TRUE(WriteLines(input, {"ba", "ba", "ba", "ba", "ba", "cd", "cd",
+                                 "cd"}));
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_requested_new_pieces(1);
+  AddPiece(&expansion, 0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false,
+           false);
+  AddPiece(&expansion, 1, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  AddPiece(&expansion, 2, "b", ModelProto::SentencePiece::NORMAL, true, true);
+  AddPiece(&expansion, 3, "c", ModelProto::SentencePiece::NORMAL, true, true);
+  AddPiece(&expansion, 4, "d", ModelProto::SentencePiece::NORMAL, true, true);
+  // Present in the ID space but built by no merge the program declares.
+  AddPiece(&expansion, 5, "ba", ModelProto::SentencePiece::NORMAL, false,
+           false);
+  ASSERT_TRUE(WriteProto(spec_path, expansion));
+
+  ASSERT_TRUE(RunTrainer(BpeContinuationSpec(input, spec_path, result_path,
+                                             prefix, 7),
+                         IdentityNormalizer())
+                  .ok());
+
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  // The duplicate was retired, so the budget bought the next real candidate.
+  ASSERT_EQ(1, result.learned_pieces_size());
+  EXPECT_EQ("cd", result.learned_pieces(0).piece());
+  EXPECT_EQ(6, result.learned_pieces(0).external_id());
+  // No merge was invented for the pre-existing string.
+  for (const auto& merge : result.learned_merges()) {
+    EXPECT_NE("ba", merge.left() + merge.right());
+  }
+}
+
+// Shape options describe what a NEW piece may look like. A setting that cannot
+// even express the inherited tokenizer is a configuration error, and must be
+// caught before the corpus is opened - this input path does not exist.
+TEST(BPEContinuationContractTest, RejectsShapeThatCannotExpressInheritedPiece) {
+  const std::string spec_path = TempPath("continuation_shape.pb");
+  const std::string result_path = TempPath("continuation_shape.result");
+  const std::string prefix = TempPath("continuation_shape_model");
+  ASSERT_TRUE(WriteProto(spec_path, BasicAbcdSpec()));
+
+  TrainerSpec trainer = BpeContinuationSpec(
+      TempPath("continuation_shape_does_not_exist.txt"), spec_path,
+      result_path, prefix, 8);
+  trainer.set_max_sentencepiece_length(1);
+  const absl::Status status = RunTrainer(trainer, IdentityNormalizer());
+  EXPECT_EQ(absl::StatusCode::kFailedPrecondition, status.code()) << status;
+  EXPECT_NE(std::string::npos, std::string(status.message()).find("ab"));
+}
+
+// The legacy interval/barline pretokenizer is fresh-training policy; a
+// continuation run carries its fence in the spec instead.
+TEST(BPEContinuationContractTest, RejectsLegacyBoundaryFlags) {
+  const std::string spec_path = TempPath("continuation_legacyflag.pb");
+  const std::string result_path = TempPath("continuation_legacyflag.result");
+  const std::string prefix = TempPath("continuation_legacyflag_model");
+  ASSERT_TRUE(WriteProto(spec_path, BasicAbcdSpec()));
+
+  TrainerSpec trainer = BpeContinuationSpec(
+      TempPath("continuation_legacyflag_input.txt"), spec_path, result_path,
+      prefix, 8);
+  trainer.SetExtension(split_by_interval, true);
+  EXPECT_FALSE(RunTrainer(trainer, IdentityNormalizer()).ok());
+}
+
+// Training twice through one trainer object must not carry state across.
+TEST(BPEContinuationContractTest, TrainerReuseDoesNotLeakState) {
+  const std::string input = TempPath("continuation_reuse_input.txt");
+  const std::string spec_path = TempPath("continuation_reuse.pb");
+  const std::string result_path = TempPath("continuation_reuse.result");
+  const std::string prefix = TempPath("continuation_reuse_model");
+  ASSERT_TRUE(WriteLines(input, {"abcd", "abcd", "abcd"}));
+  ASSERT_TRUE(WriteProto(spec_path, BasicAbcdSpec()));
+
+  const TrainerSpec trainer_spec =
+      BpeContinuationSpec(input, spec_path, result_path, prefix, 8);
+  NormalizerSpec denormalizer;
+  std::unique_ptr<TrainerInterface> trainer = TrainerFactory::Create(
+      trainer_spec, IdentityNormalizer(), denormalizer);
+
+  ASSERT_TRUE(trainer->Train().ok());
+  ExpansionResult first;
+  ASSERT_TRUE(ReadProto(result_path, &first));
+
+  ASSERT_TRUE(trainer->Train().ok());
+  ExpansionResult second;
+  ASSERT_TRUE(ReadProto(result_path, &second));
+
+  EXPECT_EQ(first.SerializeAsString(), second.SerializeAsString());
+}
+
 TEST(UnigramContinuationContractTest, PreservesPriorIdsAndScoreGeometry) {
   const std::string prior_path = TempPath("continuation_unigram_prior.model");
   const std::string input = TempPath("continuation_unigram_input.txt");
