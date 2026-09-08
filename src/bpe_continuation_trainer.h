@@ -105,8 +105,14 @@ class ContinuationTrainer : public TrainerInterface {
                             absl::string_view label);
   absl::Status LearnExpansion();
   std::vector<ExpansionMerge> EffectiveMergeTable() const;
-  bool IsReachable(absl::string_view piece,
-                   const std::vector<ExpansionMerge>& merges) const;
+  // Rank of each declared (left, right) pair. Built once per finalization:
+  // a real inherited tokenizer carries ~10^5 merges, so rebuilding this per
+  // candidate piece would make reachability verification quadratic in the
+  // size of the base tokenizer.
+  using PairRanks = absl::flat_hash_map<std::pair<std::string, std::string>,
+                                        int>;
+  static PairRanks BuildPairRanks(const std::vector<ExpansionMerge>& merges);
+  bool IsReachable(absl::string_view piece, const PairRanks& pair_rank) const;
   absl::Status FinalizeArtifacts();
 
   // Native SentencePiece BPE inference does not read a merge table. It merges

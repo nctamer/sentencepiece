@@ -863,18 +863,24 @@ std::vector<ExpansionMerge> ContinuationTrainer::EffectiveMergeTable() const {
   return out;
 }
 
-bool ContinuationTrainer::IsReachable(
-    absl::string_view piece, const std::vector<ExpansionMerge>& merges) const {
-  std::map<std::pair<std::string, std::string>, int> pair_rank;
+ContinuationTrainer::PairRanks ContinuationTrainer::BuildPairRanks(
+    const std::vector<ExpansionMerge>& merges) {
+  PairRanks pair_rank;
+  pair_rank.reserve(merges.size());
   for (const auto& merge : merges) {
     pair_rank[{merge.left(), merge.right()}] = merge.rank();
   }
+  return pair_rank;
+}
 
+bool ContinuationTrainer::IsReachable(absl::string_view piece,
+                                      const PairRanks& pair_rank) const {
   std::vector<std::string> symbols;
   if (!SegmentAtoms(piece, &symbols).ok()) return false;
 
   size_t guard = 0;
-  while (symbols.size() > 1 && guard++ <= merges.size() + symbols.size() + 1) {
+  while (symbols.size() > 1 &&
+         guard++ <= pair_rank.size() + symbols.size() + 1) {
     int best_rank = std::numeric_limits<int>::max();
     std::pair<std::string, std::string> best_pair;
     bool found = false;
@@ -1069,8 +1075,9 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
       ValidateMergeProgram(effective, /*require_all_declared_pieces=*/true));
 
   int unreachable = 0;
+  const PairRanks pair_rank = BuildPairRanks(effective);
   for (const auto& piece : learned_pieces_) {
-    if (!IsReachable(piece.piece(), effective)) {
+    if (!IsReachable(piece.piece(), pair_rank)) {
       ++unreachable;
       LOG(ERROR) << "unreachable learned BPE piece id=" << piece.external_id()
                  << " piece=" << piece.piece();
