@@ -34,6 +34,15 @@ namespace {
 
 bool Finite(double x) { return std::isfinite(x); }
 
+// log(1e-30). Stands in for the lambda -> -infinity limit when the inherited
+// side carries no expected count at all.
+//
+// At namespace scope rather than inside the function that uses it: a
+// constexpr local read by a lambda with no default capture is accepted by
+// GCC and Clang and rejected by MSVC (C3493), and the constant does not need
+// to be local to be clear.
+constexpr double kDegenerateLogBaseMass = -69.07755278982137;
+
 // Two scores that differ only by floating-point accumulation noise rank as a
 // tie, so the piece string decides.
 //
@@ -650,9 +659,8 @@ absl::Status ContinuationTrainer::SolveMStepLambda(
     // Extensions carry every count and the inherited side carries none, so the
     // objective is monotone toward lambda -> -infinity. Stand in for that
     // limit with the deterministic finite lambda whose inherited mass is 1e-30.
-    constexpr double kTargetLogBaseMass = -69.07755278982137;  // log(1e-30)
     const auto shifted = [this](double x) {
-      return LogBaseMass(x) - kTargetLogBaseMass;
+      return LogBaseMass(x) - kDegenerateLogBaseMass;
     };
     return BisectMonotoneRoot("degenerate continuation lambda", shifted,
                               /*increasing=*/true, boundary - 1.0, boundary,
