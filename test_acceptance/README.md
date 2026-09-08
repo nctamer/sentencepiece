@@ -22,3 +22,25 @@ conditions in `README_expansion.md`.
 Expects `build/src/spm_train` and a Qwen3 snapshot in the HuggingFace cache.
 `N_NEW` sets how many pieces to learn (default 24). Run it twice into
 different directories and compare `*.expansion` to check determinism.
+
+## `unigram_prior_continuation_acceptance.py`
+
+Mirrors the violin/piano flow without needing its data: trains a piano-only
+Stage-1 Unigram model, then continues it with `--unigram_prior_model` over a
+corpus containing both piano and violin.
+
+Checks that every Stage-1 ID keeps its string and type, that non-NORMAL scores
+are untouched, and that a single additive-length gauge governs every inherited
+NORMAL score - the per-piece shift/length spread is the measurement, and it
+comes out around 1e-7. Violin specializations win extension slots, weighted
+TSV equals physical repetition, and reruns are byte-identical.
+
+The segmentation check is the careful one. Extensions are *allowed* to win
+where they are better, so it does not demand that Stage 2 segment everything
+as Stage 1 did. It requires the narrower property the gauge actually
+guarantees: where no extension piece takes part, the segmentation is exactly
+Stage 1's, and every difference is explained by an extension piece winning.
+
+    python3 test_acceptance/unigram_prior_continuation_acceptance.py <output-dir>
+
+Needs `build/src/spm_train` and the `sentencepiece` Python package importable.
