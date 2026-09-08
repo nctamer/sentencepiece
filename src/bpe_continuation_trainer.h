@@ -1,0 +1,130 @@
+// Copyright 2026
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+
+#ifndef BPE_CONTINUATION_TRAINER_H_
+#define BPE_CONTINUATION_TRAINER_H_
+
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <memory>
+#include <queue>
+#include <string>
+#include <vector>
+
+#include "absl/container/btree_set.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
+#include "continuation_io.h"
+#include "sentencepiece_model.pb.h"
+#include "trainer_interface.h"
+
+namespace sentencepiece::bpe {
+
+// BPE continuation is intentionally a separate trainer from ordinary BPE.
+// Its starting state is an inherited merge program, not a fresh character
+// corpus with strings protected from pruning.
+class ContinuationTrainer : public TrainerInterface {
+ public:
+  ContinuationTrainer(const TrainerSpec& trainer_spec,
+                      const NormalizerSpec& normalizer_spec,
+                      const NormalizerSpec& denormalizer_spec)
+      : TrainerInterface(trainer_spec, normalizer_spec, denormalizer_spec) {}
+
+  absl::Status Train() override;
+
+ private:
+  struct Symbol {
+    const Symbol* left = nullptr;
+    const Symbol* right = nullptr;
+    string_util::UnicodeText chars;
+    uint64_t fp = 0;
+    uint64_t freq = 0;
+    bool is_unk = false;
+    bool active = true;
+    bool pending = false;
+    bool needs_recomputation = true;
+    absl::btree_set<uint64_t> positions;
+
+    [[nodiscard]] bool IsBigram() const {
+      return left != nullptr && right != nullptr;
+    }
+    [[nodiscard]] std::string ToString() const;
+  };
+
+  struct Position {
+    int sid;
+    int left;
+    int right;
+  };
+
+  struct QueueEntry {
+    uint64_t freq;
+    Symbol* symbol;
+  };
+
+  struct QueueEntryComparator {
+    bool operator()(const QueueEntry& e1, const QueueEntry& e2) const {
+      if (e1.freq != e2.freq) return e1.freq < e2.freq;
+      if (e1.symbol->chars.size() != e2.symbol->chars.size()) {
+        return e1.symbol->chars.size() > e2.symbol->chars.size();
+      }
+      return e1.symbol->chars > e2.symbol->chars;
+    }
+  };
+
+  static uint64_t EncodePos(int sid, int l, int r);
+  static Position DecodePos(uint64_t n);
+
+  Symbol* GetCharSymbol(char32_t c);
+  Symbol* GetPairSymbol(const Symbol* left, const Symbol* right);
+  void ComputeFreq(Symbol* symbol) const;
+  int GetNextIndex(int sid, int index) const;
+  int GetPrevIndex(int sid, int index) const;
+  void AddNewPair(int sid, int left, int right);
+  void ResetFreq(int sid, int left, int right, const Symbol* best);
+  absl::Status AcceptSymbol(Symbol* symbol);
+  void DrainPendingQueue();
+
+  absl::Status LoadAndValidateSpec();
+  absl::Status InitializeCorpusSymbols();
+  absl::Status ReplayMerges(const std::vector<ExpansionMerge>& merges,
+                            absl::string_view label);
+  absl::Status LearnExpansion();
+  std::vector<ExpansionMerge> EffectiveMergeTable() const;
+  bool IsReachable(absl::string_view piece,
+                   const std::vector<ExpansionMerge>& merges) const;
+  absl::Status FinalizeArtifacts();
+  absl::Status BuildNativeModel(ModelProto* model) const;
+
+  ExpansionSpec expansion_spec_;
+  continuation::PreparedCorpus corpus_;
+  std::vector<ExpansionPiece> base_pieces_;
+  std::vector<ExpansionPiece> bootstrap_pieces_;
+  std::vector<ExpansionPiece> learned_pieces_;
+  std::vector<ExpansionMerge> base_merges_;
+  std::vector<ExpansionMerge> bootstrap_merges_;
+  std::vector<ExpansionMerge> learned_merges_;
+
+  absl::flat_hash_set<std::string> existing_piece_strings_;
+  absl::flat_hash_set<std::string> atomic_piece_strings_;
+  absl::flat_hash_map<std::string, Symbol*> live_by_string_;
+
+  int first_new_external_id_ = -1;
+  int next_external_id_ = -1;
+  int target_new_pieces_ = 0;
+
+  absl::flat_hash_map<uint64_t, Symbol*> symbols_cache_;
+  std::priority_queue<QueueEntry, std::vector<QueueEntry>, QueueEntryComparator>
+      pq_;
+  std::vector<Symbol*> pending_queue_;
+  std::vector<std::unique_ptr<Symbol>> allocated_;
+  std::vector<std::vector<Symbol*>> symbols_;
+};
+
+}  // namespace sentencepiece::bpe
+
+#endif  // BPE_CONTINUATION_TRAINER_H_
