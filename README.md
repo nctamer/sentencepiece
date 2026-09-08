@@ -146,6 +146,7 @@ For detailed guides, API references, and advanced usage, please refer to the fol
 *   [Special Symbols & Control Tokens](doc/special_symbols.md)
 *   [Vocabulary Piece Constraints](doc/piece_constraints.md)
 *   [Model Protobuf Schema](doc/model_proto.md)
+*   [Tokenizer Continuation / Expansion](README_expansion.md) *(fork extension)*
 *   [Docker Deployment Guide](contrib/docker/README.md)
 
 ---
