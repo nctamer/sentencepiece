@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "filesystem.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
@@ -1177,6 +1178,240 @@ TEST(UnigramContinuationContractTest, CustomPriorNormalizerIsCarriedThrough) {
   ASSERT_TRUE(ReadProto(prefix + ".model", &output));
   EXPECT_EQ("intermo_custom", output.normalizer_spec().name());
   EXPECT_TRUE(output.normalizer_spec().remove_extra_whitespaces());
+}
+
+
+// ---------------------------------------------------------------------------
+// Malformed input is refused, and refused for the stated reason. Each case
+// mutates one field of an otherwise-valid spec, so what is under test is the
+// mutation and not the scaffolding.
+// ---------------------------------------------------------------------------
+
+absl::Status RunWithSpec(const ExpansionSpec& expansion, absl::string_view tag,
+                         const std::vector<std::string>& corpus = {"abcd",
+                                                                   "abcd",
+                                                                   "abcd"},
+                         int vocab_size = 8) {
+  const std::string input = TempPath(absl::StrCat("cont_bad_", tag, ".txt"));
+  const std::string spec_path = TempPath(absl::StrCat("cont_bad_", tag, ".pb"));
+  const std::string result_path =
+      TempPath(absl::StrCat("cont_bad_", tag, ".result"));
+  const std::string prefix = TempPath(absl::StrCat("cont_bad_", tag, "_model"));
+  if (!WriteLines(input, corpus)) return absl::InternalError("write corpus");
+  if (!WriteProto(spec_path, expansion)) {
+    return absl::InternalError("write spec");
+  }
+  return RunTrainer(
+      BpeContinuationSpec(input, spec_path, result_path, prefix, vocab_size),
+      IdentityNormalizer());
+}
+
+TEST(BPEContinuationContractTest, RejectsDuplicateBaseExternalId) {
+  ExpansionSpec expansion = BasicAbcdSpec();
+  expansion.mutable_base_pieces(3)->set_external_id(2);  // collides with "b"
+  EXPECT_FALSE(RunWithSpec(expansion, "dupid").ok());
+}
+
+TEST(BPEContinuationContractTest, RejectsDuplicateBasePieceString) {
+  ExpansionSpec expansion = BasicAbcdSpec();
+  expansion.mutable_base_pieces(3)->set_piece("b");  // "c" becomes a second "b"
+  EXPECT_FALSE(RunWithSpec(expansion, "dupstr").ok());
+}
+
+TEST(BPEContinuationContractTest, RejectsNoncontiguousMergeRanks) {
+  ExpansionSpec expansion = BasicAbcdSpec();
+  expansion.mutable_base_merges(1)->set_rank(7);
+  EXPECT_FALSE(RunWithSpec(expansion, "ranks").ok());
+}
+
+TEST(BPEContinuationContractTest, RejectsMergeGraphWithUnconstructibleParent) {
+  ExpansionSpec expansion = BasicAbcdSpec();
+  // "ab" is built at rank 0, so a merge consuming "abc" at rank 1 has a parent
+  // nothing ever constructs.
+  expansion.mutable_base_merges(1)->set_left("abc");
+  expansion.mutable_base_merges(1)->set_right("d");
+  EXPECT_FALSE(RunWithSpec(expansion, "graph").ok());
+}
+
+TEST(BPEContinuationContractTest, RejectsMergeChildIdMismatch) {
+  ExpansionSpec expansion = BasicAbcdSpec();
+  // "cd" is declared as ID 6; claim the merge builds something else.
+  expansion.mutable_base_merges(1)->set_external_id(3);
+  EXPECT_FALSE(RunWithSpec(expansion, "childid").ok());
+}
+
+TEST(BPEContinuationContractTest, RejectsBootstrapCollidingWithBase) {
+  ExpansionSpec expansion = BasicAbcdSpec();
+  AddBootstrapPiece(&expansion, "ab");  // already an inherited piece
+  AddBootstrapMerge(&expansion, 0, "a", "b");
+  EXPECT_FALSE(RunWithSpec(expansion, "bootcollide").ok());
+}
+
+TEST(BPEContinuationContractTest, RejectsFirstNewIdOverlappingOccupiedIds) {
+  ExpansionSpec expansion = BasicAbcdSpec();
+  expansion.set_first_new_external_id(4);  // "d" already holds 4
+  EXPECT_FALSE(RunWithSpec(expansion, "firstid").ok());
+}
+
+TEST(BPEContinuationContractTest, RejectsAllocationPastTheIdRange) {
+  ExpansionSpec expansion = BasicAbcdSpec();
+  expansion.set_first_new_external_id(std::numeric_limits<int>::max() - 1);
+  expansion.set_requested_new_pieces(8);
+  const absl::Status status = RunWithSpec(expansion, "idcap");
+  EXPECT_EQ(absl::StatusCode::kOutOfRange, status.code()) << status;
+}
+
+TEST(BPEContinuationContractTest, RejectsAmbiguousAtomicSegmentation) {
+  // "ab" is an atom AND "a"/"b" are atoms, so "ab" has two parses.
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_requested_new_pieces(0);
+  AddPiece(&expansion, 0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false,
+           false);
+  AddPiece(&expansion, 1, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  AddPiece(&expansion, 2, "b", ModelProto::SentencePiece::NORMAL, true, true);
+  AddPiece(&expansion, 3, "ab", ModelProto::SentencePiece::NORMAL, true, true);
+  EXPECT_FALSE(RunWithSpec(expansion, "ambig", {"ab", "ab"}, 16).ok());
+}
+
+TEST(BPEContinuationContractTest, RejectsUncoveredAtomicSegmentation) {
+  // The corpus contains "z", which the declared alphabet cannot spell.
+  EXPECT_FALSE(RunWithSpec(BasicAbcdSpec(), "uncovered", {"abcz", "abcz"}).ok());
+}
+
+// A weighted record must be exactly equivalent to physical repetition.
+TEST(BPEContinuationContractTest, WeightedTsvMatchesPhysicalRepetition) {
+  auto learn = [&](bool weighted) {
+    const std::string tag = weighted ? "w" : "r";
+    const std::string input = TempPath("cont_bpe_weight_" + tag +
+                                       (weighted ? ".tsv" : ".txt"));
+    const std::string spec_path = TempPath("cont_bpe_weight_" + tag + ".pb");
+    const std::string result_path =
+        TempPath("cont_bpe_weight_" + tag + ".result");
+    const std::string prefix = TempPath("cont_bpe_weight_" + tag + "_model");
+
+    std::vector<std::string> lines;
+    if (weighted) {
+      lines = {"abcd\t5", "abab\t2"};
+    } else {
+      for (int i = 0; i < 5; ++i) lines.push_back("abcd");
+      for (int i = 0; i < 2; ++i) lines.push_back("abab");
+    }
+    EXPECT_TRUE(WriteLines(input, lines));
+    ExpansionSpec expansion = BasicAbcdSpec();
+    expansion.set_requested_new_pieces(2);
+    EXPECT_TRUE(WriteProto(spec_path, expansion));
+
+    TrainerSpec trainer =
+        BpeContinuationSpec(input, spec_path, result_path, prefix, 9);
+    if (weighted) trainer.set_input_format("tsv");
+    trainer.set_hard_vocab_limit(false);
+    EXPECT_TRUE(RunTrainer(trainer, IdentityNormalizer()).ok());
+
+    ExpansionResult result;
+    EXPECT_TRUE(ReadProto(result_path, &result));
+    std::vector<std::string> learned;
+    for (const auto& piece : result.learned_pieces()) {
+      learned.push_back(piece.piece());
+    }
+    return learned;
+  };
+
+  EXPECT_EQ(learn(false), learn(true));
+}
+
+// ---------------------------------------------------------------------------
+// Unigram prior validation.
+// ---------------------------------------------------------------------------
+
+absl::Status RunWithPrior(const ModelProto& prior, absl::string_view tag,
+                          int vocab_size = 6) {
+  const std::string input = TempPath(absl::StrCat("cont_uni_bad_", tag, ".txt"));
+  const std::string prior_path =
+      TempPath(absl::StrCat("cont_uni_bad_", tag, ".prior"));
+  const std::string result_path =
+      TempPath(absl::StrCat("cont_uni_bad_", tag, ".result"));
+  const std::string prefix =
+      TempPath(absl::StrCat("cont_uni_bad_", tag, "_model"));
+  if (!WriteLines(input, std::vector<std::string>(20, "abab"))) {
+    return absl::InternalError("write corpus");
+  }
+  if (!WriteProto(prior_path, prior)) return absl::InternalError("write prior");
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(vocab_size);
+  return RunTrainer(trainer, NormalizerSpec());
+}
+
+TEST(UnigramContinuationContractTest, RejectsPriorOfTheWrongModelType) {
+  ModelProto prior = MakeMultiPathUnigramPrior();
+  prior.mutable_trainer_spec()->set_model_type(TrainerSpec::BPE);
+  EXPECT_FALSE(RunWithPrior(prior, "type").ok());
+}
+
+TEST(UnigramContinuationContractTest, RejectsDuplicateOrInvalidPriorState) {
+  {  // two pieces with the same string
+    ModelProto prior = MakeMultiPathUnigramPrior();
+    prior.mutable_pieces(2)->set_piece("a");
+    EXPECT_FALSE(RunWithPrior(prior, "dup").ok());
+  }
+  {  // no UNKNOWN
+    ModelProto prior = MakeMultiPathUnigramPrior();
+    prior.mutable_pieces(0)->set_type(ModelProto::SentencePiece::NORMAL);
+    EXPECT_FALSE(RunWithPrior(prior, "nounk").ok());
+  }
+  {  // two UNKNOWNs
+    ModelProto prior = MakeMultiPathUnigramPrior();
+    prior.mutable_pieces(1)->set_type(ModelProto::SentencePiece::UNKNOWN);
+    EXPECT_FALSE(RunWithPrior(prior, "twounk").ok());
+  }
+  {  // a non-finite inherited score has no gauge to sit on
+    ModelProto prior = MakeMultiPathUnigramPrior();
+    prior.mutable_pieces(1)->set_score(
+        std::numeric_limits<float>::infinity());
+    EXPECT_FALSE(RunWithPrior(prior, "inf").ok());
+  }
+}
+
+TEST(UnigramContinuationContractTest, RejectsUnsupportedAlphabetAndCapacity) {
+  // The corpus is outside anything the prior can segment.
+  const std::string input = TempPath("cont_uni_alpha.txt");
+  const std::string prior_path = TempPath("cont_uni_alpha.prior");
+  const std::string result_path = TempPath("cont_uni_alpha.result");
+  const std::string prefix = TempPath("cont_uni_alpha_model");
+  ASSERT_TRUE(WriteProto(prior_path, MakeMultiPathUnigramPrior()));
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(20, "zzzz")));
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(6);
+  EXPECT_FALSE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  // Asking for a vocabulary smaller than the prior cannot be honoured: the
+  // prior is the floor, and inherited pieces are never pruned.
+  EXPECT_FALSE(RunWithPrior(MakeMultiPathUnigramPrior(), "capacity",
+                            /*vocab_size=*/2)
+                   .ok());
+}
+
+TEST(UnigramContinuationContractTest, RejectsSeedSentencepiecesConflict) {
+  const std::string input = TempPath("cont_uni_seed.txt");
+  const std::string prior_path = TempPath("cont_uni_seed.prior");
+  const std::string result_path = TempPath("cont_uni_seed.result");
+  const std::string prefix = TempPath("cont_uni_seed_model");
+  const std::string seed_path = TempPath("cont_uni_seed_pieces.txt");
+  ASSERT_TRUE(WriteProto(prior_path, MakeMultiPathUnigramPrior()));
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(20, "abab")));
+  ASSERT_TRUE(WriteLines(seed_path, {"ab\t-1.0"}));
+
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(6);
+  trainer.set_seed_sentencepieces_file(seed_path);
+  // The prior already fixes the starting vocabulary; a second seed source is
+  // ambiguous rather than additive.
+  EXPECT_FALSE(RunTrainer(trainer, NormalizerSpec()).ok());
 }
 
 TEST(ContinuationContractTest, DeterministicBpeResultBytes) {

@@ -570,6 +570,17 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
       return absl::InvalidArgumentError(absl::StrCat(
           "inherited piece has multiple merge constructions: ", child));
     }
+    // The adapter may name the child it believes this merge builds. When it
+    // does, disagreeing with the piece table is an adapter bug, and rewriting
+    // the field would hide it: provenance that silently agrees with whatever
+    // it is compared against proves nothing.
+    if (merge.external_id() >= 0 &&
+        merge.external_id() != child_it->second.external_id()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "inherited merge at rank ", merge.rank(), " claims to build ",
+          child, " as external_id ", merge.external_id(),
+          " but the piece table gives it ", child_it->second.external_id()));
+    }
     merge.set_external_id(child_it->second.external_id());
     base_constructible.insert(child);
   }
@@ -599,6 +610,12 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
     if (!bootstrap_children.insert(child).second) {
       return absl::InvalidArgumentError(absl::StrCat(
           "bootstrap piece has multiple merge constructions: ", child));
+    }
+    if (merge.external_id() >= 0 && merge.external_id() != child_it->second) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "bootstrap merge at rank ", merge.rank(), " claims to build ", child,
+          " as external_id ", merge.external_id(),
+          " but the bootstrap piece was allocated ", child_it->second));
     }
     merge.set_external_id(child_it->second);
   }
