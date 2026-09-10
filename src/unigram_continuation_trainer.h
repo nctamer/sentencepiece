@@ -68,7 +68,9 @@ class ContinuationTrainer : public TrainerInterface {
   // Decides between inheriting the prior's normalization, accepting an
   // identical caller request, and refusing a conflicting one.
   absl::Status ReconcileNormalization();
-  absl::Status VerifyCorpusCoverage() const;
+  // Collects corpus characters the prior cannot spell; they become
+  // extension candidates. Non-const: it fills bootstrap_pieces_.
+  absl::Status VerifyCorpusCoverage();
   absl::Status MakeWeightedExtensionCandidates();
   absl::Status InitializeContinuationScores();
   absl::Status RunContinuationEM();
@@ -78,6 +80,30 @@ class ContinuationTrainer : public TrainerInterface {
   absl::Status RunConstrainedMStep(const std::vector<float>& expected,
                                    std::vector<ExtensionCandidate>* extensions,
                                    double* lambda) const;
+  // Per-extension DELETION LOSS, the quantity ordinary Unigram pruning ranks
+  // by (unigram_model_trainer.cc Trainer::PruneSentencePieces): how much
+  // corpus log-likelihood is lost if this extension is removed and every
+  // occurrence of it is resegmented through its best surviving alternative.
+  //
+  // This is NOT the expected count. Ranking extensions by expected count -- as
+  // this trainer did until 2026-09-10 -- keeps whatever is most FREQUENT,
+  // which systematically prefers pieces that merely fill a representational
+  // gap over pieces that compress a frequent phrase, because a gap-filler's
+  // count is undiluted while a phrase's count is split with the parent pieces
+  // that can already spell it. Deletion loss instead weights a piece's
+  // frequency by how expensive its fallback is, so a moderately frequent
+  // piece with a costly alternative can and should outrank a very frequent
+  // piece whose alternative is nearly as good.
+  //
+  // `loss[i]` is +inf for a candidate with no alternative segmentation (it is
+  // the only way to spell itself, so it must be kept) and -inf for one whose
+  // own Viterbi path is already split (it is unreachable and free to drop).
+  // Inherited pieces are never scored here: they are not candidates and
+  // cannot be pruned. Their frequencies ARE used, because an extension's
+  // alternative is usually inherited pieces.
+  absl::Status ComputeExtensionDeletionLoss(
+      const std::vector<ExtensionCandidate>& extensions, double lambda,
+      std::vector<double>* loss, std::vector<float>* viterbi_freq) const;
   // Both lambdas are roots of monotone objectives. They report failure
   // instead of returning a bracket endpoint that merely ran out of iterations.
   absl::Status SolveInitialLambda(
@@ -93,6 +119,9 @@ class ContinuationTrainer : public TrainerInterface {
   absl::Status VerifyPriorPrefix(const ModelProto& output) const;
   absl::Status FinalizeArtifacts();
 
+  // Characters present in the corpus but absent from the prior. Admitted
+  // as EXTENSION candidates, never as inherited state.
+  std::vector<std::string> bootstrap_pieces_;
   ModelProto prior_model_;
   std::string prior_model_bytes_;
   continuation::PreparedCorpus corpus_;
