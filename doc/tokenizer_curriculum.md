@@ -95,7 +95,7 @@ The context switches `PL:`, `PR:` and `Vn:` are ordinary text. In the
 Consequence: the stage-3 fence CANNOT reuse the inherited-meta fence, which
 keys on piece TYPE. It must key on normalized corpus SURFACE STRINGS.
 
-## G3: the context fence -- design, not yet implemented
+## G3: the context fence -- IMPLEMENTED
 
 Flag name: `--continuation_fence_strings` (not `fence_pieces`) -- these are
 normalized corpus surface strings, and they need not be standalone vocabulary
@@ -119,8 +119,9 @@ Semantics, deliberately narrow:
   immutable;
 - stage 4 simply omits the flag.
 
-**Fence correctness is an EXTRACTION property**, and the test must be written
-at that level:
+**Fence correctness is an EXTRACTION property**, and the tests are written at
+that level (`SPM_DUMP_CANDIDATES`, paired with `SPM_STOP_AFTER_INIT` for an
+extraction-only gate):
 
     fence ON  -> tracked context-containing/crossing candidates are ABSENT
                  from the extracted candidate pool
@@ -129,20 +130,35 @@ at that level:
 Do NOT require fence-OFF candidates to survive final pruning. Selection is an
 optimizer outcome, not a fence-correctness condition.
 
-Requirement for the matcher: **union all overlapping fence intervals**. Do not
-skip ahead by the length of the previous longest match -- overlapping fence
-strings would then be missed. The inherited-meta fence already builds a fenced
-byte mask via `normalizer::PrefixMatcher`; G3 should share one fenced-span
-builder with it rather than growing a second.
+The matcher **unions all overlapping fence intervals**: every character
+boundary is probed as a match start and a match only ever ADDS to the mask.
+Skipping ahead by the previous match length would miss overlapping starts --
+with fences `{abc, bcd}` over `abcd` it marks `[0,3)` and leaves the final
+character admissible. Both fence sources share one `FenceMask` builder, whose
+byte<->character mapping is exact: matches start only at character boundaries,
+and a match whose end is not a boundary is refused rather than rounded.
+
+Diagnostics distinguish the two sources. Explicit context fences are NOT
+`meta_fenced_spans`:
+
+    METAFENCE symbols=... present_in_corpus=... matcher=...
+    FENCE logical="Vn:" normalized="<boundary-bearing surface>"
+    FENCE logical_count=... normalized_unique=... matcher=...
+    FENCE inherited_meta_matches=... explicit_string_matches=...
+          fenced_characters=... records_with_explicit_fence=...
+          malformed_boundary_matches=...
 
 ## Gates before any full run
 
 1. Stage-1 output: distinct record count, and every count equal to 1.
 2. Stage 2: piece strings and IDs identical to stage 1; NORMAL scores changed;
    non-NORMAL scores bit-identical; NORMAL simplex sums to 1.
-3. G3: with the fence on, tracked context candidates absent from extraction and
-   `meta_fenced_spans > 0`; with it off, present. Same corpus, same seed -- the
-   flag is the only variable.
+3. G3: with the fence on, tracked context candidates are absent from
+   EXTRACTION and `explicit_string_matches > 0`; with it off, present. Same
+   corpus, same seed -- the flag is the only variable. Do NOT require
+   `meta_fenced_spans > 0`: `PL:`/`PR:`/`Vn:` are ordinary NORMAL surface text,
+   not inherited typed meta symbols, so they are counted by
+   `explicit_string_matches` and the meta counter can legitimately stay 0.
 4. Only then stages 3 and 4 end to end, with the same contract checks the
    baseline passes and the same 40k-row token-cost evaluation against the
    frozen 1500 baseline.

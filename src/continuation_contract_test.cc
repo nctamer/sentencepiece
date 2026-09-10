@@ -26,6 +26,7 @@
 #include "absl/strings/str_split.h"
 #include "absl/strings/numbers.h"
 #include "filesystem.h"
+#include "normalizer.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
 #include "trainer_factory.h"
@@ -34,6 +35,7 @@
 
 ABSL_DECLARE_FLAG(int32_t, continuation_spill_entries);
 ABSL_DECLARE_FLAG(float, min_freq_alpha);
+ABSL_DECLARE_FLAG(std::string, continuation_fence_strings);
 
 namespace sentencepiece {
 namespace {
@@ -2182,6 +2184,452 @@ TEST(UnigramContinuationContractTest, CandidatePoolIsKIndependentAtAlphaZero) {
     EXPECT_EQ(small.pieces(id).piece(), large.pieces(id).piece())
         << "at id " << id << ": the candidate pool moved with K";
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// G3: explicit string-keyed candidate fences.
+//
+// Every test here is an EXTRACTION-level test. None of them asks EM to select
+// or reject a piece: whether a candidate survives pruning is an optimizer
+// outcome, and it is not what the fence controls. The fence controls which
+// candidates are PROPOSED.
+// ---------------------------------------------------------------------------
+
+using PieceFreq = std::pair<std::string, uint64_t>;
+
+// Runs continuation with SPM_DUMP_CANDIDATES and returns the extracted pool.
+std::vector<PieceFreq> ExtractCandidates(const ModelProto& prior,
+                                         const std::vector<std::string>& lines,
+                                         const std::string& fence_spec,
+                                         const std::string& tag,
+                                         int vocab_size = 0,
+                                         std::string* dump_path_out = nullptr,
+                                         absl::Status* status_out = nullptr) {
+  const std::string prior_path = TempPath("g3_" + tag + "_prior.model");
+  const std::string input = TempPath("g3_" + tag + "_input.txt");
+  const std::string prefix = TempPath("g3_" + tag + "_model");
+  const std::string dump = TempPath("g3_" + tag + "_cands.tsv");
+  EXPECT_TRUE(WriteProto(prior_path, prior));
+  EXPECT_TRUE(WriteLines(input, lines));
+  ::remove(dump.c_str());
+
+  const std::string saved_fence =
+      absl::GetFlag(FLAGS_continuation_fence_strings);
+  absl::SetFlag(&FLAGS_continuation_fence_strings, fence_spec);
+  ScopedEnv dump_env("SPM_DUMP_CANDIDATES", dump);
+
+  TrainerSpec trainer = UnigramContinuationSpec(
+      input, "text", prior_path, TempPath("g3_" + tag + ".result"), prefix);
+  trainer.set_vocab_size(vocab_size > 0 ? vocab_size : prior.pieces_size() + 2);
+  trainer.set_max_sentencepiece_length(8);
+  const absl::Status status = RunTrainer(trainer, NormalizerSpec());
+  absl::SetFlag(&FLAGS_continuation_fence_strings, saved_fence);
+  if (status_out != nullptr) *status_out = status;
+  if (dump_path_out != nullptr) *dump_path_out = dump;
+
+  std::vector<PieceFreq> out;
+  auto in = filesystem::NewReadableFile(dump);
+  if (!in->status().ok()) return out;
+  std::string line;
+  while (in->ReadLine(&line)) {
+    if (line.empty()) continue;
+    const std::vector<std::string> f = absl::StrSplit(line, '\t');
+    if (f.size() != 3) continue;
+    uint64_t freq = 0;
+    if (!absl::SimpleAtoi(f[2], &freq)) continue;
+    out.emplace_back(f[1], freq);
+  }
+  return out;
+}
+
+bool HasCandidate(const std::vector<PieceFreq>& pool, const std::string& p) {
+  for (const auto& e : pool) {
+    if (e.first == p) return true;
+  }
+  return false;
+}
+
+std::string ReadWhole(const std::string& path) {
+  auto in = filesystem::NewReadableFile(path);
+  if (!in->status().ok()) return "<unreadable>";
+  std::string all;
+  if (!in->ReadAll(&all)) return "<unreadable>";
+  return all;
+}
+
+// The prior for the G3 tests: alphabet plus a USER_DEFINED meta symbol, so the
+// union of both fence sources can be exercised. Context switches are ORDINARY
+// NORMAL text and are deliberately NOT pieces of the prior.
+ModelProto MakeG3Prior() {
+  ModelProto prior;
+  TrainerSpec* t = prior.mutable_trainer_spec();
+  t->set_model_type(TrainerSpec::UNIGRAM);
+  t->set_unk_id(0);
+  t->set_bos_id(-1);
+  t->set_eos_id(-1);
+  t->set_pad_id(-1);
+  t->set_split_by_whitespace(false);
+  t->set_split_by_unicode_script(false);
+  t->set_split_by_number(false);
+  // The REAL corpus normalizer: identity, dummy prefix on, whitespace escaped.
+  // This is what turns a logical "Vn:" into its boundary-bearing surface.
+  NormalizerSpec* n = prior.mutable_normalizer_spec();
+  n->set_name("identity");
+  n->set_add_dummy_prefix(true);
+  n->set_remove_extra_whitespaces(false);
+  n->set_escape_whitespaces(true);
+
+  auto add = [&prior](absl::string_view piece, float score,
+                      ModelProto::SentencePiece::Type type) {
+    auto* p = prior.add_pieces();
+    p->set_piece(std::string(piece));
+    p->set_score(score);
+    p->set_type(type);
+  };
+  add("<unk>", 0.0f, ModelProto::SentencePiece::UNKNOWN);
+  add("<X>", -9.0f, ModelProto::SentencePiece::USER_DEFINED);
+  float score = -2.0f;
+  for (const char* ch : {"\xe2\x96\x81", "a", "b", "c", "d", "e", "f", "n",
+                         "L", "P", "R", "V", ":"}) {
+    add(ch, score, ModelProto::SentencePiece::NORMAL);
+    score -= 0.05f;
+  }
+  t->set_vocab_size(prior.pieces_size());
+  return prior;
+}
+
+// A variant whose normalizer adds no dummy prefix, so a logical fence string
+// IS its own surface. Used only where the property under test is about the
+// MATCHER (overlapping spans), not about this corpus's normalization.
+ModelProto MakeG3PriorNoDummyPrefix() {
+  ModelProto prior = MakeG3Prior();
+  prior.mutable_normalizer_spec()->set_add_dummy_prefix(false);
+  return prior;
+}
+
+// Normalizes a logical string exactly the way the trainer does, so assertions
+// never contain a guessed U+2581 spelling.
+std::string NormalizeLikeTrainer(const ModelProto& prior,
+                                 absl::string_view logical) {
+  normalizer::Normalizer norm(prior.normalizer_spec(), prior.trainer_spec());
+  EXPECT_TRUE(norm.status().ok());
+  return norm.Normalize(logical);
+}
+
+// THE ASSUMPTION THE WHOLE FLAG RESTS ON, tested rather than assumed: a
+// logical "Vn:" supplied by the caller must normalize to the surface that
+// actually occurs in normalized training text. With add_dummy_prefix=true and
+// escape_whitespaces=true that is the boundary-bearing form, which is also
+// what stops it matching inside unrelated material like "fooVn:bar".
+TEST(UnigramContinuationContractTest, LogicalFenceStringNormalizesToCorpusSurface) {
+  const ModelProto prior = MakeG3Prior();
+  const std::string surface = NormalizeLikeTrainer(prior, "Vn:");
+  EXPECT_EQ("\xe2\x96\x81"
+            "Vn:", surface)
+      << "logical Vn: did not normalize to the boundary-bearing surface";
+
+  // And the same normalizer applied to a training record really does contain
+  // that surface, at a word boundary.
+  const std::string record = NormalizeLikeTrainer(prior, "a Vn: b");
+  EXPECT_NE(std::string::npos, record.find(surface))
+      << "normalized record " << record << " does not contain " << surface;
+
+  // A raw substring occurrence must NOT be the same string, or the fence would
+  // match inside unrelated material.
+  const std::string glued = NormalizeLikeTrainer(prior, "fooVn:bar");
+  EXPECT_EQ(std::string::npos, glued.find(surface))
+      << "the fence surface appears inside glued material " << glued;
+}
+
+TEST(UnigramContinuationContractTest, FenceRejectsMalformedConfiguration) {
+  const ModelProto prior = MakeG3Prior();
+  absl::Status status;
+  ExtractCandidates(prior, {"a PL: b"}, "PL:,,Vn:", "malformed", 0, nullptr,
+                    &status);
+  EXPECT_FALSE(status.ok()) << "an empty list entry must be rejected";
+  EXPECT_EQ(absl::StatusCode::kInvalidArgument, status.code()) << status;
+}
+
+// OVERLAPPING MATCHES MUST BE UNIONED. With fences {abc, bcd} over "abcd" the
+// old longest-match-then-skip loop marked [0,3) and never reconsidered
+// position 1, leaving the final character admissible.
+TEST(UnigramContinuationContractTest, OverlappingFenceMatchesAreUnioned) {
+  // {abc, bcd} over "abcd" match at [2,5) and [3,6) of "eeabcdff". The old
+  // longest-match-then-skip loop marked the first and then jumped past
+  // position 3, so the final 'd' stayed admissible. The union must be [2,6).
+  //
+  // add_dummy_prefix is off here on purpose: the property under test is the
+  // matcher's span union, and a dummy prefix would make "bcd" simply not occur
+  // in the normalized text, so the test would pass without testing anything.
+  const ModelProto prior = MakeG3PriorNoDummyPrefix();
+  EXPECT_EQ("abc", NormalizeLikeTrainer(prior, "abc"));
+  EXPECT_EQ("bcd", NormalizeLikeTrainer(prior, "bcd"));
+  const std::vector<std::string> lines(40, "eeabcdff");
+  EXPECT_EQ("eeabcdff", NormalizeLikeTrainer(prior, "eeabcdff"))
+      << "the record does not normalize to itself; the offsets below are wrong";
+
+  const auto off = ExtractCandidates(prior, lines, "", "overlap_off");
+  const auto on = ExtractCandidates(prior, lines, "abc,bcd", "overlap_on");
+
+  // Only ONE fence would leave part of "abcd" admissible; the union leaves
+  // none of it.
+  const auto single = ExtractCandidates(prior, lines, "abc", "overlap_single");
+  bool single_leaves_d = false;
+  for (const auto& e : single) {
+    if (e.first.find('d') != std::string::npos) single_leaves_d = true;
+  }
+  EXPECT_TRUE(single_leaves_d)
+      << "fencing only \"abc\" already removed every 'd'; the union test "
+         "cannot distinguish anything";
+
+  for (const auto& e : on) {
+    EXPECT_EQ(std::string::npos, e.first.find_first_of("abcd"))
+        << "candidate " << e.first << " overlaps the unioned fence";
+  }
+  bool off_has_some = false;
+  for (const auto& e : off) {
+    if (e.first.find_first_of("abcd") != std::string::npos) off_has_some = true;
+  }
+  EXPECT_TRUE(off_has_some) << "fence-off produced no candidate to remove";
+  EXPECT_TRUE(HasCandidate(on, "ee") || HasCandidate(on, "ff"))
+      << "legal spans were fenced too";
+}
+
+// Multi-byte fence strings must mark the correct UNICODE interval.
+TEST(UnigramContinuationContractTest, MultiByteFenceMarksCorrectUnicodeSpan) {
+  ModelProto prior = MakeG3Prior();
+  for (const char* ch : {"\xc3\xbc", "\xe2\x82\xac"}) {   // 'ü' (2B), '€' (3B)
+    auto* p = prior.add_pieces();
+    p->set_piece(ch);
+    p->set_score(-3.0f);
+    p->set_type(ModelProto::SentencePiece::NORMAL);
+  }
+  prior.mutable_trainer_spec()->set_vocab_size(prior.pieces_size());
+  const std::vector<std::string> lines(40, "aa \xc3\xbc\xe2\x82\xac bb");
+
+  const auto off = ExtractCandidates(prior, lines, "", "mb_off");
+  const auto on = ExtractCandidates(prior, lines, "\xc3\xbc\xe2\x82\xac",
+                                    "mb_on");
+  EXPECT_TRUE(HasCandidate(off, "\xc3\xbc\xe2\x82\xac"))
+      << "the multi-byte candidate was not proposed even with the fence off";
+  for (const auto& e : on) {
+    EXPECT_EQ(std::string::npos, e.first.find("\xc3\xbc"))
+        << "candidate " << e.first << " overlaps a fenced multi-byte character";
+    EXPECT_EQ(std::string::npos, e.first.find("\xe2\x82\xac"))
+        << "candidate " << e.first << " overlaps a fenced multi-byte character";
+  }
+  EXPECT_TRUE(HasCandidate(on, "aa") || HasCandidate(on, "bb"));
+}
+
+// THE CENTRAL G3 TEST. Fence OFF proposes context-containing and
+// context-crossing candidates; fence ON proposes none of them, while
+// candidates wholly inside the legal spans survive.
+TEST(UnigramContinuationContractTest, ContextFencesRemoveExactlyContextCandidates) {
+  const ModelProto prior = MakeG3Prior();
+  std::vector<std::string> lines;
+  for (int i = 0; i < 40; ++i) {
+    lines.push_back("aa PL: bb");
+    lines.push_back("cc PR: dd");
+    lines.push_back("ee Vn: ff");
+  }
+  const auto off = ExtractCandidates(prior, lines, "", "ctx_off");
+  const auto on = ExtractCandidates(prior, lines, "PL:,PR:,Vn:", "ctx_on");
+
+  // Assertions are built THROUGH the normalizer, never by guessing a U+2581
+  // spelling.
+  const std::string pl = NormalizeLikeTrainer(prior, "PL:");   // the switch
+  const std::string vn = NormalizeLikeTrainer(prior, "Vn:");
+  // Crossing candidates are cut out of the NORMALIZED RECORD, not assembled
+  // from separately normalized fragments: "a PL:" normalizes with its own
+  // leading boundary and is not the substring that actually occurs here.
+  const std::string record = NormalizeLikeTrainer(prior, "aa PL: bb");
+  const size_t at = record.find(pl);
+  ASSERT_NE(std::string::npos, at) << "record " << record;
+  ASSERT_GT(at, 0u);
+  // The whitespace marker is DERIVED from the normalized fence rather than
+  // spelled out: pl is marker + "PL:", so everything below stays on character
+  // boundaries even though the marker is three bytes.
+  const std::string marker = pl.substr(0, pl.size() - std::string("PL:").size());
+  ASSERT_FALSE(marker.empty());
+  const std::string a_pl = record.substr(at - 1, 1 + pl.size());
+  const std::string pl_b = record.substr(at, pl.size() + marker.size() + 1);
+  const std::string a_pl_b =
+      record.substr(at - 1, 1 + pl.size() + marker.size() + 1);
+
+  // fence OFF: representative context candidates are proposed.
+  EXPECT_TRUE(HasCandidate(off, pl)) << "missing " << pl;
+  EXPECT_TRUE(HasCandidate(off, vn)) << "missing " << vn;
+  EXPECT_TRUE(HasCandidate(off, a_pl)) << "missing left-crossing " << a_pl;
+  EXPECT_TRUE(HasCandidate(off, pl_b)) << "missing right-crossing " << pl_b;
+  EXPECT_TRUE(HasCandidate(off, a_pl_b)) << "missing spanning " << a_pl_b;
+
+  // fence ON: those exact candidates are gone, and so is anything else that
+  // touches a fenced character -- including the switch itself.
+  for (const std::string& gone : {pl, vn, a_pl, pl_b, a_pl_b}) {
+    EXPECT_FALSE(HasCandidate(on, gone)) << "still proposed: " << gone;
+  }
+  for (const auto& e : on) {
+    for (const std::string& fenced :
+         {NormalizeLikeTrainer(prior, "PL:"), NormalizeLikeTrainer(prior, "PR:"),
+          NormalizeLikeTrainer(prior, "Vn:")}) {
+      EXPECT_EQ(std::string::npos, e.first.find(fenced))
+          << "candidate " << e.first << " contains fenced " << fenced;
+    }
+    // No candidate may contain any character of a fenced span, so the bare
+    // marker characters cannot appear either.
+    EXPECT_EQ(std::string::npos, e.first.find(':'))
+        << "candidate " << e.first << " overlaps a fenced character";
+  }
+
+  // Candidates wholly inside the legal left/right spans remain.
+  EXPECT_TRUE(HasCandidate(on, "aa")) << "legal left span was fenced";
+  EXPECT_TRUE(HasCandidate(on, "bb")) << "legal right span was fenced";
+  EXPECT_TRUE(HasCandidate(on, "ff")) << "legal right span was fenced";
+}
+
+// The fence governs candidate PROPOSAL, never the inherited model.
+TEST(UnigramContinuationContractTest, FenceDoesNotTouchInheritedPieces) {
+  ModelProto prior = MakeG3Prior();
+  // An inherited NORMAL piece that CONTAINS the fenced context switch.
+  const std::string inherited = NormalizeLikeTrainer(prior, "Vn: d");
+  auto* p = prior.add_pieces();
+  p->set_piece(inherited);
+  p->set_score(-4.5f);
+  p->set_type(ModelProto::SentencePiece::NORMAL);
+  const int inherited_id = prior.pieces_size() - 1;
+  prior.mutable_trainer_spec()->set_vocab_size(prior.pieces_size());
+
+  const std::string prior_path = TempPath("g3_inherit_prior.model");
+  const std::string input = TempPath("g3_inherit_input.txt");
+  const std::string prefix = TempPath("g3_inherit_model");
+  const std::string dump = TempPath("g3_inherit_cands.tsv");
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  std::vector<std::string> lines;
+  for (int i = 0; i < 40; ++i) {
+    lines.push_back("aa Vn: d bb");
+    lines.push_back("cc Vn: e dd");
+  }
+  ASSERT_TRUE(WriteLines(input, lines));
+
+  const std::string saved = absl::GetFlag(FLAGS_continuation_fence_strings);
+  absl::SetFlag(&FLAGS_continuation_fence_strings, "Vn:");
+  ScopedEnv dump_env("SPM_DUMP_CANDIDATES", dump);
+  TrainerSpec trainer = UnigramContinuationSpec(
+      input, "text", prior_path, TempPath("g3_inherit.result"), prefix);
+  trainer.set_vocab_size(prior.pieces_size() + 2);
+  trainer.set_max_sentencepiece_length(8);
+  const absl::Status status = RunTrainer(trainer, NormalizerSpec());
+  absl::SetFlag(&FLAGS_continuation_fence_strings, saved);
+  ASSERT_TRUE(status.ok()) << status;
+
+  ModelProto out;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &out));
+  // Same ID, same string, same type.
+  ASSERT_LT(inherited_id, out.pieces_size());
+  EXPECT_EQ(inherited, out.pieces(inherited_id).piece());
+  EXPECT_EQ(ModelProto::SentencePiece::NORMAL, out.pieces(inherited_id).type());
+  // And its score obeys the ordinary gauge contract, fence or no fence.
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(TempPath("g3_inherit.result"), &result));
+  EXPECT_TRUE(unigram::VerifyPriorPrefixInvariant(prior, out,
+                                                 result.unigram_lambda()).ok());
+
+  // The E-step could still use it: it is in the model the trainer built, and
+  // the gauge shifted it like any other inherited NORMAL piece.
+  EXPECT_NE(prior.pieces(inherited_id).score(), out.pieces(inherited_id).score());
+
+  // But no NEW candidate contains or crosses the fence.
+  const std::string vn = NormalizeLikeTrainer(prior, "Vn:");
+  auto in = filesystem::NewReadableFile(dump);
+  ASSERT_TRUE(in->status().ok());
+  std::string line;
+  int rows = 0;
+  while (in->ReadLine(&line)) {
+    if (line.empty()) continue;
+    const std::vector<std::string> f = absl::StrSplit(line, '\t');
+    ASSERT_EQ(3u, f.size());
+    EXPECT_EQ(std::string::npos, f[1].find(vn))
+        << "new candidate " << f[1] << " contains the fenced switch";
+    ++rows;
+  }
+  EXPECT_GT(rows, 0) << "no candidates at all; the test proves nothing";
+}
+
+// Typed-meta fencing (defect D) and explicit-string fencing must UNION, and
+// the counters must keep them apart.
+TEST(UnigramContinuationContractTest, MetaAndExplicitFencesUnion) {
+  const ModelProto prior = MakeG3Prior();       // contains USER_DEFINED "<X>"
+  std::vector<std::string> lines(60, "aa <X> bb Vn: cc");
+  const auto on = ExtractCandidates(prior, lines, "Vn:", "union_on");
+  ASSERT_FALSE(on.empty());
+
+  const std::string vn = NormalizeLikeTrainer(prior, "Vn:");
+  for (const auto& e : on) {
+    EXPECT_EQ(std::string::npos, e.first.find("<X>"))
+        << e.first << " crosses the inherited meta symbol";
+    EXPECT_EQ(std::string::npos, e.first.find('<')) << e.first;
+    EXPECT_EQ(std::string::npos, e.first.find(vn))
+        << e.first << " overlaps the explicit fence";
+    EXPECT_EQ(std::string::npos, e.first.find(':')) << e.first;
+  }
+  // Legal regions still produce candidates.
+  EXPECT_TRUE(HasCandidate(on, "aa"));
+  EXPECT_TRUE(HasCandidate(on, "bb"));
+  EXPECT_TRUE(HasCandidate(on, "cc"));
+}
+
+// An empty/absent option must be a STRICT no-op, because G3 is a curriculum
+// option and not a new default modelling rule.
+TEST(UnigramContinuationContractTest, EmptyFenceOptionIsAStrictNoOp) {
+  const ModelProto prior = MakeG3Prior();
+  std::vector<std::string> lines;
+  for (int i = 0; i < 40; ++i) {
+    lines.push_back("aa PL: bb");
+    lines.push_back("cc Vn: dd");
+  }
+  std::string dump_absent, dump_empty;
+  const auto absent =
+      ExtractCandidates(prior, lines, "", "noop_absent", 0, &dump_absent);
+  const auto empty =
+      ExtractCandidates(prior, lines, "", "noop_empty", 0, &dump_empty);
+
+  // Candidate dumps byte-identical.
+  EXPECT_EQ(ReadWhole(dump_absent), ReadWhole(dump_empty));
+  ASSERT_EQ(absent.size(), empty.size());
+  for (size_t i = 0; i < absent.size(); ++i) {
+    EXPECT_EQ(absent[i].first, empty[i].first) << "at rank " << i;
+    EXPECT_EQ(absent[i].second, empty[i].second) << "at rank " << i;
+  }
+
+  // And the final models agree bit for bit.
+  ModelProto m1, m2;
+  ASSERT_TRUE(ReadProto(TempPath("g3_noop_absent_model.model"), &m1));
+  ASSERT_TRUE(ReadProto(TempPath("g3_noop_empty_model.model"), &m2));
+  ASSERT_EQ(m1.pieces_size(), m2.pieces_size());
+  for (int i = 0; i < m1.pieces_size(); ++i) {
+    EXPECT_EQ(m1.pieces(i).piece(), m2.pieces(i).piece());
+    EXPECT_EQ(m1.pieces(i).type(), m2.pieces(i).type());
+    EXPECT_EQ(m1.pieces(i).score(), m2.pieces(i).score());
+  }
+}
+
+// Fence ORDER must not be a modelling parameter, and duplicates must collapse.
+TEST(UnigramContinuationContractTest, FenceSetIsOrderIndependentAndDeduplicated) {
+  const ModelProto prior = MakeG3Prior();
+  std::vector<std::string> lines;
+  for (int i = 0; i < 40; ++i) {
+    lines.push_back("aa PL: bb");
+    lines.push_back("cc PR: dd");
+    lines.push_back("ee Vn: ff");
+  }
+  std::string d1, d2, d3;
+  ExtractCandidates(prior, lines, "PL:,PR:,Vn:", "order_a", 0, &d1);
+  ExtractCandidates(prior, lines, "Vn:,PL:,PR:", "order_b", 0, &d2);
+  ExtractCandidates(prior, lines, "Vn:,PL:,Vn:,PR:,PR:", "order_c", 0, &d3);
+  const std::string a = ReadWhole(d1);
+  EXPECT_EQ(a, ReadWhole(d2)) << "fence list order changed extraction";
+  EXPECT_EQ(a, ReadWhole(d3)) << "duplicate fence entries changed extraction";
 }
 
 }  // namespace

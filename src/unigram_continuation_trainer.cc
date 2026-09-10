@@ -42,6 +42,15 @@
 #include "unigram_model_trainer.h"
 #include "util.h"
 
+ABSL_FLAG(std::string, continuation_fence_strings, "",
+          "comma-separated LOGICAL corpus strings (e.g. \"PL:,PR:,Vn:\") that "
+          "fence Unigram continuation CANDIDATE GENERATION. Each is normalized "
+          "with the prior's own normalizer before matching, so callers pass "
+          "PL: and never the internal \xe2\x96\x81PL: form. No new candidate may "
+          "overlap a fenced character. The corpus, the E-step, inherited "
+          "pieces and BPE are all unaffected. Entries may not be empty and may "
+          "not themselves contain a comma.");
+
 ABSL_FLAG(std::string, continuation_spill_dir, "",
           "directory under which candidate-extraction spill runs are created. "
           "Empty means $TMPDIR, or /tmp when that is unset. Each run creates a "
@@ -111,6 +120,124 @@ class SpillScratch {
   std::vector<std::string> runs_;
   bool open_ = false;
 };
+
+// ONE FENCED-SPAN MECHANISM, TWO SOURCES.
+//
+// Candidate enumeration must exclude characters covered by
+//   A. inherited TYPED meta symbols (USER_DEFINED / CONTROL / UNKNOWN / BYTE),
+//      because the lattice scores those by maximal matching rather than as
+//      ordinary Unigram log-probabilities (defect D); and
+//   B. explicit curriculum fence STRINGS supplied by
+//      --continuation_fence_strings, which are ordinary NORMAL surface text
+//      such as the normalized form of "Vn:".
+// The mask is the UNION of both; the counters keep them apart, because "no
+// candidate crossed a meta symbol" and "no candidate crossed a context switch"
+// are different claims.
+//
+// TWO CORRECTNESS PROPERTIES THIS TYPE OWES, both of which the earlier
+// meta-only code got wrong and neither of which a caller can see:
+//
+//  1. UNION OF ALL MATCHES, not longest-match-then-skip. The old loop did
+//     `b += n` after a match, so with fences {abc, bcd} over "abcd" it marked
+//     [0,3) and never looked at position 1 again -- [3,4) stayed admissible
+//     although "bcd" covers it. Every character boundary is now probed, and a
+//     match only ever ADDS to the mask.
+//  2. EXACT byte<->character mapping. Character positions are what enumeration
+//     indexes, matchers return byte lengths. `char_of_byte` is defined ONLY at
+//     real UTF-8 boundaries (-1 elsewhere), matches are attempted only at
+//     boundaries, and a match whose end is not a boundary is refused rather
+//     than rounded to one.
+class FenceMask {
+ public:
+  void SetInheritedMeta(std::unique_ptr<normalizer::PrefixMatcher> m) {
+    meta_ = std::move(m);
+  }
+  void SetExplicit(std::unique_ptr<normalizer::PrefixMatcher> m) {
+    explicit_ = std::move(m);
+  }
+  bool active() const { return meta_ != nullptr || explicit_ != nullptr; }
+
+  // Fills `fenced` (one entry per Unicode character of `utf8`) or leaves it
+  // empty when no fencing is configured. `utf8` and `text` are the same
+  // sentence in the two representations enumeration already has in hand, so
+  // this adds no corpus copy.
+  void Build(absl::string_view utf8, const string_util::UnicodeText& text,
+             std::vector<char>* fenced) {
+    fenced->clear();
+    if (!active()) return;
+
+    // Byte offset -> character index, defined only at character boundaries.
+    std::vector<int64_t> char_of_byte(utf8.size() + 1, -1);
+    std::vector<size_t> byte_of_char(text.size() + 1, 0);
+    size_t b = 0;
+    for (size_t c = 0; c < text.size(); ++c) {
+      char_of_byte[b] = static_cast<int64_t>(c);
+      byte_of_char[c] = b;
+      b += string_util::UnicodeCharToUTF8(text[c]).size();
+    }
+    char_of_byte[b] = static_cast<int64_t>(text.size());
+    byte_of_char[text.size()] = b;
+    if (b != utf8.size()) {
+      // The two representations disagree; fence nothing rather than mark the
+      // wrong characters.
+      ++malformed_;
+      return;
+    }
+
+    fenced->assign(text.size(), 0);
+    bool any_explicit_here = false;
+    // EVERY character boundary is a candidate match start. Never skip ahead by
+    // a previous match length.
+    for (size_t c = 0; c < text.size(); ++c) {
+      Mark(meta_.get(), utf8, byte_of_char[c], c, char_of_byte, fenced,
+           &meta_matches_, nullptr);
+      Mark(explicit_.get(), utf8, byte_of_char[c], c, char_of_byte, fenced,
+           &explicit_matches_, &any_explicit_here);
+    }
+    if (any_explicit_here) ++records_with_explicit_;
+    for (const char f : *fenced) {
+      if (f) ++fenced_characters_;
+    }
+  }
+
+  uint64_t meta_matches() const { return meta_matches_; }
+  uint64_t explicit_matches() const { return explicit_matches_; }
+  uint64_t fenced_characters() const { return fenced_characters_; }
+  uint64_t records_with_explicit() const { return records_with_explicit_; }
+  uint64_t malformed() const { return malformed_; }
+
+  // The absolute byte offset is passed in rather than recovered from pointer
+  // arithmetic: the match end must be checked against the SENTENCE's boundary
+  // table, and a suffix view does not carry that offset.
+  void Mark(const normalizer::PrefixMatcher* matcher, absl::string_view utf8,
+            size_t start_byte, size_t c0,
+            const std::vector<int64_t>& char_of_byte, std::vector<char>* fenced,
+            uint64_t* counter, bool* seen_here) {
+    if (matcher == nullptr) return;
+    bool found = false;
+    const int n = matcher->PrefixMatch(utf8.substr(start_byte), &found);
+    if (!found || n <= 0) return;
+    const size_t end_byte = start_byte + static_cast<size_t>(n);
+    // Refuse a match that does not land on a character boundary rather than
+    // rounding it onto one: a partial-byte span must never reach the mask.
+    if (end_byte >= char_of_byte.size() || char_of_byte[end_byte] < 0) {
+      ++malformed_;
+      return;
+    }
+    const size_t c1 = static_cast<size_t>(char_of_byte[end_byte]);
+    ++*counter;
+    if (seen_here != nullptr) *seen_here = true;
+    for (size_t c = c0; c < c1 && c < fenced->size(); ++c) (*fenced)[c] = 1;
+  }
+
+ private:
+  std::unique_ptr<normalizer::PrefixMatcher> meta_;
+  std::unique_ptr<normalizer::PrefixMatcher> explicit_;
+  uint64_t meta_matches_ = 0, explicit_matches_ = 0;
+  uint64_t fenced_characters_ = 0, records_with_explicit_ = 0, malformed_ = 0;
+};
+
+
 
 
 
@@ -611,15 +738,69 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     }
     if (meta_present) break;
   }
-  std::unique_ptr<normalizer::PrefixMatcher> meta_matcher;
+
+  FenceMask fence;
   if (meta_present && !meta_symbols.empty()) {
-    meta_matcher =
-        std::make_unique<normalizer::PrefixMatcher>(meta_symbols);
+    fence.SetInheritedMeta(
+        std::make_unique<normalizer::PrefixMatcher>(meta_symbols));
   }
-  uint64_t meta_fenced_spans = 0;
   LOG(INFO) << "METAFENCE symbols=" << meta_symbols.size()
             << " present_in_corpus=" << (meta_present ? "yes" : "no")
-            << " matcher=" << (meta_matcher ? "active" : "skipped(no-op)");
+            << " matcher=" << (meta_present && !meta_symbols.empty()
+                                   ? "active"
+                                   : "skipped(no-op)");
+
+  // EXPLICIT CURRICULUM FENCES (--continuation_fence_strings).
+  //
+  // The caller supplies LOGICAL corpus strings ("PL:", "PR:", "Vn:"). They are
+  // normalized here with the PRIOR's own normalizer -- the same regime that
+  // produced the records in corpus_ -- so a caller never types the internal
+  // U+2581 form and there is no second normalization convention. With this
+  // corpus's normalizer (identity, add_dummy_prefix, escape_whitespaces) the
+  // logical "Vn:" becomes the boundary-bearing surface that actually occurs in
+  // the normalized text, which is also what keeps it from matching inside
+  // unrelated material such as "fooVn:bar".
+  std::set<std::string> fence_surface_storage;
+  size_t logical_fence_count = 0;
+  {
+    const std::string spec = absl::GetFlag(FLAGS_continuation_fence_strings);
+    if (!spec.empty()) {
+      normalizer::Normalizer fence_normalizer(prior_model_.normalizer_spec(),
+                                              trainer_spec_);
+      ABSL_RETURN_IF_ERROR(fence_normalizer.status());
+      for (const auto& logical : absl::StrSplit(spec, ',')) {
+        const std::string one(logical);
+        if (one.empty()) {
+          return absl::InvalidArgumentError(
+              "--continuation_fence_strings contains an empty entry; the "
+              "syntax is a comma-separated list of non-empty logical strings "
+              "and an entry may not itself contain a comma");
+        }
+        ++logical_fence_count;
+        const std::string surface = fence_normalizer.Normalize(one);
+        if (surface.empty()) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "continuation fence string ", one,
+              " normalizes to the empty string under the prior's normalizer"));
+        }
+        // Deterministic dedup: a std::set of surfaces, so the configured order
+        // of the list cannot become a modelling parameter.
+        const bool inserted = fence_surface_storage.insert(surface).second;
+        LOG(INFO) << "FENCE logical=\"" << one << "\" normalized=\"" << surface
+                  << "\"" << (inserted ? "" : " (duplicate, deduplicated)");
+      }
+    }
+  }
+  if (!fence_surface_storage.empty()) {
+    std::set<absl::string_view> views;
+    for (const auto& sfc : fence_surface_storage) views.insert(sfc);
+    fence.SetExplicit(std::make_unique<normalizer::PrefixMatcher>(views));
+  }
+  LOG(INFO) << "FENCE logical_count=" << logical_fence_count
+            << " normalized_unique=" << fence_surface_storage.size()
+            << " matcher=" << (fence_surface_storage.empty()
+                                   ? "none(no-op)"
+                                   : "active");
 
   absl::flat_hash_map<std::string, uint64_t> counts;
   // Entry cap governs resident aggregation memory, NOT the retained pool.
@@ -693,39 +874,16 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     const string_util::UnicodeText text =
         string_util::UTF8ToUnicodeText(sentence.first);
 
-    // Candidate-only meta fence: mark every character position covered by an
-    // inherited meta symbol. Enumeration may not start inside one, and may not
-    // extend across one, so no learned NORMAL piece can span a symbol the
-    // lattice scores by maximal matching. The record itself is untouched.
+    // Candidate-only fence: mark every character position covered by an
+    // inherited meta symbol OR an explicit curriculum fence string, as a
+    // UNION. Enumeration may not start inside a fenced character and may not
+    // extend across one, so no NEW piece can contain, cross or equal a fenced
+    // span. The record itself is untouched and the E-step still reads it whole.
+    //
+    // The mask is per-sentence and transient: no persistent corpus-wide fence
+    // storage, no second copy of the corpus, no extra pass.
     std::vector<char> fenced;
-    if (meta_matcher != nullptr) {
-      fenced.assign(text.size(), 0);
-      size_t byte_pos = 0;
-      std::vector<size_t> char_at_byte;
-      char_at_byte.reserve(text.size() + 1);
-      for (size_t c = 0; c < text.size(); ++c) {
-        char_at_byte.resize(byte_pos + 1, c);
-        char_at_byte[byte_pos] = c;
-        byte_pos += string_util::UnicodeCharToUTF8(text[c]).size();
-      }
-      absl::string_view rest(sentence.first);
-      size_t b = 0;
-      while (b < sentence.first.size()) {
-        bool found = false;
-        const int n = meta_matcher->PrefixMatch(rest.substr(b), &found);
-        if (found && n > 0) {
-          ++meta_fenced_spans;
-          const size_t c0 = b < char_at_byte.size() ? char_at_byte[b] : 0;
-          const size_t c1 = (b + n) < char_at_byte.size()
-                                ? char_at_byte[b + n]
-                                : text.size();
-          for (size_t c = c0; c < c1 && c < fenced.size(); ++c) fenced[c] = 1;
-          b += n;
-        } else {
-          b += (n > 0 ? n : 1);
-        }
-      }
-    }
+    fence.Build(sentence.first, text, &fenced);
 
     for (size_t begin = 0; begin < text.size(); ++begin) {
       if (!fenced.empty() && fenced[begin]) continue;   // cannot start inside
@@ -880,7 +1038,15 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
             << " max_live_counts=" << kMaxLiveCounts
             << " merged_distinct=" << merged_distinct
             << " retained=" << ranked.size()
-            << " meta_fenced_spans=" << meta_fenced_spans;
+            << " meta_fenced_spans=" << fence.meta_matches();
+  // Explicit context fences are NOT meta_fenced_spans and are counted apart:
+  // "no candidate crossed an inherited meta symbol" and "no candidate crossed
+  // a curriculum context switch" are different claims about different sources.
+  LOG(INFO) << "FENCE inherited_meta_matches=" << fence.meta_matches()
+            << " explicit_string_matches=" << fence.explicit_matches()
+            << " fenced_characters=" << fence.fenced_characters()
+            << " records_with_explicit_fence=" << fence.records_with_explicit()
+            << " malformed_boundary_matches=" << fence.malformed();
 
   // REQUIRED COVERAGE EXTENSIONS ARE ADMITTED UNCONDITIONALLY, ahead of the frequency
   // filter and the pool cap. Without them the corpus is unrepresentable, so
@@ -965,7 +1131,8 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
             << corpus_.sentences.size() << " fenced records";
 
   // EXTRACTION-ONLY DUMP. Set SPM_DUMP_CANDIDATES=<path> to write
-  // "rank\tpiece\tweighted_freq" for the whole pool and stop before EM. This
+  // "rank\tpiece\tweighted_freq" for the whole pool. (It does not itself stop
+  // the run; pair it with SPM_STOP_AFTER_INIT for an extraction-only gate.) This
   // exists because "the phrase is absent" has to be attributable to a stage:
   // never enumerated, rejected at initialization, or out-competed. Extraction
   // is the first of the three and was invisible until now.
