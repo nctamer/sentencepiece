@@ -7,6 +7,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <queue>
+#include <set>
+#include <fstream>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -16,8 +22,10 @@
 #include <utility>
 #include <vector>
 
+#include "filesystem.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_join.h"
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
@@ -25,10 +33,17 @@
 #include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "normalizer.h"
 #include "ret_check.h"
 #include "unigram_model.h"
 #include "unigram_model_trainer.h"
 #include "util.h"
+
+ABSL_FLAG(int32_t, continuation_spill_entries, 2097152,
+          "Max in-memory candidate entries before continuation spills a "
+          "sorted run to disk. Bounds aggregation memory only; it does NOT "
+          "change results, because run counts are summed exactly during the "
+          "k-way merge before any candidate is scored or ranked.");
 
 namespace sentencepiece::unigram {
 namespace {
@@ -55,7 +70,30 @@ constexpr double kDegenerateLogBaseMass = -69.07755278982137;
 //
 // The band sits far below any meaningful score difference and far above the
 // accumulated noise of a corpus with ~10^6 records.
+// Relative-tolerance equality that is SAFE FOR NON-FINITE INPUTS.
+//
+// The finite-only form below was `|a-b| <= 1e-9 * max(|a|,|b|,1)`, and it is
+// wrong in both directions once an infinity reaches it:
+//   ScoresTie(+inf, finite) -> TRUE, because |inf - finite| <= 1e-9*inf is
+//                              inf <= inf. A "must keep" candidate therefore
+//                              tied with every ordinary one and the comparator
+//                              fell through to lexical order.
+//   ScoresTie(+inf, +inf)   -> FALSE, because the difference is NaN and every
+//                              NaN comparison is false, so two must-keeps did
+//                              not even tie with each other.
+// Measured consequence: the required coverage extension 'V', ranked +inf precisely so
+// it could not be pruned, was ordered lexically and pruned out of the emitted
+// model, leaving a vocabulary that cannot spell its own training corpus.
+//
+// Infinities are now handled before the tolerance is applied. NaN never ties
+// with anything, including itself, which keeps a corrupt score loud instead of
+// letting it masquerade as an ordering.
 bool ScoresTie(double a, double b) {
+  if (std::isnan(a) || std::isnan(b)) return false;
+  if (std::isinf(a) || std::isinf(b)) {
+    // Equal infinities of the same sign tie; everything else is ordered.
+    return a == b;
+  }
   const double scale = std::max({std::abs(a), std::abs(b), 1.0});
   return std::abs(a - b) <= 1e-9 * scale;
 }
@@ -326,7 +364,7 @@ absl::Status ContinuationTrainer::ReconcileNormalization() {
 }
 
 absl::Status ContinuationTrainer::VerifyCorpusCoverage() {
-  // BOOTSTRAP, DO NOT REFUSE.
+  // ADMIT AS A REQUIRED COVERAGE EXTENSION, DO NOT REFUSE.
   // A continuation corpus routinely contains characters the prior never saw --
   // expanding a piano tokenizer with violin introduces 'V' for the "Vn:"
   // marker, and the prior cannot spell it. Refusing here forced callers to
@@ -341,7 +379,7 @@ absl::Status ContinuationTrainer::VerifyCorpusCoverage() {
   // learned by the constrained M-step like any other extension. Pruning keeps
   // them automatically -- a character with no alternative segmentation has
   // infinite deletion loss -- so no special-casing is needed there.
-  bootstrap_pieces_.clear();
+  required_coverage_extensions_.clear();
   Model model(prior_model_);
   if (!model.status().ok()) return model.status();
 
@@ -357,14 +395,35 @@ absl::Status ContinuationTrainer::VerifyCorpusCoverage() {
       }
     }
   }
-  bootstrap_pieces_.assign(missing.begin(), missing.end());
-  std::sort(bootstrap_pieces_.begin(), bootstrap_pieces_.end());
-  if (!bootstrap_pieces_.empty()) {
-    LOG(INFO) << "Unigram continuation bootstrap: " << bootstrap_pieces_.size()
+  required_coverage_extensions_.assign(missing.begin(), missing.end());
+  std::sort(required_coverage_extensions_.begin(), required_coverage_extensions_.end());
+  // ASSUMPTION MADE LOAD-BEARING: required coverage extensions are ATOMIC single
+  // characters. The initializer records one basis decomposition at lambda=0
+  // and reuses it as beta_i + lambda*h_i for every lambda. That is EXACT only
+  // because a candidate containing m missing characters must consume exactly
+  // those m required atoms in every basis segmentation, so every path shares
+  // the same lambda offset (L_x - m) and the argmax cannot move with lambda.
+  // Allow multi-character required pieces and h_i becomes path-dependent and
+  // the derivation silently stops holding.
+  for (const auto& b : required_coverage_extensions_) {
+    if (string_util::UTF8Len(b) != 1) {
+      return absl::UnimplementedError(absl::StrCat(
+          "continuation required coverage extensions must be single-character "
+          "only; got '", b, "' of length ", string_util::UTF8Len(b),
+          ". A multi-character required piece makes the inherited-length "
+          "exposure h_i path-dependent and invalidates the beta_i + "
+          "lambda*h_i initialization."));
+    }
+  }
+  required_extensions_.clear();
+  required_extensions_.insert(required_coverage_extensions_.begin(),
+                              required_coverage_extensions_.end());
+  if (!required_coverage_extensions_.empty()) {
+    LOG(INFO) << "Unigram continuation required coverage extension: " << required_coverage_extensions_.size()
               << " character(s) absent from the prior will be admitted as "
                  "EXTENSION candidates (they consume extension budget, and "
                  "the prior is not modified): "
-              << absl::StrJoin(bootstrap_pieces_, " ");
+              << absl::StrJoin(required_coverage_extensions_, " ");
   }
   return absl::OkStatus();
 }
@@ -401,12 +460,137 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     inherited_strings.insert(piece.piece());
   }
 
-  // Exact global weighted occurrence counts. A TSV row (x, N) contributes
-  // exactly the same candidate occurrences as N physical copies of x, while
-  // the record boundary remains a hard fence. Unlike the earlier bounded
-  // suffix-array queue, no candidate loses accumulated mass through GC and no
-  // chunk-local threshold changes the result.
+  // EXACT GLOBAL WEIGHTED COUNTS IN BOUNDED MEMORY (spill + k-way merge).
+  //
+  // WHAT WAS WRONG BEFORE. Two successive implementations were both unfit:
+  //   (1) an unbounded flat_hash_map holding EVERY unique valid substring,
+  //       duplicated into a second vector, fully sorted, and only then
+  //       truncated to candidate_limit -- so seed_sentencepiece_size was not a
+  //       memory bound at all;
+  //   (2) a bounded map with periodic GC that evicted by CURRENT PARTIAL rank.
+  //       That is not equivalent to exact global top-K: a candidate can be
+  //       rare in an early corpus prefix, be evicted, and become globally
+  //       frequent later. Its count then restarts and its final value is only
+  //       a lower bound, so the retained set depends on record ORDER and on
+  //       the flush threshold. The claim that "GC uses the same ranking as
+  //       selection, so it cannot reorder what selection picks" is false, and
+  //       is withdrawn.
+  //
+  // THIS implementation keeps the ORIGINAL exact semantics:
+  //   freq(x) = sum over records of weight * occurrences of x
+  // while bounding resident memory. Partial counts are flushed to sorted runs
+  // keyed by candidate BYTES (never by score), and a k-way merge sums all runs
+  // for each distinct string. A candidate's final score is computed only once
+  // its exact global count is known, so ordering never depends on flush
+  // boundaries. Determinism is therefore independent of spill threshold and
+  // record order.
+  struct SpillEntry {
+    std::string piece;
+    uint64_t count;
+  };
+  const std::string spill_dir =
+      absl::StrCat("/gscratch/scrubbed/nctamer/pianotok_work/.spm_spill_",
+                   getpid());
+  std::vector<std::string> run_paths;
+  auto cleanup_runs = [&run_paths, &spill_dir]() {
+    for (const auto& r : run_paths) ::remove(r.c_str());
+    ::rmdir(spill_dir.c_str());
+  };
+
+  // DEFECT D: INHERITED META SYMBOLS FENCE CANDIDATE GENERATION.
+  //
+  // Standard SentencePiece replaces meta/user-defined symbols with a
+  // pretokenization boundary before seed generation, so a learned NORMAL piece
+  // can never span one. Continuation normalized the corpus but did not impose
+  // the equivalent fence, so an extension could span an inherited
+  // USER_DEFINED symbol. That is wrong because USER_DEFINED pieces are scored
+  // by the lattice's maximal-matching bonus rather than as ordinary Unigram
+  // log-probabilities, while the constrained M-step assumes the learned family
+  // is inherited NORMAL + extension NORMAL. Fencing restores that separation.
+  //
+  // The fence applies to the CANDIDATE-GENERATION VIEW ONLY. The E-step keeps
+  // reading the original normalized record and still sees the inherited
+  // symbols normally; nothing on disk is mutated.
+  std::set<absl::string_view> meta_symbols;
+  for (const auto& piece : prior_model_.pieces()) {
+    switch (piece.type()) {
+      case ModelProto::SentencePiece::USER_DEFINED:
+      case ModelProto::SentencePiece::CONTROL:
+      case ModelProto::SentencePiece::UNKNOWN:
+      case ModelProto::SentencePiece::BYTE:
+        meta_symbols.insert(piece.piece());
+        break;
+      default:
+        break;                      // NORMAL and UNUSED are not boundaries
+    }
+  }
+  // Cheap precheck: if no meta symbol occurs anywhere in the corpus, fencing
+  // is provably a no-op and the per-position matcher is skipped entirely.
+  bool meta_present = false;
+  for (const auto& sentence : corpus_.sentences) {
+    for (const auto& m : meta_symbols) {
+      if (absl::StrContains(sentence.first, m)) { meta_present = true; break; }
+    }
+    if (meta_present) break;
+  }
+  std::unique_ptr<normalizer::PrefixMatcher> meta_matcher;
+  if (meta_present && !meta_symbols.empty()) {
+    meta_matcher =
+        std::make_unique<normalizer::PrefixMatcher>(meta_symbols);
+  }
+  uint64_t meta_fenced_spans = 0;
+  LOG(INFO) << "METAFENCE symbols=" << meta_symbols.size()
+            << " present_in_corpus=" << (meta_present ? "yes" : "no")
+            << " matcher=" << (meta_matcher ? "active" : "skipped(no-op)");
+
   absl::flat_hash_map<std::string, uint64_t> counts;
+  // Entry cap governs resident aggregation memory, NOT the retained pool.
+  // Floor is deliberately tiny so tests can FORCE multi-run spilling. A
+  // max() against 2^21 here silently clamped small thresholds upward and made
+  // the spill path unreachable in testing.
+  const size_t kMaxLiveCounts = std::max<size_t>(
+      16, static_cast<size_t>(absl::GetFlag(FLAGS_continuation_spill_entries)));
+  size_t spill_runs = 0;
+  uint64_t spilled_entries = 0;
+
+  auto flush_run = [&]() -> absl::Status {
+    if (counts.empty()) return absl::OkStatus();
+    std::vector<SpillEntry> live;
+    live.reserve(counts.size());
+    for (auto& it : counts) live.push_back({it.first, it.second});
+    counts.clear();
+    // SORT BY BYTES. The merge is keyed on the string, so runs must be in
+    // string order; sorting by score here would make the merge wrong.
+    std::sort(live.begin(), live.end(),
+              [](const SpillEntry& a, const SpillEntry& b) {
+                return a.piece < b.piece;
+              });
+    ::mkdir(spill_dir.c_str(), 0700);
+    const std::string path =
+        absl::StrCat(spill_dir, "/run", spill_runs, ".bin");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      return absl::InternalError(
+          absl::StrCat("cannot open continuation spill run ", path));
+    }
+    for (const auto& e : live) {
+      const uint32_t n = static_cast<uint32_t>(e.piece.size());
+      out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+      out.write(e.piece.data(), n);
+      out.write(reinterpret_cast<const char*>(&e.count), sizeof(e.count));
+    }
+    out.flush();
+    if (!out) {
+      return absl::InternalError(
+          absl::StrCat("short write on continuation spill run ", path));
+    }
+    out.close();
+    run_paths.push_back(path);
+    ++spill_runs;
+    spilled_entries += static_cast<uint64_t>(live.size());
+    return absl::OkStatus();
+  };
+
   long double weighted_bytes = 0.0L;
   const size_t max_piece_length =
       static_cast<size_t>(trainer_spec_.max_sentencepiece_length());
@@ -421,12 +605,49 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
 
     const string_util::UnicodeText text =
         string_util::UTF8ToUnicodeText(sentence.first);
+
+    // Candidate-only meta fence: mark every character position covered by an
+    // inherited meta symbol. Enumeration may not start inside one, and may not
+    // extend across one, so no learned NORMAL piece can span a symbol the
+    // lattice scores by maximal matching. The record itself is untouched.
+    std::vector<char> fenced;
+    if (meta_matcher != nullptr) {
+      fenced.assign(text.size(), 0);
+      size_t byte_pos = 0;
+      std::vector<size_t> char_at_byte;
+      char_at_byte.reserve(text.size() + 1);
+      for (size_t c = 0; c < text.size(); ++c) {
+        char_at_byte.resize(byte_pos + 1, c);
+        char_at_byte[byte_pos] = c;
+        byte_pos += string_util::UnicodeCharToUTF8(text[c]).size();
+      }
+      absl::string_view rest(sentence.first);
+      size_t b = 0;
+      while (b < sentence.first.size()) {
+        bool found = false;
+        const int n = meta_matcher->PrefixMatch(rest.substr(b), &found);
+        if (found && n > 0) {
+          ++meta_fenced_spans;
+          const size_t c0 = b < char_at_byte.size() ? char_at_byte[b] : 0;
+          const size_t c1 = (b + n) < char_at_byte.size()
+                                ? char_at_byte[b + n]
+                                : text.size();
+          for (size_t c = c0; c < c1 && c < fenced.size(); ++c) fenced[c] = 1;
+          b += n;
+        } else {
+          b += (n > 0 ? n : 1);
+        }
+      }
+    }
+
     for (size_t begin = 0; begin < text.size(); ++begin) {
+      if (!fenced.empty() && fenced[begin]) continue;   // cannot start inside
       string_util::UnicodeText piece;
       piece.reserve(std::min(max_piece_length, text.size() - begin));
       const size_t stop =
           std::min(text.size(), begin + std::max<size_t>(1, max_piece_length));
       for (size_t end = begin; end < stop; ++end) {
+        if (!fenced.empty() && fenced[end]) break;      // cannot cross
         piece.push_back(text[end]);
         if (piece.size() <= 1) continue;
         if (!IsValidSentencePiece(piece)) continue;
@@ -441,6 +662,9 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
               candidate));
         }
         count += delta;
+        if (counts.size() > kMaxLiveCounts) {
+          ABSL_RETURN_IF_ERROR(flush_run());
+        }
       }
     }
   }
@@ -453,15 +677,11 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
       2, static_cast<uint64_t>(
              alpha * static_cast<double>(weighted_bytes) / denom));
 
-  std::vector<std::pair<std::string, uint64_t>> ranked;
-  ranked.reserve(counts.size());
-  for (auto& item : counts) {
-    const uint64_t effective_min = item.first.size() <= 3 ? 2 : global_min_freq;
-    if (item.second >= effective_min) {
-      ranked.emplace_back(item.first, item.second);
-    }
-  }
-  std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+  // Final flush, then an exact k-way merge over all runs.
+  ABSL_RETURN_IF_ERROR(flush_run());
+
+  const auto by_rank = [](const std::pair<std::string, uint64_t>& a,
+                          const std::pair<std::string, uint64_t>& b) {
     const double sa = CandidateScore(a.first, a.second);
     const double sb = CandidateScore(b.first, b.second);
     if (sa != sb) return sa > sb;
@@ -469,25 +689,107 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     const size_t lb = string_util::UTF8Len(b.first);
     if (la != lb) return la > lb;
     return a.first < b.first;
-  });
-  if (ranked.size() > candidate_limit) ranked.resize(candidate_limit);
+  };
 
-  // BOOTSTRAP CHARACTERS ARE ADMITTED UNCONDITIONALLY, ahead of the frequency
+  // Bounded top-K over EXACT counts. priority_queue's top() is the maximum
+  // under the comparator, so comparing with `by_rank` (a is better than b)
+  // puts the WORST retained candidate on top and makes eviction O(log K).
+  std::priority_queue<std::pair<std::string, uint64_t>,
+                      std::vector<std::pair<std::string, uint64_t>>,
+                      decltype(by_rank)>
+      best(by_rank);
+
+  struct RunReader {
+    std::ifstream in;
+    std::string piece;
+    uint64_t count = 0;
+    bool ok = false;
+    bool Advance() {
+      uint32_t n = 0;
+      if (!in.read(reinterpret_cast<char*>(&n), sizeof(n))) return ok = false;
+      piece.resize(n);
+      if (n && !in.read(&piece[0], n)) return ok = false;
+      if (!in.read(reinterpret_cast<char*>(&count), sizeof(count))) {
+        return ok = false;
+      }
+      return ok = true;
+    }
+  };
+  std::vector<std::unique_ptr<RunReader>> readers;
+  readers.reserve(run_paths.size());
+  for (const auto& path : run_paths) {
+    auto r = std::make_unique<RunReader>();
+    r->in.open(path, std::ios::binary);
+    if (!r->in) {
+      cleanup_runs();
+      return absl::InternalError(
+          absl::StrCat("cannot reopen continuation spill run ", path));
+    }
+    r->Advance();
+    readers.push_back(std::move(r));
+  }
+
+  size_t merged_distinct = 0, meta_rejected_at_merge = 0;
+  while (true) {
+    const std::string* smallest = nullptr;
+    for (const auto& r : readers) {
+      if (!r->ok) continue;
+      if (smallest == nullptr || r->piece < *smallest) smallest = &r->piece;
+    }
+    if (smallest == nullptr) break;
+    const std::string key = *smallest;
+    // Sum every run's contribution for this exact string, with overflow check.
+    uint64_t total = 0;
+    for (auto& r : readers) {
+      while (r->ok && r->piece == key) {
+        if (r->count > std::numeric_limits<uint64_t>::max() - total) {
+          cleanup_runs();
+          return absl::OutOfRangeError(absl::StrCat(
+              "weighted Unigram candidate count overflow for piece: ", key));
+        }
+        total += r->count;
+        r->Advance();
+      }
+    }
+    ++merged_distinct;
+    const uint64_t effective_min = key.size() <= 3 ? 2 : global_min_freq;
+    if (total < effective_min) continue;
+    best.emplace(key, total);
+    if (best.size() > candidate_limit) best.pop();
+  }
+  readers.clear();
+  cleanup_runs();
+
+  std::vector<std::pair<std::string, uint64_t>> ranked;
+  ranked.reserve(best.size());
+  while (!best.empty()) {
+    ranked.push_back(best.top());
+    best.pop();
+  }
+  std::sort(ranked.begin(), ranked.end(), by_rank);
+  LOG(INFO) << "EXTRACTSPILL runs=" << spill_runs
+            << " spilled_entries=" << spilled_entries
+            << " max_live_counts=" << kMaxLiveCounts
+            << " merged_distinct=" << merged_distinct
+            << " retained=" << ranked.size()
+            << " meta_fenced_spans=" << meta_fenced_spans;
+
+  // REQUIRED COVERAGE EXTENSIONS ARE ADMITTED UNCONDITIONALLY, ahead of the frequency
   // filter and the pool cap. Without them the corpus is unrepresentable, so
   // they are not competing on merit with ordinary candidates -- but they are
   // still ORDINARY EXTENSIONS: appended after the prior, scored by the
   // constrained M-step, and counted against the extension budget. Pruning
   // keeps them on its own, because a piece with no alternative segmentation
   // has infinite deletion loss.
-  if (!bootstrap_pieces_.empty()) {
+  if (!required_coverage_extensions_.empty()) {
     absl::flat_hash_set<std::string> present;
     present.reserve(ranked.size());
     for (const auto& item : ranked) present.insert(item.first);
     std::vector<std::pair<std::string, uint64_t>> prepend;
-    for (const auto& ch : bootstrap_pieces_) {
+    for (const auto& ch : required_coverage_extensions_) {
       if (present.count(ch)) continue;
       auto it = counts.find(ch);
-      // A bootstrap character always occurs; fall back to 1 if the counter
+      // A required coverage character always occurs; fall back to 1 if the counter
       // never saw it as a standalone substring.
       prepend.emplace_back(ch, it == counts.end()
                                    ? static_cast<uint64_t>(1)
@@ -496,7 +798,7 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     if (!prepend.empty()) {
       ranked.insert(ranked.begin(), prepend.begin(), prepend.end());
       LOG(INFO) << "Unigram continuation: admitted " << prepend.size()
-                << " bootstrap character candidate(s) into the pool";
+                << " required coverage extension candidate(s) into the pool";
     }
   }
 
@@ -504,12 +806,30 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
   for (auto& item : ranked) {
     ExtensionCandidate candidate;
     candidate.piece = std::move(item.first);
+    candidate.freq = item.second;      // needed to initialize its score
     extension_candidates_.push_back(std::move(candidate));
   }
 
   LOG(INFO) << "Unigram continuation extracted " << extension_candidates_.size()
-            << " exact globally weighted candidates from "
+            << " bounded weighted candidates (see EXTRACTGC) from "
             << corpus_.sentences.size() << " fenced records";
+
+  // EXTRACTION-ONLY DUMP. Set SPM_DUMP_CANDIDATES=<path> to write
+  // "rank\tpiece\tweighted_freq" for the whole pool and stop before EM. This
+  // exists because "the phrase is absent" has to be attributable to a stage:
+  // never enumerated, rejected at initialization, or out-competed. Extraction
+  // is the first of the three and was invisible until now.
+  if (const char* dump = std::getenv("SPM_DUMP_CANDIDATES")) {
+    auto out = filesystem::NewWritableFile(dump);
+    if (out->status().ok()) {
+      for (size_t i = 0; i < extension_candidates_.size(); ++i) {
+        out->WriteLine(absl::StrCat(i, "\t", extension_candidates_[i].piece,
+                                    "\t", extension_candidates_[i].freq));
+      }
+    }
+    LOG(INFO) << "SPM_DUMP_CANDIDATES wrote " << extension_candidates_.size()
+              << " candidates to " << dump;
+  }
   if (static_cast<int>(extension_candidates_.size()) < extension_target_ &&
       trainer_spec_.hard_vocab_limit()) {
     return absl::FailedPreconditionError(absl::StrCat(
@@ -553,6 +873,44 @@ double ContinuationTrainer::BaseMass(double lambda,
   return mass;
 }
 
+absl::Status ContinuationTrainer::SolveCoveredBasisLambda(
+    const std::vector<ExtensionCandidate>& extensions, double required_mass,
+    double* lambda) const {
+  // Required extensions contribute a CONSTANT `required_mass`: their scores are
+  // free parameters fixed at initialization, with no gauge exposure. Ordinary
+  // candidates are tied to their covered-basis decomposition, whose only
+  // gauge-exposed part is its inherited pieces, hence h_i and not L_i.
+  auto log_mass = [&](double lam) {
+    double max_term = -std::numeric_limits<double>::infinity();
+    for (const auto& piece : inherited_normal_) {
+      max_term = std::max(max_term,
+                          piece.prior_score + lam * piece.additive_length);
+    }
+    for (const auto& c : extensions) {
+      if (c.is_required) continue;
+      max_term = std::max(max_term,
+                          c.inherited_best_score + lam * c.basis_inherited_len);
+    }
+    if (required_mass > 0.0) {
+      max_term = std::max(max_term, std::log(required_mass));
+    }
+    double sum = 0.0;
+    for (const auto& piece : inherited_normal_) {
+      sum += std::exp(piece.prior_score + lam * piece.additive_length -
+                      max_term);
+    }
+    for (const auto& c : extensions) {
+      if (c.is_required) continue;
+      sum += std::exp(c.inherited_best_score + lam * c.basis_inherited_len -
+                      max_term);
+    }
+    if (required_mass > 0.0) sum += std::exp(std::log(required_mass) - max_term);
+    return max_term + std::log(sum);
+  };
+  return BisectMonotoneRoot("covered-basis continuation lambda", log_mass,
+                            /*increasing=*/true, -1.0, 1.0, lambda);
+}
+
 absl::Status ContinuationTrainer::SolveInitialLambda(
     const std::vector<ExtensionCandidate>& extensions, double* lambda) const {
   auto log_mass = [&](double lambda) {
@@ -590,37 +948,177 @@ absl::Status ContinuationTrainer::InitializeContinuationScores() {
     return absl::OkStatus();
   }
 
+  // THE COVERED BASIS = immutable inherited NORMAL pieces + REQUIRED coverage extension
+  // extensions, and nothing else.
+  //
+  // The basis must contain the required extensions or every candidate that
+  // needs a character the prior cannot spell is rejected here -- with 'V'
+  // absent from rnnt_1200 that is the entire Vn: family, 231,737 retained
+  // candidates in the correct grammar. It must contain NOTHING ELSE: if
+  // ordinary candidates could decompose through other ordinary candidates,
+  // initialization order and model population would decide the result, which
+  // is not a definition.
+  //
+  // Required extensions are NOT relabelled as inherited. They stay extensions:
+  // appended after the whole prior, counted against the extension budget,
+  // never pruned. What changes is only that they are admissible spelling
+  // material for ordinary candidates.
+  //
+  // NORMALIZATION. The basis is itself a complete model over
+  // (inherited + required), so its free mass is fully assigned to the required
+  // pieces: q_r = epsilon(lambda_basis) * freq_r / sum_r freq_r, with
+  // lambda_basis solving BaseMass(lambda) + sum_r q_r = 1. Because a required
+  // piece carries a FREE score rather than a gauge-shifted inherited one, the
+  // old identity "candidate score == B_x + lambda*L_x" no longer holds for any
+  // V-containing decomposition. Its basis score is
+  //   sum_j (s_j + lambda*l_j) + sum_r q_r
+  // so the initializer below reads the basis Viterbi path score DIRECTLY
+  // instead of reconstructing it from B_x and L_x.
   TrainerModel::SentencePieces normal_pieces;
-  normal_pieces.reserve(inherited_normal_.size());
-  absl::flat_hash_set<std::string> normal_strings;
+  normal_pieces.reserve(inherited_normal_.size() + required_extensions_.size());
+  absl::flat_hash_set<std::string> normal_strings;   // admissible basis symbols
+  double base_mass_at_zero = 0.0;
   for (const auto& piece : inherited_normal_) {
     normal_pieces.emplace_back(piece.piece,
                                static_cast<float>(piece.prior_score));
     normal_strings.insert(piece.piece);
+    base_mass_at_zero += std::exp(piece.prior_score);
   }
+
+  // Required extensions, scored from the basis free mass by frequency share.
+  std::vector<std::pair<std::string, uint64_t>> required_freq;
+  for (const auto& c : extension_candidates_) {
+    if (required_extensions_.contains(c.piece)) {
+      required_freq.emplace_back(c.piece, std::max<uint64_t>(1, c.freq));
+    }
+  }
+  double lambda_basis = 0.0;
+  if (!required_freq.empty()) {
+    // BaseMass is increasing in lambda; find the lambda leaving exactly the
+    // mass the required pieces need. With required mass free to be small, the
+    // basis lambda is near the value where BaseMass == 1 - required_share.
+    double deriv = 0.0;
+    const double eps0 = 1.0 - BaseMass(0.0, &deriv);
+    // The covered-basis rule "give the required atoms the residual while
+    // holding lambda_basis = 0" needs a residual to exist. A prior whose
+    // NORMAL mass already fills the simplex cannot host a required atom this
+    // way, and there is no defined fallback; fail explicitly rather than
+    // silently producing a non-normalized basis.
+    if (!(eps0 > 0.0)) {
+      return absl::UnimplementedError(absl::StrCat(
+          "continuation required coverage extension needs unallocated prior mass: Z_B(0)=",
+          BaseMass(0.0, &deriv), " leaves residual ", eps0,
+          " (<= 0), so required coverage extensions cannot be given probability "
+          "at lambda_basis=0. This prior/coverage-extension combination is "
+          "unsupported."));
+    }
+    // lambda_basis = 0 and the required pieces take ALL of the residual, so the
+    // covered basis is a normalized model over (inherited + required) with
+    // every inherited score still exactly at its prior value. The previous
+    // "half of epsilon0" was an unjustified heuristic and left the basis
+    // sub-normalized. These scores are initialization only; the constrained
+    // M-step estimates the extension probabilities afterwards.
+    const double required_total = std::max(1e-12, eps0);
+    double fsum = 0.0;
+    for (const auto& r : required_freq) fsum += static_cast<double>(r.second);
+    for (const auto& r : required_freq) {
+      const double q = required_total * (static_cast<double>(r.second) / fsum);
+      normal_pieces.emplace_back(r.first, static_cast<float>(std::log(q)));
+      normal_strings.insert(r.first);
+    }
+    LOG(INFO) << "GATE2 basis: inherited_normal=" << inherited_normal_.size()
+              << " required=" << required_freq.size()
+              << " base_mass_at_lambda0=" << base_mass_at_zero
+              << " epsilon0=" << eps0
+              << " required_extension_mass=" << required_total
+              << " lambda_basis=" << lambda_basis;
+  }
+
   TrainerModel normal_model(trainer_spec_, prior_model_.normalizer_spec());
   ABSL_RETURN_IF_ERROR(normal_model.SetSentencePieces(std::move(normal_pieces)));
   if (!normal_model.status().ok()) return normal_model.status();
 
+  // CLASS E: rejected here, before initialization, for not being spellable by
+  // the inherited-only basis. This filter is why a required coverage extension and
+  // EVERYTHING THAT CONTAINS IT never reach EM or pruning: with 'V' absent
+  // from the prior, "V", "\xe2\x96\x81Vn:" and every Vn:+pitch piece are
+  // rejected at this line, not out-competed later. Such candidates must not be
+  // classified as pruning failures.
+  size_t in_count = extension_candidates_.size();
+  size_t in_with_V = 0;
+  for (const auto& c : extension_candidates_) {
+    if (absl::StrContains(c.piece, "V")) ++in_with_V;
+  }
+
   std::vector<ExtensionCandidate> valid;
   valid.reserve(extension_candidates_.size());
   for (auto candidate : extension_candidates_) {
+    if (required_extensions_.contains(candidate.piece)) {
+      // A required extension is a basis symbol; it cannot be asked to
+      // decompose into the basis without trivially matching itself. Its score
+      // is the FIXED r_k assigned above and carries no gauge exposure.
+      Lattice rl;
+      rl.SetSentence(candidate.piece);
+      normal_model.PopulateNodes(&rl);
+      candidate.inherited_best_score = rl.Viterbi().second;
+      candidate.basis_inherited_len = 0;
+      candidate.is_required = true;
+      valid.push_back(std::move(candidate));
+      continue;
+    }
     Lattice lattice;
     lattice.SetSentence(candidate.piece);
     normal_model.PopulateNodes(&lattice);
     const auto path = lattice.Viterbi();
     bool inherited_only = !path.first.empty();
+    std::string offender;
     for (const auto* node : path.first) {
       if (!normal_strings.contains(std::string(node->piece))) {
         inherited_only = false;
+        offender.assign(node->piece.data(), node->piece.size());
         break;
       }
     }
-    if (!inherited_only) continue;
+    if (!inherited_only) {
+      LOG(INFO) << "INITREJECT piece=" << candidate.piece
+                << " freq=" << candidate.freq << " reason="
+                << (path.first.empty()
+                        ? "no basis decomposition at all"
+                        : absl::StrCat("decomposition uses non-basis piece '",
+                                       offender, "'"));
+      continue;
+    }
+    // The basis path score ALREADY carries the gauge on inherited pieces and
+    // the free score on required extensions, so it is used directly. Do not
+    // reconstruct it as B_x + lambda*L_x: that identity holds only when every
+    // symbol in the decomposition is a gauge-shifted inherited piece, which is
+    // false for any V-containing candidate.
     candidate.inherited_best_score = path.second;
+    // h_i: additive length of the INHERITED pieces only. Required atoms carry
+    // free scores, so they contribute no lambda exposure.
+    int h = 0;
+    for (const auto* node : path.first) {
+      const std::string sym(node->piece.data(), node->piece.size());
+      if (!required_extensions_.contains(sym)) {
+        h += static_cast<int>(string_util::UTF8Len(sym));
+      }
+    }
+    candidate.basis_inherited_len = h;
+    candidate.is_required = false;
     valid.push_back(std::move(candidate));
   }
   extension_candidates_.swap(valid);
+
+  size_t out_with_V = 0;
+  for (const auto& c : extension_candidates_) {
+    if (absl::StrContains(c.piece, "V")) ++out_with_V;
+  }
+  LOG(INFO) << "INITFILTER before_init_candidates=" << in_count
+            << " before_init_containing_V=" << in_with_V
+            << " after_init_candidates=" << extension_candidates_.size()
+            << " after_init_containing_V=" << out_with_V
+            << " rejected=" << (in_count - extension_candidates_.size());
+
 
   if (static_cast<int>(extension_candidates_.size()) < extension_target_ &&
       trainer_spec_.hard_vocab_limit()) {
@@ -628,11 +1126,96 @@ absl::Status ContinuationTrainer::InitializeContinuationScores() {
         "insufficient extension candidates have an inherited NORMAL decomposition");
   }
 
-  ABSL_RETURN_IF_ERROR(
-      SolveInitialLambda(extension_candidates_, &lambda_));
+  double required_mass_total = 0.0;
+  for (const auto& c : extension_candidates_) {
+    if (c.is_required) required_mass_total += std::exp(c.inherited_best_score);
+  }
+  ABSL_RETURN_IF_ERROR(SolveCoveredBasisLambda(
+      extension_candidates_, required_mass_total, &lambda_));
+
+  // Candidate and its inherited decomposition are EXACTLY TIED here, and that
+  // is not an accident: the decomposition's pieces partition the same surface,
+  // so sum_j l_j = L_x and sum_j (s_j + lambda*l_j) = B_x + lambda*L_x, which
+  // is precisely this score. lambda cancels. Whether that systematic tie is
+  // benign or is what breaks Viterbi-based pruning is being measured; do not
+  // "fix" it by adding corpus frequency until that measurement exists.
   for (auto& candidate : extension_candidates_) {
-    const int len = static_cast<int>(string_util::UTF8Len(candidate.piece));
-    candidate.score = candidate.inherited_best_score + lambda_ * len;
+    // EXACTLY the term the root solver summed. Required pieces keep their
+    // fixed r_k (no gauge exposure); ordinary pieces get beta_i + lambda*h_i.
+    candidate.score = candidate.is_required
+                          ? candidate.inherited_best_score
+                          : candidate.inherited_best_score +
+                                lambda_ * candidate.basis_inherited_len;
+  }
+  // GATE 2 raw report.
+  {
+    static const char* kG2[] = {
+        "\xe2\x96\x81" "a4" "\xe2\x96\x81" "G4",
+        "\xe2\x96\x81" "b4" "\xe2\x96\x81" "A4",
+        "\xe2\x96\x81" "d4" "\xe2\x96\x81" "C4",
+        "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "d5",
+        "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "a4",
+        "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "e5",
+        "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "c5",
+        "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "g4",
+        "V"};
+    absl::flat_hash_set<std::string> present;
+    present.reserve(extension_candidates_.size());
+    for (const auto& c : extension_candidates_) present.insert(c.piece);
+    for (const char* t : kG2) {
+      LOG(INFO) << "GATE2TRACK " << t << " survives_init="
+                << (present.contains(std::string(t)) ? "yes" : "NO");
+    }
+    double deriv = 0.0;
+    const double bm = BaseMass(lambda_, &deriv);
+    double req_mass = 0.0, ord_mass = 0.0;
+    for (const auto& c : extension_candidates_) {
+      const double m = std::exp(c.score);
+      if (required_extensions_.contains(c.piece)) req_mass += m;
+      else ord_mass += m;
+    }
+    // INVARIANT: required and ordinary are disjoint, and each required piece
+    // occurs exactly once in the candidate table (hence exactly once in the
+    // final working piece table).
+    size_t req_seen = 0;
+    absl::flat_hash_set<std::string> req_dupe;
+    for (const auto& c : extension_candidates_) {
+      if (!c.is_required) continue;
+      ++req_seen;
+      if (!req_dupe.insert(c.piece).second) {
+        return absl::InternalError(absl::StrCat(
+            "required extension appears more than once: ", c.piece));
+      }
+      if (!required_extensions_.contains(c.piece)) {
+        return absl::InternalError("is_required set on a non-required piece");
+      }
+    }
+    if (req_seen != required_extensions_.size()) {
+      return absl::InternalError(absl::StrCat(
+          "required extension count mismatch: table has ", req_seen,
+          " but ", required_extensions_.size(), " are required"));
+    }
+    const double residual = std::abs((bm + req_mass + ord_mass) - 1.0);
+    LOG(INFO) << "GATE2INV required_disjoint=yes required_once=yes"
+              << " required_count=" << req_seen
+              << " normalization_residual=" << residual;
+    LOG(INFO) << "GATE2NORM BaseMass=" << bm
+              << " required_extension_mass=" << req_mass
+              << " ordinary_extension_mass=" << ord_mass
+              << " total_mass=" << (bm + req_mass + ord_mass)
+              << " lambda=" << lambda_
+              << " all_scores_finite="
+              << (std::all_of(extension_candidates_.begin(),
+                              extension_candidates_.end(),
+                              [](const ExtensionCandidate& c) {
+                                return std::isfinite(c.score);
+                              })
+                      ? "yes" : "NO");
+    if (const char* d2 = std::getenv("SPM_STOP_AFTER_INIT")) {
+      (void)d2;
+      LOG(INFO) << "SPM_STOP_AFTER_INIT set; stopping before EM.";
+      return absl::CancelledError("stop-after-init");
+    }
   }
   return absl::OkStatus();
 }
@@ -655,14 +1238,88 @@ ModelProto ContinuationTrainer::BuildWorkingModel(
   return model;
 }
 
-absl::Status ContinuationTrainer::RunEStep(
+absl::Status ContinuationTrainer::RebuildWorkingModel(
     const std::vector<ExtensionCandidate>& extensions, double lambda,
-    std::vector<float>* expected, double* objective) const {
-  const ModelProto working = BuildWorkingModel(extensions, lambda);
-  Model model(working);
-  if (!model.status().ok()) return model.status();
+    WorkingModelState* state) const {
+  // Destroy the Model FIRST: it points into state->proto, and the next step
+  // mutates that proto structurally.
+  state->model.reset();
 
-  expected->assign(working.pieces_size(), 0.0f);
+  state->proto = prior_model_;
+  for (const auto& piece : inherited_normal_) {
+    state->proto.mutable_pieces(piece.external_id)
+        ->set_score(static_cast<float>(piece.prior_score +
+                                       lambda * piece.additive_length));
+  }
+  for (const auto& candidate : extensions) {
+    auto* piece = state->proto.add_pieces();
+    piece->set_piece(candidate.piece);
+    piece->set_score(static_cast<float>(candidate.score));
+    piece->set_type(ModelProto::SentencePiece::NORMAL);
+  }
+  state->proto.mutable_trainer_spec()->set_vocab_size(
+      state->proto.pieces_size());
+
+  const size_t expect =
+      static_cast<size_t>(prior_model_.pieces_size()) + extensions.size();
+  if (static_cast<size_t>(state->proto.pieces_size()) != expect) {
+    return absl::InternalError(absl::StrCat(
+        "working support size mismatch: proto has ", state->proto.pieces_size(),
+        " expected ", expect));
+  }
+
+  state->model = std::make_unique<Model>(state->proto);
+  if (!state->model->status().ok()) return state->model->status();
+  ++state->support_generation;
+  ++state->support_builds;
+  return absl::OkStatus();
+}
+
+absl::Status ContinuationTrainer::UpdateWorkingScores(
+    const std::vector<ExtensionCandidate>& extensions, double lambda,
+    WorkingModelState* state) const {
+  const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
+  const size_t expect = base_n + extensions.size();
+  if (static_cast<size_t>(state->proto.pieces_size()) != expect) {
+    return absl::InternalError(absl::StrCat(
+        "score-only update against a stale support: proto has ",
+        state->proto.pieces_size(), " expected ", expect,
+        ". A support change requires RebuildWorkingModel()."));
+  }
+  if (state->model == nullptr) {
+    return absl::FailedPreconditionError("no working model to update");
+  }
+
+  for (const auto& piece : inherited_normal_) {
+    state->proto.mutable_pieces(piece.external_id)
+        ->set_score(static_cast<float>(piece.prior_score +
+                                       lambda * piece.additive_length));
+  }
+  for (size_t i = 0; i < extensions.size(); ++i) {
+    // Strings/ids/types are untouched; only the score field moves.
+    state->proto.mutable_pieces(static_cast<int>(base_n + i))
+        ->set_score(static_cast<float>(extensions[i].score));
+  }
+#ifndef NDEBUG
+  for (size_t i = 0; i < extensions.size(); ++i) {
+    if (state->proto.pieces(static_cast<int>(base_n + i)).piece() !=
+        extensions[i].piece) {
+      return absl::InternalError(
+          "score-only update found a support drift at the extension region");
+    }
+  }
+#endif
+  // min_score_ is derived from scores and would otherwise go stale.
+  ABSL_RETURN_IF_ERROR(state->model->RefreshScoreCache());
+  ++state->score_refreshes;
+  return absl::OkStatus();
+}
+
+absl::Status ContinuationTrainer::RunEStep(
+    const Model& model, size_t support_size, std::vector<float>* expected,
+    double* objective) const {
+  // Consumes the persistent model. Builds nothing.
+  expected->assign(support_size, 0.0f);
   *objective = 0.0;
   long double total_weight = 0.0L;
   for (const auto& sentence : corpus_.sentences) {
@@ -679,104 +1336,6 @@ absl::Status ContinuationTrainer::RunEStep(
     *objective -= static_cast<double>(z);
   }
   if (total_weight > 0) *objective /= static_cast<double>(total_weight);
-  return absl::OkStatus();
-}
-
-absl::Status ContinuationTrainer::ComputeExtensionDeletionLoss(
-    const std::vector<ExtensionCandidate>& extensions, double lambda,
-    std::vector<double>* loss, std::vector<float>* viterbi_freq) const {
-  // Mirrors Trainer::PruneSentencePieces in unigram_model_trainer.cc. The only
-  // differences are structural, and both follow from the continuation
-  // contract: the piece table is inherited+extensions rather than a single
-  // trained vocabulary, and only the extension region is scored, because
-  // inherited pieces can never be pruned.
-  const ModelProto working = BuildWorkingModel(extensions, lambda);
-  Model model(working);
-  if (!model.status().ok()) return model.status();
-
-  const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
-  const size_t total = static_cast<size_t>(working.pieces_size());
-
-  // Viterbi token frequencies over the whole corpus. Ordinary Unigram pruning
-  // uses the Viterbi path, not the marginal, because the loss below is stated
-  // in terms of "every occurrence is replaced by its alternative".
-  viterbi_freq->assign(total, 0.0f);
-  {
-    Lattice lattice;
-    for (const auto& sentence : corpus_.sentences) {
-      lattice.SetSentence(sentence.first);
-      model.PopulateNodes(&lattice);
-      for (const auto* node : lattice.Viterbi().first) {
-        if (node->id >= 0 && static_cast<size_t>(node->id) < total) {
-          (*viterbi_freq)[node->id] += static_cast<float>(sentence.second);
-        }
-      }
-    }
-  }
-
-  double sum = 0.0;
-  for (size_t i = 0; i < total; ++i) sum += (*viterbi_freq)[i];
-  if (!(sum > 0.0)) {
-    return absl::FailedPreconditionError(
-        "Unigram continuation pruning: empty Viterbi frequency mass");
-  }
-  const double logsum = std::log(sum);
-
-  loss->assign(extensions.size(), 0.0);
-  Lattice lattice;
-  for (size_t k = 0; k < extensions.size(); ++k) {
-    const size_t id = base_n + k;
-    const double f = static_cast<double>((*viterbi_freq)[id]);
-
-    lattice.SetSentence(extensions[k].piece);
-    model.PopulateNodes(&lattice);
-    const auto nbests = lattice.NBest(2, false, 0.0);
-
-    if (nbests.empty()) {                       // unreachable; drop it
-      (*loss)[k] = -std::numeric_limits<double>::infinity();
-      continue;
-    }
-    if (nbests.size() == 1) {
-      // No second best: this piece is the only way to spell itself, so
-      // removing it would make its string unrepresentable. Must keep.
-      (*loss)[k] = std::numeric_limits<double>::infinity();
-      continue;
-    }
-    if (nbests[0].first.size() >= 2) {
-      // Its own Viterbi path already prefers a split, so the piece is never
-      // used and costs nothing to remove.
-      (*loss)[k] = -std::numeric_limits<double>::infinity();
-      continue;
-    }
-    if (f <= 0.0) {                             // never on a Viterbi path
-      (*loss)[k] = -std::numeric_limits<double>::infinity();
-      continue;
-    }
-
-    std::vector<int> alt;
-    alt.reserve(nbests[1].first.size());
-    for (const auto* node : nbests[1].first) {
-      if (node->id >= 0 && static_cast<size_t>(node->id) < total) {
-        alt.push_back(node->id);
-      }
-    }
-    if (alt.empty()) {                          // no usable alternative: keep
-      (*loss)[k] = std::numeric_limits<double>::infinity();
-      continue;
-    }
-
-    const double logprob_sp = std::log(f) - logsum;
-    // Removing the piece re-assigns its f occurrences to |alt| pieces each.
-    const double logsum_alt =
-        std::log(sum + f * (static_cast<double>(alt.size()) - 1.0));
-    double logprob_alt = 0.0;
-    for (const int n : alt) {
-      logprob_alt +=
-          std::log(static_cast<double>((*viterbi_freq)[n]) + f) - logsum_alt;
-    }
-    const double F = f / sum;
-    (*loss)[k] = F * (logprob_sp - logprob_alt);
-  }
   return absl::OkStatus();
 }
 
@@ -866,36 +1425,232 @@ absl::Status ContinuationTrainer::RunConstrainedMStep(
   const double epsilon = std::max(1e-300, 1.0 - base_mass);
 
   const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
+  // TWO DENOMINATORS, DELIBERATELY.
+  //   ca       = sum of RAW expected counts. This is the observed posterior
+  //              mass C = sum_j d_j and is the coefficient of log(epsilon(l))
+  //              in the constrained M-step derivation, so the lambda solve
+  //              must keep using it.
+  //   ca_floor = sum of FLOORED numerators, sum_j max(d_j, 1e-30). The floor is
+  //              a finite-support numerical convention for the relative shares,
+  //              not observed mass. Allocating floored numerators over the raw
+  //              denominator makes the assigned extension mass exceed epsilon
+  //              by epsilon*(ca_floor - ca)/ca. Bounded by ~1e-24 for 1e6
+  //              extensions and thus far below the 1e-12 residual checked at
+  //              initialization, but it is an inconsistency and costs nothing
+  //              to remove.
   double ca = 0.0;
+  double ca_floor = 0.0;
+  size_t floored = 0;
   for (size_t i = 0; i < extensions->size(); ++i) {
-    ca += expected[base_n + i];
+    const double d = expected[base_n + i];
+    ca += d;
+    const double f = std::max<double>(1e-30, d);
+    if (f > d) ++floored;
+    ca_floor += f;
   }
   if (!(ca > 0.0) || !Finite(ca) || !(epsilon > 0.0)) {
     return absl::FailedPreconditionError(
         "extension received no finite probability mass in constrained M-step");
   }
+  if (floored > 0) {
+    LOG(INFO) << "MSTEPFLOOR extensions=" << extensions->size()
+              << " ca_raw=" << ca << " ca_floored=" << ca_floor
+              << " floored_counts=" << floored
+              << " mass_residual_if_unfixed="
+              << (epsilon * (ca_floor - ca) / ca);
+  }
 
   for (size_t i = 0; i < extensions->size(); ++i) {
     const double count = std::max<double>(1e-30, expected[base_n + i]);
-    (*extensions)[i].score = std::log(epsilon) + std::log(count / ca);
+    (*extensions)[i].score = std::log(epsilon) + std::log(count / ca_floor);
   }
   return absl::OkStatus();
 }
 
+// STAGED CANDIDATE TRACKER.
+//
+// Reports, per tracked candidate, the quantities that distinguish four
+// mutually exclusive failure modes. It does NOT interpret them.
+//   A  Viterbi=0 but posterior substantial -> Viterbi pruning misclassifies.
+//   B  Viterbi=0 and posterior negligible before pruning -> competition/EM.
+//   C  posterior substantial then collapses at the M-step -> M-step dynamics.
+//   D  posterior substantial until pruning, then removed -> pruning criterion.
+// Viterbi frequency alone never establishes any of them: the E-step is
+// forward-backward (PopulateMarginal), and every candidate is initialized
+// EXACTLY tied with its inherited-only decomposition (B_x + lambda*L_x on both
+// sides), so ties are systematic and a deterministic Viterbi tie-break can
+// report 0 for a candidate carrying real posterior mass.
+absl::Status ContinuationTrainer::ReportTracked(
+    absl::string_view stage, const std::vector<float>* expected_in,
+    const std::vector<double>* loss_in) const {
+  // OPT-IN. Each call builds a full working ModelProto (prior + every
+  // candidate) and makes a complete corpus pass. At a 10^6 candidate pool that
+  // is several GB and minutes per call, and calling it at three stages plus
+  // every pruning round exhausted a 16 GB cgroup before the first prune. The
+  // diagnostic is worth its cost on small pools and during Gate 2; it must not
+  // be paid by a production run.
+  if (std::getenv("SPM_TRACK") == nullptr) return absl::OkStatus();
+  static const char* kTracked[] = {
+      "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "d5",
+      "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "a4",
+      "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "e5",
+      "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "c5",
+      "\xe2\x96\x81" "Vn:" "\xe2\x96\x81" "g4",
+      "\xe2\x96\x81" "a4" "\xe2\x96\x81" "G4",
+      "\xe2\x96\x81" "b4" "\xe2\x96\x81" "A4",
+      "\xe2\x96\x81" "d5" "\xe2\x96\x81" "C5",
+      "\xe2\x96\x81" "e5" "\xe2\x96\x81" "D5",
+      "\xe2\x96\x81" "c5" "\xe2\x96\x81" "B4",
+      "\xe2\x96\x81" "g5" "\xe2\x96\x81" "F5",
+      "\xe2\x96\x81" "f5" "\xe2\x96\x81" "E5",
+      "\xe2\x96\x81" "a5" "\xe2\x96\x81" "G5",
+      "\xe2\x96\x81" "b5" "\xe2\x96\x81" "A5",
+      "\xe2\x96\x81" "d4" "\xe2\x96\x81" "C4",
+      "\xe2\x96\x81" "A4.",
+      "\xe2\x96\x81" "E5.",
+      "\xe2\x96\x81" "B4.",
+      "\xe2\x96\x81" "D5.",
+      "\xe2\x96\x81" "G4.",
+      "/128",
+      "R:",
+      "L:",
+      "12/8k",
+      "/4k",
+      "V"};
+
+  const ModelProto working = BuildWorkingModel(extension_candidates_, lambda_);
+  Model model(working);
+  if (!model.status().ok()) return model.status();
+  Model prior_only(prior_model_);
+  if (!prior_only.status().ok()) return prior_only.status();
+  const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
+
+  std::vector<float> viterbi(working.pieces_size(), 0.0f);
+  std::vector<float> expected_local(working.pieces_size(), 0.0f);
+  const bool need_local = (expected_in == nullptr);
+  for (const auto& sentence : corpus_.sentences) {
+    Lattice lat;
+    lat.SetSentence(sentence.first);
+    model.PopulateNodes(&lat);
+    if (need_local) {
+      lat.PopulateMarginal(static_cast<float>(sentence.second), &expected_local);
+    }
+    for (const auto* node : lat.Viterbi().first) {
+      if (node->id >= 0) viterbi[node->id] += static_cast<float>(sentence.second);
+    }
+  }
+  const std::vector<float>& expected = need_local ? expected_local : *expected_in;
+
+  absl::flat_hash_map<std::string, size_t> index;
+  for (size_t i = 0; i < extension_candidates_.size(); ++i) {
+    index[extension_candidates_[i].piece] = i;
+  }
+
+  LOG(INFO) << "TRACK[" << stage << "] piece|occ|cand_score|decomp_score|delta"
+               "|viterbi|posterior|post_per_occ|loss|self_1tok|alt_seg";
+  for (const char* t : kTracked) {
+    const std::string key(t);
+    auto it = index.find(key);
+    if (it == index.end()) {
+      LOG(INFO) << "TRACK[" << stage << "] " << key << " | ABSENT_FROM_CANDIDATES";
+      continue;
+    }
+    const size_t i = it->second;
+    const auto& c = extension_candidates_[i];
+    const int len = static_cast<int>(string_util::UTF8Len(c.piece));
+    Lattice pl;
+    pl.SetSentence(c.piece);
+    prior_only.PopulateNodes(&pl);
+    const double decomp = pl.Viterbi().second + lambda_ * len;
+
+    // Is the candidate its own 1-token Viterbi segmentation in isolation, and
+    // what is the best full-model alternative?
+    Lattice fl;
+    fl.SetSentence(c.piece);
+    model.PopulateNodes(&fl);
+    const auto nb = fl.NBest(2, false, 0.0);
+    const bool self_1tok = !nb.empty() && nb[0].first.size() == 1;
+    std::string alt = "(none)";
+    double alt_score = 0.0;
+    if (nb.size() > 1) {
+      alt.clear();
+      for (const auto* n : nb[1].first) {
+        alt.append(std::string(n->piece)).append(" ");
+      }
+      alt_score = nb[1].second;
+    }
+    const double occ = static_cast<double>(c.freq);
+    const double post = expected[base_n + i];
+    LOG(INFO) << "TRACK[" << stage << "] " << c.piece << " | " << occ << " | "
+              << c.score << " | " << decomp << " | " << (c.score - decomp)
+              << " | " << viterbi[base_n + i] << " | " << post << " | "
+              << (occ > 0 ? post / occ : 0.0) << " | "
+              << (loss_in ? absl::StrCat((*loss_in)[i]) : std::string("-"))
+              << " | " << (self_1tok ? "yes" : "no") << " | " << alt << "("
+              << alt_score << ")";
+  }
+
+  // Aggregates over ALL candidates.
+  size_t n = 0, zero_vit = 0, zv_post_gt1 = 0, zv_post_gt100 = 0, post_le1 = 0;
+  double post_sum = 0.0;
+  for (size_t i = 0; i < extension_candidates_.size(); ++i) {
+    const double v = viterbi[base_n + i];
+    const double p = expected[base_n + i];
+    ++n; post_sum += p;
+    if (v <= 0.0) {
+      ++zero_vit;
+      if (p > 1.0) ++zv_post_gt1;
+      if (p > 100.0) ++zv_post_gt100;
+    }
+    if (p <= 1.0) ++post_le1;
+  }
+  LOG(INFO) << "TRACKAGG[" << stage << "] cands=" << n
+            << " zero_viterbi=" << zero_vit
+            << " posterior_sum=" << post_sum
+            << " zeroVit_post>1=" << zv_post_gt1
+            << " zeroVit_post>100=" << zv_post_gt100
+            << " post<=1=" << post_le1;
+  return absl::OkStatus();
+}
+
 absl::Status ContinuationTrainer::RunContinuationEM() {
+  ABSL_RETURN_IF_ERROR(ReportTracked("1-post-init", nullptr, nullptr));
   if (extension_target_ == 0) return absl::OkStatus();
   if (extension_candidates_.empty()) {
     return absl::FailedPreconditionError("no Unigram extension candidates");
   }
 
+  int prune_round = 0;
+  bool reported_first_em = false;
+
+  // ONE support build before the first E-step. Thereafter the trie is rebuilt
+  // only when pruning changes the support; score-only M-step results are
+  // written into the live proto and the score cache refreshed in place.
+  WorkingModelState working;
+  ABSL_RETURN_IF_ERROR(
+      RebuildWorkingModel(extension_candidates_, lambda_, &working));
+
   while (static_cast<int>(extension_candidates_.size()) > extension_target_) {
     std::vector<float> expected;
     double objective = 0.0;
     for (int sub = 0; sub < trainer_spec_.num_sub_iterations(); ++sub) {
-      ABSL_RETURN_IF_ERROR(
-          RunEStep(extension_candidates_, lambda_, &expected, &objective));
+      ABSL_RETURN_IF_ERROR(RunEStep(*working.model,
+                                    static_cast<size_t>(working.proto.pieces_size()),
+                                    &expected, &objective));
+      if (!reported_first_em) {
+        ABSL_RETURN_IF_ERROR(
+            ReportTracked("2-post-Estep-pre-Mstep", &expected, nullptr));
+      }
       ABSL_RETURN_IF_ERROR(
           RunConstrainedMStep(expected, &extension_candidates_, &lambda_));
+      // SCORE-ONLY: no trie rebuild.
+      ABSL_RETURN_IF_ERROR(
+          UpdateWorkingScores(extension_candidates_, lambda_, &working));
+      if (!reported_first_em) {
+        ABSL_RETURN_IF_ERROR(
+            ReportTracked("3-post-Mstep-pre-prune", nullptr, nullptr));
+        reported_first_em = true;
+      }
     }
 
     const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
@@ -909,20 +1664,97 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
     // overwhelmingly supports (Vn: is followed by a note 922,977 times) were
     // discarded. Frequency alone cannot express that a piece is worth keeping
     // BECAUSE its fallback is expensive; deletion loss can.
+    // CONTROLLED TEST: the ORIGINAL expected-posterior-count ranking.
+    // The deletion-loss replacement is retained (ComputeExtensionDeletionLoss)
+    // but NOT used here. The earlier evidence against count ranking is
+    // confounded and must be discarded: those runs passed
+    // split_by_whitespace=true, so IsValidSentencePiece() rejected any piece
+    // containing an internal U+2581 and every multi-word candidate -- the bare
+    // note bigrams that define the acceptance criterion, and every Vn:+pitch
+    // piece -- was structurally impossible to enumerate. Count pruning was
+    // never actually tested on the intended candidate universe.
+    //
+    // Note this ranking reads `expected`, i.e. forward-backward POSTERIOR
+    // occupancy, never Viterbi counts, so it is unaffected by the
+    // zero-Viterbi/positive-posterior defect measured separately (/128:
+    // Viterbi 0, posterior 363.8).
     std::vector<double> loss;
     std::vector<float> viterbi_freq;
-    ABSL_RETURN_IF_ERROR(ComputeExtensionDeletionLoss(
-        extension_candidates_, lambda_, &loss, &viterbi_freq));
 
-    std::vector<size_t> order(extension_candidates_.size());
-    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-      const double la = loss[a];
-      const double lb = loss[b];
-      if (!ScoresTie(la, lb)) return la > lb;
-      // Deterministic tie-break, as before.
-      return extension_candidates_[a].piece < extension_candidates_[b].piece;
-    });
+    // PROVENANCE (opt-in via SPM_TRACK; see ReportTracked for why).
+    // Without this, "the phrase is absent" cannot be attributed to
+    // a cause: it may never have been a candidate, may have had zero Viterbi
+    // frequency, may have been ranked out, or may have been starved of mass.
+    if (std::getenv("SPM_TRACK") != nullptr) {
+      size_t n_pos_inf = 0, n_neg_inf = 0, n_zero_freq = 0, n_prefixed = 0;
+      double ext_mass = 0.0;
+      const size_t bn = static_cast<size_t>(prior_model_.pieces_size());
+      for (size_t i = 0; i < extension_candidates_.size(); ++i) {
+        if (!loss.empty() && std::isinf(loss[i])) {
+          (loss[i] > 0 ? n_pos_inf : n_neg_inf)++;
+        }
+        if (viterbi_freq[bn + i] <= 0.0f) ++n_zero_freq;
+        if (absl::StartsWith(extension_candidates_[i].piece, "\xe2\x96\x81")) {
+          ++n_prefixed;
+        }
+        ext_mass += expected[bn + i];
+      }
+      double deriv_dbg = 0.0;
+      const double base_mass_dbg = BaseMass(lambda_, &deriv_dbg);
+      LOG(INFO) << "continuation provenance: cands="
+                << extension_candidates_.size() << " word_initial=" << n_prefixed
+                << " loss=+inf:" << n_pos_inf << " -inf:" << n_neg_inf
+                << " zero_viterbi_freq=" << n_zero_freq
+                << " extension_expected_mass=" << ext_mass
+                << " base_mass=" << base_mass_dbg
+                << " epsilon=" << (1.0 - base_mass_dbg);
+    }
+
+    // REQUIRED EXTENSIONS DO NOT COMPETE.
+    // Corpus characters the prior cannot spell are genuinely new final
+    // vocabulary entries -- they count against extension_target_ -- but they
+    // are not optional, so they must not be ranked at all. Encoding them as
+    // +inf inside the ranking was wrong twice over: it made correctness depend
+    // on the comparator's handling of non-finite values (which was broken, and
+    // silently pruned the required character 'V' by falling through to lexical
+    // order), and it conflated "must keep" with "ranked first", which are
+    // different statements. The reference implementation likewise removes
+    // always-keep pieces from competition and fills the remaining capacity
+    // from ranked candidates.
+    ABSL_RETURN_IF_ERROR(ReportTracked(
+        absl::StrCat("4-pre-prune-round", ++prune_round), &expected, nullptr));
+
+    std::vector<size_t> required_idx, optional_idx;
+    for (size_t i = 0; i < extension_candidates_.size(); ++i) {
+      if (required_extensions_.contains(extension_candidates_[i].piece)) {
+        required_idx.push_back(i);
+      } else {
+        optional_idx.push_back(i);
+      }
+    }
+    if (static_cast<int>(required_idx.size()) > extension_target_) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "continuation needs ", required_idx.size(),
+          " required extension pieces to cover the corpus but the extension "
+          "budget is only ", extension_target_));
+    }
+
+    std::sort(optional_idx.begin(), optional_idx.end(),
+              [&](size_t a, size_t b) {
+                const double ea = expected[base_n + a];
+                const double eb = expected[base_n + b];
+                if (!ScoresTie(ea, eb)) return ea > eb;
+                // Deterministic tie-break, as before.
+                return extension_candidates_[a].piece <
+                       extension_candidates_[b].piece;
+              });
+
+    // Required first, then the ranked optional tail. `order` keeps the rest of
+    // the loop unchanged.
+    std::vector<size_t> order;
+    order.reserve(extension_candidates_.size());
+    order.insert(order.end(), required_idx.begin(), required_idx.end());
+    order.insert(order.end(), optional_idx.begin(), optional_idx.end());
 
     size_t keep = std::max<size_t>(
         extension_target_, static_cast<size_t>(
@@ -930,13 +1762,18 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
                                trainer_spec_.shrinking_factor()));
     keep = std::min(keep, extension_candidates_.size() - 1);
     keep = std::max<size_t>(keep, extension_target_);
+    // Never shrink into the required prefix.
+    keep = std::max(keep, required_idx.size());
 
     std::vector<ExtensionCandidate> next;
     next.reserve(keep);
+    // Same convention as the M-step: the warm-start denominator must be the
+    // sum of the FLOORED numerators actually used below, or the kept set is
+    // allocated slightly more than epsilon.
     double kept_count = 0.0;
     for (size_t i = 0; i < keep; ++i) {
       next.push_back(extension_candidates_[order[i]]);
-      kept_count += expected[base_n + order[i]];
+      kept_count += std::max<double>(1e-30, expected[base_n + order[i]]);
     }
 
     double deriv = 0.0;
@@ -948,6 +1785,9 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
                       std::log(count / std::max(1e-300, kept_count));
     }
     extension_candidates_.swap(next);
+    // SUPPORT CHANGED -> exactly one rebuild.
+    ABSL_RETURN_IF_ERROR(
+        RebuildWorkingModel(extension_candidates_, lambda_, &working));
     LOG(INFO) << "Unigram continuation pruned extension candidates to "
               << extension_candidates_.size() << " objective=" << objective
               << " lambda=" << lambda_;
@@ -964,12 +1804,28 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
   std::vector<float> expected;
   double objective = 0.0;
   const int final_iters = std::max(2, trainer_spec_.num_sub_iterations());
-  for (int sub = 0; sub < final_iters; ++sub) {
+  // The loop above already rebuilt for the final support after its last prune;
+  // if the target was met without entering the loop, `working` still holds the
+  // initial support, which is the correct one. Either way: no rebuild here.
+  if (working.model == nullptr ||
+      static_cast<size_t>(working.proto.pieces_size()) !=
+          static_cast<size_t>(prior_model_.pieces_size()) +
+              extension_candidates_.size()) {
     ABSL_RETURN_IF_ERROR(
-        RunEStep(extension_candidates_, lambda_, &expected, &objective));
+        RebuildWorkingModel(extension_candidates_, lambda_, &working));
+  }
+  for (int sub = 0; sub < final_iters; ++sub) {
+    ABSL_RETURN_IF_ERROR(RunEStep(*working.model,
+                                  static_cast<size_t>(working.proto.pieces_size()),
+                                  &expected, &objective));
     ABSL_RETURN_IF_ERROR(
         RunConstrainedMStep(expected, &extension_candidates_, &lambda_));
+    ABSL_RETURN_IF_ERROR(
+        UpdateWorkingScores(extension_candidates_, lambda_, &working));
   }
+  LOG(INFO) << "WORKINGMODEL support_builds=" << working.support_builds
+            << " score_refreshes=" << working.score_refreshes
+            << " support_generation=" << working.support_generation;
 
   const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
   int zero_count = 0;
@@ -1073,7 +1929,38 @@ absl::Status ContinuationTrainer::VerifyPriorPrefix(
   return VerifyPriorPrefixInvariant(prior_model_, output, lambda_);
 }
 
+absl::Status ContinuationTrainer::VerifyFinalCoverage() const {
+  // THE LAST GATE BEFORE ANYTHING IS WRITTEN.
+  // A continuation model that cannot spell its own training corpus is not a
+  // tokenizer, and it must never reach disk. This is not hypothetical: a
+  // 1500-piece artifact was emitted whose required coverage extension had
+  // been pruned by a comparator bug, so every violin row fell back to <unk>.
+  // Nothing downstream noticed, because every other check -- inherited IDs,
+  // types, gauge error, piece count -- still passed.
+  const ModelProto final_model = BuildWorkingModel(extension_candidates_,
+                                                   lambda_);
+  Model model(final_model);
+  if (!model.status().ok()) return model.status();
+
+  const int unk = final_model.trainer_spec().unk_id();
+  for (const auto& sentence : corpus_.sentences) {
+    Lattice lattice;
+    lattice.SetSentence(sentence.first);
+    model.PopulateNodes(&lattice);
+    for (const auto* node : lattice.Viterbi().first) {
+      if (node->id == unk) {
+        return absl::InternalError(absl::StrCat(
+            "continuation produced a model that cannot represent its own "
+            "corpus without <unk>; representative input: ", sentence.first,
+            ". Refusing to write artifacts."));
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ContinuationTrainer::FinalizeArtifacts() {
+  ABSL_RETURN_IF_ERROR(VerifyFinalCoverage());
   ExpansionResult result;
   result.set_schema_version(1);
   result.set_model_type(EXPANSION_UNIGRAM);
@@ -1200,7 +2087,13 @@ absl::Status ContinuationTrainer::Train() {
   ABSL_RETURN_IF_ERROR(LoadAndValidatePrior());
   ABSL_RETURN_IF_ERROR(continuation::LoadPreparedCorpus(
       trainer_spec_, prior_model_.normalizer_spec(), components_, &corpus_));
-  sentences_ = corpus_.sentences;
+  // NOT `sentences_ = corpus_.sentences;`.
+  // That kept a second full copy of the ~1.34M-record corpus for the whole
+  // run. Continuation's coverage check, candidate extraction and E-step all
+  // read corpus_.sentences; nothing in this path reads TrainerInterface's
+  // sentences_. Verified by inspection: the only other mention is the clear()
+  // above. If an inherited API is ever found to need it, populate it at that
+  // call site rather than holding a duplicate for the whole run.
   ABSL_RETURN_IF_ERROR(VerifyCorpusCoverage());
 
   if (extension_target_ > 0) {

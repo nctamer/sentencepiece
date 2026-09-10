@@ -178,6 +178,7 @@ set(SPM_TEST_SRCS
   char_model_test.cc
   char_model_trainer_test.cc
   continuation_contract_test.cc
+  continuation_workingmodel_test.cc
   filesystem_test.cc
   model_factory_test.cc
   model_interface_test.cc

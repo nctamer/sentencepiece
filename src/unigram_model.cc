@@ -684,6 +684,28 @@ Model::Model(const ModelProto& model_proto) {
   BuildTrie(&pieces);
 }
 
+absl::Status Model::RefreshScoreCache() {
+  if (model_proto_ == nullptr) {
+    return absl::FailedPreconditionError("no backing ModelProto");
+  }
+  float min_score = FLT_MAX;
+  for (const auto& sp : model_proto_->pieces()) {
+    if (std::isnan(sp.score()) || std::isinf(sp.score())) {
+      status_ = absl::InternalError("score is NaN or Inf.");
+      return status_;
+    }
+    if (sp.type() == ModelProto::SentencePiece::NORMAL) {
+      min_score = std::min(min_score, sp.score());
+    }
+  }
+  if (min_score == FLT_MAX) {
+    status_ = absl::InternalError("no NORMAL piece to derive min_score from.");
+    return status_;
+  }
+  min_score_ = min_score;
+  return absl::OkStatus();
+}
+
 Model::~Model() = default;
 
 EncodeResult Model::Encode(absl::string_view normalized) const {
