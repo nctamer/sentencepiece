@@ -160,6 +160,7 @@ set(SPM_TRAIN_SRCS
   continuation_io.cc
   unigram_model_trainer.cc
   unigram_continuation_trainer.cc
+  unigram_refit.cc
   word_model_trainer.cc
   char_model_trainer.cc
   bpe_model_trainer.cc
@@ -179,6 +180,7 @@ set(SPM_TEST_SRCS
   char_model_trainer_test.cc
   continuation_contract_test.cc
   continuation_workingmodel_test.cc
+  unigram_refit_test.cc
   filesystem_test.cc
   model_factory_test.cc
   model_interface_test.cc
@@ -309,6 +311,7 @@ add_executable(spm_encode spm_encode_main.cc)
 add_executable(spm_decode spm_decode_main.cc)
 add_executable(spm_normalize spm_normalize_main.cc)
 add_executable(spm_train spm_train_main.cc)
+add_executable(spm_refit_unigram spm_refit_unigram_main.cc)
 add_executable(spm_export_vocab spm_export_vocab_main.cc)
 add_executable(spm_eval spm_eval_main.cc)
 
@@ -316,6 +319,7 @@ target_link_libraries(spm_encode sentencepiece ${SPM_LIBS})
 target_link_libraries(spm_decode sentencepiece ${SPM_LIBS})
 target_link_libraries(spm_normalize sentencepiece sentencepiece_train ${SPM_LIBS})
 target_link_libraries(spm_train sentencepiece sentencepiece_train ${SPM_LIBS})
+target_link_libraries(spm_refit_unigram sentencepiece sentencepiece_train ${SPM_LIBS})
 target_link_libraries(spm_export_vocab sentencepiece ${SPM_LIBS})
 target_link_libraries(spm_eval sentencepiece sentencepiece_train ${SPM_LIBS})
 
@@ -338,7 +342,7 @@ else()
   set(SPM_EXTRA_INSTALL_LIBS sentencepiece-static sentencepiece_train-static)
 endif()
 
-set(SPM_EXE_TARGETS spm_encode spm_decode spm_normalize spm_train spm_export_vocab spm_eval)
+set(SPM_EXE_TARGETS spm_encode spm_decode spm_normalize spm_train spm_refit_unigram spm_export_vocab spm_eval)
 if (SPM_ENABLE_NFKC_COMPILE)
   list(APPEND SPM_EXE_TARGETS compile_charsmap)
 endif()
