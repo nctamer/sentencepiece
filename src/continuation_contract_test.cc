@@ -15,10 +15,16 @@
 #include <utility>
 #include <vector>
 
+#include <dirent.h>
+#include <sys/stat.h>
+#include <cerrno>
+
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/numbers.h"
 #include "filesystem.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
@@ -27,6 +33,7 @@
 #include "util.h"
 
 ABSL_DECLARE_FLAG(int32_t, continuation_spill_entries);
+ABSL_DECLARE_FLAG(float, min_freq_alpha);
 
 namespace sentencepiece {
 namespace {
@@ -1798,6 +1805,382 @@ TEST(UnigramContinuationContractTest, InheritedMetaSymbolsFenceCandidates) {
   for (int id = 0; id < prior.pieces_size(); ++id) {
     EXPECT_EQ(prior.pieces(id).piece(), output.pieces(id).piece());
     EXPECT_EQ(prior.pieces(id).type(), output.pieces(id).type());
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Cleanup regressions: SPM_TRACK, spill scratch lifetime, exact required
+// coverage frequencies, artifact score agreement, Unicode length, and the
+// conditional K-independence claim.
+// ---------------------------------------------------------------------------
+
+// Counts entries under a directory tree, or -1 when it does not exist.
+int CountDirEntries(const std::string& dir) {
+  DIR* d = ::opendir(dir.c_str());
+  if (d == nullptr) return -1;
+  int n = 0;
+  while (struct dirent* e = ::readdir(d)) {
+    const std::string name = e->d_name;
+    if (name != "." && name != "..") ++n;
+  }
+  ::closedir(d);
+  return n;
+}
+
+// Any spm_continuation_spill_* directory still present under `base`.
+std::vector<std::string> LeftoverSpillDirs(const std::string& base) {
+  std::vector<std::string> found;
+  DIR* d = ::opendir(base.c_str());
+  if (d == nullptr) return found;
+  while (struct dirent* e = ::readdir(d)) {
+    const std::string name = e->d_name;
+    if (name.rfind("spm_continuation_spill_", 0) == 0) {
+      found.push_back(filesystem::JoinPath(base, name));
+    }
+  }
+  ::closedir(d);
+  return found;
+}
+
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* key, const std::string& value) : key_(key) {
+    const char* old = ::getenv(key);
+    had_ = old != nullptr;
+    if (had_) old_ = old;
+    ::setenv(key, value.c_str(), 1);
+  }
+  ~ScopedEnv() {
+    if (had_) {
+      ::setenv(key_.c_str(), old_.c_str(), 1);
+    } else {
+      ::unsetenv(key_.c_str());
+    }
+  }
+ private:
+  std::string key_, old_;
+  bool had_ = false;
+};
+
+// A prior over {a, b} whose corpus will also contain characters it cannot
+// spell, so required coverage extensions are exercised.
+ModelProto MakeAbUnigramPrior() {
+  ModelProto prior = MakeTinyUnigramPrior();
+  prior.mutable_trainer_spec()->set_vocab_size(prior.pieces_size());
+  return prior;
+}
+
+// ITEM 1. SPM_TRACK used to index a never-filled vector -- undefined behaviour
+// on every tracked run. This just has to COMPLETE.
+TEST(UnigramContinuationContractTest, TrackingPathRunsWithoutInvalidAccess) {
+  const std::string prior_path = TempPath("cont_track_prior.model");
+  const std::string input = TempPath("cont_track_input.txt");
+  const std::string prefix = TempPath("cont_track_model");
+  ASSERT_TRUE(WriteProto(prior_path, MakeAbUnigramPrior()));
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(60, "abababab")));
+
+  ScopedEnv track("SPM_TRACK", "1");
+  TrainerSpec trainer = UnigramContinuationSpec(
+      input, "text", prior_path, TempPath("cont_track.result"), prefix);
+  trainer.set_vocab_size(5);
+  EXPECT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  ModelProto out;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &out));
+  EXPECT_EQ(5, out.pieces_size());
+}
+
+// ITEM 3. Spill scratch is private and removed on EVERY exit path.
+TEST(UnigramContinuationContractTest, SpillScratchIsRemovedOnSuccess) {
+  const std::string base = TempPath("cont_spillbase_ok");
+  ASSERT_EQ(0, ::mkdir(base.c_str(), 0700) == 0 || errno == EEXIST ? 0 : -1);
+  ScopedEnv tmp("TMPDIR", base);
+
+  const std::string prior_path = TempPath("cont_spillok_prior.model");
+  const std::string input = TempPath("cont_spillok_input.txt");
+  const std::string prefix = TempPath("cont_spillok_model");
+  ASSERT_TRUE(WriteProto(prior_path, MakeAbUnigramPrior()));
+  std::vector<std::string> lines;
+  for (int i = 0; i < 80; ++i) {
+    lines.push_back("abababab");
+    lines.push_back("babababa");
+  }
+  ASSERT_TRUE(WriteLines(input, lines));
+
+  const int32_t saved = absl::GetFlag(FLAGS_continuation_spill_entries);
+  absl::SetFlag(&FLAGS_continuation_spill_entries, 16);  // force many runs
+  TrainerSpec trainer = UnigramContinuationSpec(
+      input, "text", prior_path, TempPath("cont_spillok.result"), prefix);
+  trainer.set_vocab_size(5);
+  const absl::Status status = RunTrainer(trainer, NormalizerSpec());
+  absl::SetFlag(&FLAGS_continuation_spill_entries, saved);
+  EXPECT_TRUE(status.ok()) << status;
+  EXPECT_TRUE(LeftoverSpillDirs(base).empty())
+      << "a successful run left spill files behind";
+}
+
+TEST(UnigramContinuationContractTest, SpillScratchIsRemovedOnFailure) {
+  const std::string base = TempPath("cont_spillbase_fail");
+  ::mkdir(base.c_str(), 0700);
+  ScopedEnv tmp("TMPDIR", base);
+  // Fail only AFTER at least one sorted run exists, so cleanup has something
+  // real to remove.
+  ScopedEnv fail("SPM_SPILL_FAIL_AFTER_RUNS", "1");
+
+  const std::string prior_path = TempPath("cont_spillfail_prior.model");
+  const std::string input = TempPath("cont_spillfail_input.txt");
+  const std::string prefix = TempPath("cont_spillfail_model");
+  ASSERT_TRUE(WriteProto(prior_path, MakeAbUnigramPrior()));
+  std::vector<std::string> lines(80, "abababab");
+  ASSERT_TRUE(WriteLines(input, lines));
+
+  const int32_t saved = absl::GetFlag(FLAGS_continuation_spill_entries);
+  absl::SetFlag(&FLAGS_continuation_spill_entries, 16);
+  TrainerSpec trainer = UnigramContinuationSpec(
+      input, "text", prior_path, TempPath("cont_spillfail.result"), prefix);
+  trainer.set_vocab_size(5);
+  const absl::Status status = RunTrainer(trainer, NormalizerSpec());
+  absl::SetFlag(&FLAGS_continuation_spill_entries, saved);
+  EXPECT_FALSE(status.ok()) << "the fault injection did not fire";
+  for (const auto& dir : LeftoverSpillDirs(base)) {
+    ADD_FAILURE() << "a failed run left " << CountDirEntries(dir)
+                  << " spill file(s) in " << dir;
+  }
+}
+
+// ITEM 4. Two missing characters with deliberately unequal weighted counts.
+// Their INITIAL required probabilities must follow the exact frequency ratio,
+// so this reads the initialization log rather than the post-EM model: final
+// re-estimation would otherwise hide an initialization bug.
+TEST(UnigramContinuationContractTest, RequiredCoverageFrequenciesAreExact) {
+  const std::string prior_path = TempPath("cont_reqfreq_prior.model");
+  const std::string input = TempPath("cont_reqfreq_input.tsv");
+  const std::string prefix = TempPath("cont_reqfreq_model");
+  const std::string dump = TempPath("cont_reqfreq_init.tsv");
+  ASSERT_TRUE(WriteProto(prior_path, MakeAbUnigramPrior()));
+  // 'Y' and the two-byte 'ü' are both absent from the prior. Weighted
+  // occurrences: Y = 3*10 = 30, ue = 1*10 + 1*2 = 12. Deliberately unequal,
+  // and deliberately not 1 -- the previous lookup returned exactly 1 for every
+  // required character, which silently imposed an EQUAL split of the required
+  // mass while the code claimed proportionality.
+  ASSERT_TRUE(WriteLines(input, {"aYbYaYb\t10", "aüb\t10", "büa\t2"}));
+
+  ScopedEnv dump_env("SPM_DUMP_REQUIRED_INIT", dump);
+  TrainerSpec trainer = UnigramContinuationSpec(
+      input, "tsv", prior_path, TempPath("cont_reqfreq.result"), prefix);
+  trainer.set_vocab_size(5);   // 3 inherited + exactly the 2 required
+  ASSERT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  // INITIALIZATION is what is inspected. Final EM re-estimation would hide an
+  // initialization bug entirely: both pieces would still be present with
+  // plausible scores.
+  std::map<std::string, std::pair<uint64_t, double>> init;
+  {
+    auto in = filesystem::NewReadableFile(dump);
+    ASSERT_TRUE(in->status().ok());
+    std::string line;
+    while (in->ReadLine(&line)) {
+      if (line.empty()) continue;
+      const std::vector<std::string> f = absl::StrSplit(line, '\t');
+      ASSERT_EQ(3u, f.size()) << line;
+      uint64_t freq = 0;
+      double q = 0.0;
+      ASSERT_TRUE(absl::SimpleAtoi(f[1], &freq));
+      ASSERT_TRUE(absl::SimpleAtod(f[2], &q));
+      init[f[0]] = {freq, q};
+    }
+  }
+  ASSERT_EQ(2u, init.size());
+  ASSERT_TRUE(init.count("Y"));
+  ASSERT_TRUE(init.count("ü"));
+
+  // Exact weighted counts, not synthetic 1s.
+  EXPECT_EQ(30u, init["Y"].first);
+  EXPECT_EQ(12u, init["ü"].first);
+
+  // Initial required probabilities follow that exact ratio ...
+  EXPECT_NEAR(30.0 / 12.0, init["Y"].second / init["ü"].second, 1e-9)
+      << "required mass was not split in proportion to weighted frequency";
+  // ... and together they take the whole residual, so the covered basis is
+  // normalized rather than merely close.
+  ModelProto prior;
+  ASSERT_TRUE(ReadProto(prior_path, &prior));
+  double base_mass = 0.0;
+  for (const auto& p : prior.pieces()) {
+    if (p.type() == ModelProto::SentencePiece::NORMAL) {
+      base_mass += std::exp(static_cast<double>(p.score()));
+    }
+  }
+  EXPECT_NEAR(1.0 - base_mass, init["Y"].second + init["ü"].second, 1e-12);
+
+  ModelProto out;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &out));
+  ASSERT_EQ(5, out.pieces_size());
+  bool has_y = false, has_u = false;
+  for (const auto& p : out.pieces()) {
+    if (p.piece() == "Y") has_y = true;
+    if (p.piece() == "ü") has_u = true;
+  }
+  EXPECT_TRUE(has_y);
+  EXPECT_TRUE(has_u);
+}
+
+// ITEM 6. .model, .expansion and .vocab must describe ONE tokenizer.
+TEST(UnigramContinuationContractTest, ArtifactsAgreeOnFinalScores) {
+  const std::string prior_path = TempPath("cont_artifacts_prior.model");
+  const std::string input = TempPath("cont_artifacts_input.txt");
+  const std::string prefix = TempPath("cont_artifacts_model");
+  const std::string result_path = TempPath("cont_artifacts.result");
+  const ModelProto prior = MakeAbUnigramPrior();
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(60, "abababab")));
+
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(5);
+  ASSERT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  ModelProto model;
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &model));
+  ASSERT_TRUE(ReadProto(result_path, &result));
+
+  std::map<int, const ExpansionPiece*> by_id;
+  for (const auto& p : result.base_pieces()) by_id[p.external_id()] = &p;
+  for (const auto& p : result.learned_pieces()) by_id[p.external_id()] = &p;
+  ASSERT_EQ(model.pieces_size(), static_cast<int>(by_id.size()));
+
+  // The gauge really did move the inherited scores, or this proves nothing.
+  bool some_inherited_moved = false;
+  for (int id = 0; id < prior.pieces_size(); ++id) {
+    if (prior.pieces(id).type() == ModelProto::SentencePiece::NORMAL &&
+        prior.pieces(id).score() != model.pieces(id).score()) {
+      some_inherited_moved = true;
+    }
+  }
+  EXPECT_TRUE(some_inherited_moved)
+      << "lambda was 0, so this test cannot distinguish pre- from post-gauge";
+
+  for (int id = 0; id < model.pieces_size(); ++id) {
+    const auto* sidecar = by_id[id];
+    ASSERT_NE(nullptr, sidecar) << "id " << id << " missing from ExpansionResult";
+    EXPECT_EQ(model.pieces(id).piece(), sidecar->piece()) << "id " << id;
+    EXPECT_EQ(model.pieces(id).type(), sidecar->type()) << "id " << id;
+    // Bit-identical: both are the same float32.
+    EXPECT_EQ(model.pieces(id).score(), sidecar->score())
+        << "id " << id << " (" << model.pieces(id).piece()
+        << ") .model and .expansion disagree";
+  }
+
+  // ... and the textual .vocab round-trips those same float32 values.
+  auto vocab = filesystem::NewReadableFile(prefix + ".vocab");
+  ASSERT_TRUE(vocab->status().ok());
+  std::string line;
+  int rows = 0;
+  while (vocab->ReadLine(&line)) {
+    if (line.empty()) continue;
+    const std::vector<std::string> f = absl::StrSplit(line, '\t');
+    ASSERT_EQ(3u, f.size()) << line;
+    int id = 0;
+    ASSERT_TRUE(absl::SimpleAtoi(f[2], &id));
+    float score = 0.0f;
+    ASSERT_TRUE(absl::SimpleAtof(f[1], &score)) << line;
+    ASSERT_LT(id, model.pieces_size());
+    EXPECT_EQ(model.pieces(id).score(), score)
+        << "id " << id << " .vocab does not round-trip the model score";
+    ++rows;
+  }
+  EXPECT_EQ(model.pieces_size(), rows);
+}
+
+// ITEM 7. The short-candidate exemption from the dynamic frequency floor must
+// be measured in CHARACTERS. Under byte length, "abc" was exempt while the
+// same-length "aüc" (4 bytes) was not.
+TEST(UnigramContinuationContractTest, ShortCandidateExemptionUsesUnicodeLength) {
+  const std::string prior_path = TempPath("cont_ulen_prior.model");
+  const std::string input = TempPath("cont_ulen_input.tsv");
+  ModelProto prior = MakeAbUnigramPrior();
+  for (const char* ch : {"c", "ü", "x"}) {
+    auto* p = prior.add_pieces();
+    p->set_piece(ch);
+    p->set_score(-3.0f);
+    p->set_type(ModelProto::SentencePiece::NORMAL);
+  }
+  prior.mutable_trainer_spec()->set_vocab_size(prior.pieces_size());
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  // "abc" and "aüc" are both 3 CHARACTERS and appear equally often; only
+  // their byte lengths differ (3 vs 4).
+  ASSERT_TRUE(WriteLines(input, {"abcx\t40", "aücx\t40"}));
+
+  auto run = [&](const std::string& tag) {
+    const std::string prefix = TempPath("cont_ulen_" + tag);
+    TrainerSpec trainer = UnigramContinuationSpec(
+        input, "tsv", prior_path, TempPath("cont_ulen_" + tag + ".result"),
+        prefix);
+    trainer.set_vocab_size(prior.pieces_size() + 6);
+    trainer.set_hard_vocab_limit(false);
+    EXPECT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+    ModelProto m;
+    EXPECT_TRUE(ReadProto(prefix + ".model", &m));
+    return m;
+  };
+
+  // The filter is only active for a nonzero min_freq_alpha; at the validated
+  // default the exemption never binds. Exercise it where it can bind.
+  const float saved = absl::GetFlag(FLAGS_min_freq_alpha);
+  absl::SetFlag(&FLAGS_min_freq_alpha, 1.0f);
+  const ModelProto m = run("active");
+  absl::SetFlag(&FLAGS_min_freq_alpha, saved);
+
+  bool has_ascii = false, has_multibyte = false;
+  for (const auto& p : m.pieces()) {
+    if (p.piece() == "abc") has_ascii = true;
+    if (p.piece() == "aüc") has_multibyte = true;
+  }
+  // Whatever the filter decides, it must decide the same for both: they are
+  // the same length in characters and equally frequent.
+  EXPECT_EQ(has_ascii, has_multibyte)
+      << "the short-candidate exemption still depends on UTF-8 byte length";
+}
+
+// ITEM 8. Pool-size independence from the extension target, pinned at the
+// validated default min_freq_alpha = 0 -- and only there.
+TEST(UnigramContinuationContractTest, CandidatePoolIsKIndependentAtAlphaZero) {
+  const std::string prior_path = TempPath("cont_kindep_prior.model");
+  const std::string input = TempPath("cont_kindep_input.tsv");
+  ASSERT_TRUE(WriteProto(prior_path, MakeAbUnigramPrior()));
+  ASSERT_TRUE(WriteLines(input, {"abababab\t50", "babababa\t30",
+                                 "aabbaabb\t20", "abbaabba\t14",
+                                 "aaabbbab\t9"}));
+
+  const float saved = absl::GetFlag(FLAGS_min_freq_alpha);
+  absl::SetFlag(&FLAGS_min_freq_alpha, 0.0f);
+  auto run = [&](int vocab_size) {
+    const std::string prefix =
+        TempPath(absl::StrCat("cont_kindep_", vocab_size));
+    TrainerSpec trainer = UnigramContinuationSpec(
+        input, "tsv", prior_path,
+        TempPath(absl::StrCat("cont_kindep_", vocab_size, ".result")), prefix);
+    trainer.set_vocab_size(vocab_size);
+    trainer.set_seed_sentencepiece_size(64);   // pool size, set explicitly
+    EXPECT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+    ModelProto m;
+    EXPECT_TRUE(ReadProto(prefix + ".model", &m));
+    return m;
+  };
+  const ModelProto small = run(5);
+  const ModelProto large = run(7);
+  absl::SetFlag(&FLAGS_min_freq_alpha, saved);
+
+  ASSERT_EQ(5, small.pieces_size());
+  ASSERT_EQ(7, large.pieces_size());
+  // A smaller K must be a PREFIX of the larger run's selection order: same
+  // candidate pool, same ranking, fewer slots. If the pool moved with K this
+  // would not hold.
+  for (int id = 0; id < small.pieces_size(); ++id) {
+    EXPECT_EQ(small.pieces(id).piece(), large.pieces(id).piece())
+        << "at id " << id << ": the candidate pool moved with K";
   }
 }
 
