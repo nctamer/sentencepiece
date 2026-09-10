@@ -152,6 +152,20 @@ class Model : public ModelInterface {
   // Returns a vocab id of |piece|.
   int PieceToId(absl::string_view piece) const override;
 
+  // Recomputes ONLY the score-dependent caches from the backing ModelProto.
+  //
+  // The trie, the piece map and the reserved-id map are functions of the
+  // SUPPORT (strings, ids, types), not of the probabilities, so a training
+  // loop that changes only scores must not pay for a structural rebuild.
+  // `min_score_` is the one cached quantity derived from scores -- it sets the
+  // UNKNOWN fallback via `min_score() - kUnkPenalty` in PopulateNodes -- so it
+  // MUST be refreshed after any in-place score mutation, or the model silently
+  // scores unknown spans against a stale minimum.
+  //
+  // Callers must not have changed piece strings, ids, types or count; that is
+  // a support change and requires reconstruction.
+  absl::Status RefreshScoreCache();
+
  protected:
   // Builds a Trie index.
   void BuildTrie(std::vector<std::pair<absl::string_view, int>>* pieces);

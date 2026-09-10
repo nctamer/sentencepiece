@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "absl/flags/declare.h"
+#include "absl/flags/flag.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "filesystem.h"
@@ -23,6 +25,8 @@
 #include "trainer_factory.h"
 #include "unigram_continuation_trainer.h"
 #include "util.h"
+
+ABSL_DECLARE_FLAG(int32_t, continuation_spill_entries);
 
 namespace sentencepiece {
 namespace {
@@ -1376,8 +1380,17 @@ TEST(UnigramContinuationContractTest, RejectsDuplicateOrInvalidPriorState) {
   }
 }
 
-TEST(UnigramContinuationContractTest, RejectsUnsupportedAlphabetAndCapacity) {
-  // The corpus is outside anything the prior can segment.
+TEST(UnigramContinuationContractTest, AdmitsUnsupportedAlphabetAsRequiredCoverage) {
+  // CONTRACT CHANGE, DELIBERATE. This used to assert that a corpus containing
+  // a character the prior cannot spell is REJECTED. That behaviour was the
+  // coverage defect: continuation admitted the missing character as an
+  // extension candidate and then discarded it (and everything containing it)
+  // at initialization, which made the whole affected family unreachable --
+  // measured on the real corpus as 341,334 V-bearing candidates admitted and
+  // 0 surviving. Missing characters are now admitted as REQUIRED atomic
+  // COVERAGE EXTENSIONS: they consume extension budget, are protected from
+  // pruning, remain free parameters in every M-step, and the prior is never
+  // modified. So this must now SUCCEED.
   const std::string input = TempPath("cont_uni_alpha.txt");
   const std::string prior_path = TempPath("cont_uni_alpha.prior");
   const std::string result_path = TempPath("cont_uni_alpha.result");
@@ -1387,10 +1400,13 @@ TEST(UnigramContinuationContractTest, RejectsUnsupportedAlphabetAndCapacity) {
   TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
                                                 result_path, prefix);
   trainer.set_vocab_size(6);
-  EXPECT_FALSE(RunTrainer(trainer, NormalizerSpec()).ok());
+  EXPECT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+}
 
-  // Asking for a vocabulary smaller than the prior cannot be honoured: the
-  // prior is the floor, and inherited pieces are never pruned.
+TEST(UnigramContinuationContractTest, RejectsCapacityBelowThePrior) {
+  // Unchanged contract: asking for a vocabulary smaller than the prior cannot
+  // be honoured, because the prior is the floor and inherited pieces are never
+  // pruned.
   EXPECT_FALSE(RunWithPrior(MakeMultiPathUnigramPrior(), "capacity",
                             /*vocab_size=*/2)
                    .ok());
@@ -1590,6 +1606,198 @@ TEST(ContinuationContractTest, DeterministicBpeResultBytes) {
     } else {
       EXPECT_EQ(first_bytes, bytes);
     }
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Required coverage extensions, spill exactness, and the inherited-meta fence.
+//
+// These four properties were each established by a measurement on the real
+// corpus during the repair and are pinned here so a future edit cannot undo
+// them silently.
+// ---------------------------------------------------------------------------
+
+// A prior whose alphabet is {a, b} plus a USER_DEFINED meta symbol. "z" is
+// deliberately absent, so any corpus containing it needs a coverage repair.
+ModelProto MakeMetaAlphabetUnigramPrior() {
+  ModelProto prior = MakeMultiPathUnigramPrior();
+  prior.clear_pieces();
+  struct Entry {
+    const char* piece;
+    float score;
+    ModelProto::SentencePiece::Type type;
+  };
+  for (const Entry& e :
+       {Entry{"<unk>", 0.0f, ModelProto::SentencePiece::UNKNOWN},
+        Entry{"a", -1.0f, ModelProto::SentencePiece::NORMAL},
+        Entry{"b", -1.2f, ModelProto::SentencePiece::NORMAL},
+        Entry{"<X>", -9.0f, ModelProto::SentencePiece::USER_DEFINED}}) {
+    auto* piece = prior.add_pieces();
+    piece->set_piece(e.piece);
+    piece->set_score(e.score);
+    piece->set_type(e.type);
+  }
+  prior.mutable_trainer_spec()->set_vocab_size(prior.pieces_size());
+  return prior;
+}
+
+bool HasPiece(const ModelProto& model, absl::string_view piece) {
+  for (const auto& p : model.pieces()) {
+    if (p.piece() == piece) return true;
+  }
+  return false;
+}
+
+// PROPERTY: a required coverage extension is not free. It occupies one of the
+// requested new slots, exactly like an ordinary extension, and the prior is
+// never enlarged to make room for it. With a single slot available, the
+// coverage repair takes it and nothing else is learned.
+TEST(UnigramContinuationContractTest, RequiredCoverageConsumesExtensionCapacity) {
+  const std::string prior_path = TempPath("cont_uni_cap_prior.model");
+  const std::string input = TempPath("cont_uni_cap_input.txt");
+  const std::string result_path = TempPath("cont_uni_cap.result");
+  const std::string prefix = TempPath("cont_uni_cap_model");
+  const ModelProto prior = MakeMultiPathUnigramPrior();  // <unk>, a, b, ab
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  // "z" is outside the prior alphabet; "abab" is richly attested so an
+  // ordinary extension would certainly be learned if a slot were free.
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(40, "abababz")));
+
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(prior.pieces_size() + 1);  // exactly ONE new slot
+  ASSERT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  ModelProto output;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &output));
+  ASSERT_EQ(prior.pieces_size() + 1, output.pieces_size());
+  // The one slot went to the coverage repair, not to a frequent ordinary
+  // candidate: capacity is shared, not extended.
+  EXPECT_EQ("z", output.pieces(prior.pieces_size()).piece());
+  EXPECT_EQ(ModelProto::SentencePiece::NORMAL,
+            output.pieces(prior.pieces_size()).type());
+  for (int id = 0; id < prior.pieces_size(); ++id) {
+    EXPECT_EQ(prior.pieces(id).piece(), output.pieces(id).piece());
+    EXPECT_EQ(prior.pieces(id).type(), output.pieces(id).type());
+  }
+}
+
+// PROPERTY: `is_required` governs PRUNING ELIGIBILITY ONLY. The coverage
+// extension's probability is a free parameter re-estimated from posterior
+// expected counts in every constrained M-step, so making it more frequent in
+// the corpus must move its score. A fabricated or pinned score would be
+// identical across these two runs.
+TEST(UnigramContinuationContractTest, RequiredCoverageIsFreelyReestimated) {
+  const std::string prior_path = TempPath("cont_uni_reest_prior.model");
+  const ModelProto prior = MakeMultiPathUnigramPrior();
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+
+  auto run = [&](const std::string& tag,
+                 const std::vector<std::string>& lines) {
+    const std::string input = TempPath("cont_uni_reest_" + tag + ".txt");
+    const std::string prefix = TempPath("cont_uni_reest_" + tag + "_model");
+    EXPECT_TRUE(WriteLines(input, lines));
+    TrainerSpec trainer = UnigramContinuationSpec(
+        input, "text", prior_path, TempPath("cont_uni_reest_" + tag + ".result"),
+        prefix);
+    trainer.set_vocab_size(prior.pieces_size() + 1);
+    EXPECT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+    ModelProto out;
+    EXPECT_TRUE(ReadProto(prefix + ".model", &out));
+    return out;
+  };
+
+  const ModelProto rare = run("rare", std::vector<std::string>(40, "ababababz"));
+  const ModelProto often = run("often", std::vector<std::string>(40, "zzzzzzzab"));
+  ASSERT_TRUE(HasPiece(rare, "z"));
+  ASSERT_TRUE(HasPiece(often, "z"));
+
+  const double s_rare = ScoreOf(rare, "z");
+  const double s_often = ScoreOf(often, "z");
+  EXPECT_TRUE(std::isfinite(s_rare));
+  EXPECT_TRUE(std::isfinite(s_often));
+  // More posterior mass on "z" means a higher (less negative) log score.
+  EXPECT_GT(s_often, s_rare + 1e-3)
+      << "z score did not respond to its corpus frequency: " << s_rare
+      << " vs " << s_often;
+}
+
+// PROPERTY: candidate extraction spills to disk and merges externally, and the
+// spill threshold is a MEMORY knob, not a modelling one. A tiny threshold
+// forces many runs and a k-way merge; a large one keeps everything in memory.
+// Both must produce the identical artifact, because the aggregation is exact.
+TEST(UnigramContinuationContractTest, SpillThresholdDoesNotChangeTheResult) {
+  const std::string prior_path = TempPath("cont_uni_spill_prior.model");
+  const std::string input = TempPath("cont_uni_spill_input.txt");
+  const ModelProto prior = MakeMultiPathUnigramPrior();
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  std::vector<std::string> lines;
+  for (int i = 0; i < 60; ++i) {
+    lines.push_back("abababab");
+    lines.push_back("babababa");
+    lines.push_back("aabbaabb");
+  }
+  ASSERT_TRUE(WriteLines(input, lines));
+
+  auto run = [&](const std::string& tag, int32_t spill) {
+    const int32_t saved = absl::GetFlag(FLAGS_continuation_spill_entries);
+    absl::SetFlag(&FLAGS_continuation_spill_entries, spill);
+    const std::string prefix = TempPath("cont_uni_spill_" + tag + "_model");
+    TrainerSpec trainer = UnigramContinuationSpec(
+        input, "text", prior_path, TempPath("cont_uni_spill_" + tag + ".result"),
+        prefix);
+    trainer.set_vocab_size(prior.pieces_size() + 2);
+    const absl::Status status = RunTrainer(trainer, NormalizerSpec());
+    absl::SetFlag(&FLAGS_continuation_spill_entries, saved);
+    EXPECT_TRUE(status.ok()) << tag << ": " << status;
+    ModelProto out;
+    EXPECT_TRUE(ReadProto(prefix + ".model", &out));
+    return out;
+  };
+
+  const ModelProto tiny = run("tiny", 16);          // forces many spill runs
+  const ModelProto huge = run("huge", 1 << 24);     // never spills
+  ASSERT_EQ(tiny.pieces_size(), huge.pieces_size());
+  for (int i = 0; i < tiny.pieces_size(); ++i) {
+    EXPECT_EQ(tiny.pieces(i).piece(), huge.pieces(i).piece()) << "at id " << i;
+    EXPECT_EQ(tiny.pieces(i).score(), huge.pieces(i).score()) << "at id " << i;
+  }
+}
+
+// PROPERTY: an inherited meta symbol (USER_DEFINED / CONTROL / UNKNOWN / BYTE)
+// is an atomic boundary. No extension candidate may contain one or straddle
+// one, so an extension can only be built inside a fenced span.
+TEST(UnigramContinuationContractTest, InheritedMetaSymbolsFenceCandidates) {
+  const std::string prior_path = TempPath("cont_uni_fence_prior.model");
+  const std::string input = TempPath("cont_uni_fence_input.txt");
+  const std::string prefix = TempPath("cont_uni_fence_model");
+  const ModelProto prior = MakeMetaAlphabetUnigramPrior();  // <unk>, a, b, <X>
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  // "aa" and "bb" are legal candidates. "a<X>", "<X>b" and "aa<X>bb" are not,
+  // and "<X>" itself is inherited, not learnable.
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(60, "aa<X>bb")));
+
+  TrainerSpec trainer = UnigramContinuationSpec(
+      input, "text", prior_path, TempPath("cont_uni_fence.result"), prefix);
+  trainer.set_vocab_size(prior.pieces_size() + 2);
+  ASSERT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+
+  ModelProto output;
+  ASSERT_TRUE(ReadProto(prefix + ".model", &output));
+  ASSERT_EQ(prior.pieces_size() + 2, output.pieces_size());
+  for (int id = prior.pieces_size(); id < output.pieces_size(); ++id) {
+    const std::string& piece = output.pieces(id).piece();
+    EXPECT_EQ(std::string::npos, piece.find("<X>"))
+        << "extension straddles or contains the inherited meta symbol: "
+        << piece;
+    EXPECT_EQ(std::string::npos, piece.find('<')) << piece;
+    EXPECT_EQ(std::string::npos, piece.find('>')) << piece;
+  }
+  // The prior itself is untouched by the fence.
+  for (int id = 0; id < prior.pieces_size(); ++id) {
+    EXPECT_EQ(prior.pieces(id).piece(), output.pieces(id).piece());
+    EXPECT_EQ(prior.pieces(id).type(), output.pieces(id).type());
   }
 }
 
