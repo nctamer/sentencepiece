@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
 #include <sstream>
 #include <cmath>
 #include <limits>
@@ -489,6 +490,28 @@ absl::Status RefitFixedVocabulary(const ModelProto& input,
       LOG(INFO) << "REFIT early stop: improvement " << improvement
                 << " < tolerance " << options.objective_tolerance;
       break;
+    }
+  }
+
+  // OPT-IN DIAGNOSTIC DUMP (SPM_DUMP_REFIT_EXPECTED=<path>).
+  //
+  // `expected` here is the posterior occupancy from the E-step that FOLLOWED
+  // the last M-step, i.e. under the final model, which is exactly the usage
+  // profile a caller wants. Emitting it costs nothing: it is already in hand,
+  // so there is no extra corpus pass and no extra model build, and nothing
+  // about the estimate changes -- this reads state, it does not produce it.
+  if (const char* dump = std::getenv("SPM_DUMP_REFIT_EXPECTED")) {
+    auto out = filesystem::NewWritableFile(dump);
+    if (out->status().ok()) {
+      for (size_t i = 0; i < n; ++i) {
+        const auto& sp = output->pieces(static_cast<int>(i));
+        std::ostringstream os;
+        os << i << "\t" << sp.piece() << "\t"
+           << ModelProto::SentencePiece::Type_Name(sp.type()) << "\t"
+           << std::setprecision(17) << expected[i] << "\t" << sp.score();
+        out->WriteLine(os.str());
+      }
+      LOG(INFO) << "SPM_DUMP_REFIT_EXPECTED wrote " << n << " rows to " << dump;
     }
   }
 

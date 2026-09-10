@@ -18,6 +18,8 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/str_format.h"
 #include "filesystem.h"
 #include "sentencepiece_model.pb.h"
@@ -54,6 +56,27 @@ NormalizerSpec IdentityNormalizer() {
   n.set_escape_whitespaces(true);
   return n;
 }
+
+
+class ScopedRefitEnv {
+ public:
+  ScopedRefitEnv(const char* key, const std::string& value) : key_(key) {
+    const char* old = ::getenv(key);
+    had_ = old != nullptr;
+    if (had_) old_ = old;
+    ::setenv(key, value.c_str(), 1);
+  }
+  ~ScopedRefitEnv() {
+    if (had_) {
+      ::setenv(key_.c_str(), old_.c_str(), 1);
+    } else {
+      ::unsetenv(key_.c_str());
+    }
+  }
+ private:
+  std::string key_, old_;
+  bool had_ = false;
+};
 
 struct Entry {
   std::string piece;
@@ -685,6 +708,52 @@ TEST(UnigramRefitTest, ContractCheckerRejectsAMutatedSupport) {
   ModelProto renamed = in;
   renamed.mutable_pieces(2)->set_piece("bb");
   EXPECT_FALSE(unigram_refit::VerifyFixedSupportContract(in, renamed).ok());
+}
+
+
+// The diagnostic dump must be exactly that: enabling it may not move a single
+// score, because it reads the final E-step vector that already exists rather
+// than recomputing anything.
+TEST(UnigramRefitTest, ExpectedCountDumpDoesNotChangeTheResult) {
+  const ModelProto in = MakeAbModel();
+  const std::string corpus = TempPath("refit_dump.tsv");
+  ASSERT_TRUE(WriteLines(corpus, {"ab\t31", "ba\t17", "aab\t5"}));
+  const std::string dump = TempPath("refit_dump_expected.tsv");
+  ::remove(dump.c_str());
+
+  ModelProto plain, dumped;
+  RefitStats s1, s2;
+  ASSERT_TRUE(Refit(in, corpus, "tsv", &plain, &s1).ok());
+  {
+    ScopedRefitEnv env("SPM_DUMP_REFIT_EXPECTED", dump);
+    ASSERT_TRUE(Refit(in, corpus, "tsv", &dumped, &s2).ok());
+  }
+
+  ASSERT_EQ(plain.pieces_size(), dumped.pieces_size());
+  for (int i = 0; i < plain.pieces_size(); ++i) {
+    EXPECT_EQ(plain.pieces(i).piece(), dumped.pieces(i).piece());
+    EXPECT_EQ(plain.pieces(i).type(), dumped.pieces(i).type());
+    EXPECT_TRUE(BitEqual(plain.pieces(i).score(), dumped.pieces(i).score()))
+        << "enabling the dump moved the score at id " << i;
+  }
+  EXPECT_DOUBLE_EQ(s1.final_objective, s2.final_objective);
+
+  // And it really wrote one row per piece, with a positive count for a piece
+  // the corpus clearly uses.
+  auto in_file = filesystem::NewReadableFile(dump);
+  ASSERT_TRUE(in_file->status().ok());
+  std::string line;
+  int rows = 0;
+  double ab_count = -1.0;
+  while (in_file->ReadLine(&line)) {
+    if (line.empty()) continue;
+    const std::vector<std::string> f = absl::StrSplit(line, '\t');
+    ASSERT_EQ(5u, f.size()) << line;
+    if (f[1] == "ab") ASSERT_TRUE(absl::SimpleAtod(f[3], &ab_count));
+    ++rows;
+  }
+  EXPECT_EQ(plain.pieces_size(), rows);
+  EXPECT_GT(ab_count, 0.0);
 }
 
 }  // namespace
