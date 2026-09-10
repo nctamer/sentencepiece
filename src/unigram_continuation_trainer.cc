@@ -18,6 +18,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/strings/str_join.h"
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -324,10 +325,27 @@ absl::Status ContinuationTrainer::ReconcileNormalization() {
   return absl::OkStatus();
 }
 
-absl::Status ContinuationTrainer::VerifyCorpusCoverage() const {
+absl::Status ContinuationTrainer::VerifyCorpusCoverage() {
+  // BOOTSTRAP, DO NOT REFUSE.
+  // A continuation corpus routinely contains characters the prior never saw --
+  // expanding a piano tokenizer with violin introduces 'V' for the "Vn:"
+  // marker, and the prior cannot spell it. Refusing here forced callers to
+  // hand-edit the prior, which is worse in three ways: it mutates an artifact
+  // that is supposed to be immutable, it silently spends one of the extension
+  // slots (1201+299 instead of 1200+300), and the hand-chosen score is a fake
+  // inherited probability that no data supports.
+  //
+  // Instead: collect the missing characters here and admit them as ordinary
+  // EXTENSION candidates. They are new pieces, they append after the whole
+  // prior, they count against the extension budget, and their scores are
+  // learned by the constrained M-step like any other extension. Pruning keeps
+  // them automatically -- a character with no alternative segmentation has
+  // infinite deletion loss -- so no special-casing is needed there.
+  bootstrap_pieces_.clear();
   Model model(prior_model_);
   if (!model.status().ok()) return model.status();
 
+  absl::flat_hash_set<std::string> missing;
   for (const auto& sentence : corpus_.sentences) {
     Lattice lattice;
     lattice.SetSentence(sentence.first);
@@ -335,11 +353,18 @@ absl::Status ContinuationTrainer::VerifyCorpusCoverage() const {
     const auto path = lattice.Viterbi();
     for (const auto* node : path.first) {
       if (node->id == prior_unk_id_) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "continuation corpus is not representable by the inherited model "
-            "without <unk>; representative input: ", sentence.first));
+        missing.emplace(node->piece.data(), node->piece.size());
       }
     }
+  }
+  bootstrap_pieces_.assign(missing.begin(), missing.end());
+  std::sort(bootstrap_pieces_.begin(), bootstrap_pieces_.end());
+  if (!bootstrap_pieces_.empty()) {
+    LOG(INFO) << "Unigram continuation bootstrap: " << bootstrap_pieces_.size()
+              << " character(s) absent from the prior will be admitted as "
+                 "EXTENSION candidates (they consume extension budget, and "
+                 "the prior is not modified): "
+              << absl::StrJoin(bootstrap_pieces_, " ");
   }
   return absl::OkStatus();
 }
@@ -348,13 +373,25 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
   extension_candidates_.clear();
   if (extension_target_ == 0) return absl::OkStatus();
 
-  size_t candidate_limit = std::max<size_t>(
-      10000, static_cast<size_t>(extension_target_) * 64);
-  if (trainer_spec_.seed_sentencepiece_size() > 0) {
-    candidate_limit = std::min<size_t>(
-        candidate_limit,
-        static_cast<size_t>(trainer_spec_.seed_sentencepiece_size()));
-  }
+  // THE CANDIDATE POOL IS THE SEARCH UNIVERSE AND MUST NOT DEPEND ON K.
+  // This used to be max(10000, extension_target * 64), with
+  // seed_sentencepiece_size able only to SHRINK it. Two things were wrong.
+  // First, the universe moved with the OUTPUT budget, so a K=300 run and a
+  // K=1200 run searched different candidate sets and their vocabularies were
+  // not comparable -- a phrase could be absent either because EM pruned it or
+  // because it was never admitted, and nothing distinguished the two.
+  // Second, seed_sentencepiece_size could not ENLARGE the pool, so there was
+  // no way to ask for a wider search at a small K.
+  //
+  // Now: seed_sentencepiece_size, when set, IS the pool size, independent of
+  // K; otherwise a fixed default (SentencePiece's own seed default) is used.
+  // The pool is only ever raised to extension_target, since a pool smaller
+  // than the budget cannot fill it.
+  constexpr size_t kDefaultContinuationCandidatePool = 1000000;
+  size_t candidate_limit =
+      trainer_spec_.seed_sentencepiece_size() > 0
+          ? static_cast<size_t>(trainer_spec_.seed_sentencepiece_size())
+          : kDefaultContinuationCandidatePool;
   candidate_limit = std::max<size_t>(candidate_limit,
                                      static_cast<size_t>(extension_target_));
 
@@ -434,6 +471,34 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     return a.first < b.first;
   });
   if (ranked.size() > candidate_limit) ranked.resize(candidate_limit);
+
+  // BOOTSTRAP CHARACTERS ARE ADMITTED UNCONDITIONALLY, ahead of the frequency
+  // filter and the pool cap. Without them the corpus is unrepresentable, so
+  // they are not competing on merit with ordinary candidates -- but they are
+  // still ORDINARY EXTENSIONS: appended after the prior, scored by the
+  // constrained M-step, and counted against the extension budget. Pruning
+  // keeps them on its own, because a piece with no alternative segmentation
+  // has infinite deletion loss.
+  if (!bootstrap_pieces_.empty()) {
+    absl::flat_hash_set<std::string> present;
+    present.reserve(ranked.size());
+    for (const auto& item : ranked) present.insert(item.first);
+    std::vector<std::pair<std::string, uint64_t>> prepend;
+    for (const auto& ch : bootstrap_pieces_) {
+      if (present.count(ch)) continue;
+      auto it = counts.find(ch);
+      // A bootstrap character always occurs; fall back to 1 if the counter
+      // never saw it as a standalone substring.
+      prepend.emplace_back(ch, it == counts.end()
+                                   ? static_cast<uint64_t>(1)
+                                   : it->second);
+    }
+    if (!prepend.empty()) {
+      ranked.insert(ranked.begin(), prepend.begin(), prepend.end());
+      LOG(INFO) << "Unigram continuation: admitted " << prepend.size()
+                << " bootstrap character candidate(s) into the pool";
+    }
+  }
 
   extension_candidates_.reserve(ranked.size());
   for (auto& item : ranked) {
@@ -617,6 +682,104 @@ absl::Status ContinuationTrainer::RunEStep(
   return absl::OkStatus();
 }
 
+absl::Status ContinuationTrainer::ComputeExtensionDeletionLoss(
+    const std::vector<ExtensionCandidate>& extensions, double lambda,
+    std::vector<double>* loss, std::vector<float>* viterbi_freq) const {
+  // Mirrors Trainer::PruneSentencePieces in unigram_model_trainer.cc. The only
+  // differences are structural, and both follow from the continuation
+  // contract: the piece table is inherited+extensions rather than a single
+  // trained vocabulary, and only the extension region is scored, because
+  // inherited pieces can never be pruned.
+  const ModelProto working = BuildWorkingModel(extensions, lambda);
+  Model model(working);
+  if (!model.status().ok()) return model.status();
+
+  const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
+  const size_t total = static_cast<size_t>(working.pieces_size());
+
+  // Viterbi token frequencies over the whole corpus. Ordinary Unigram pruning
+  // uses the Viterbi path, not the marginal, because the loss below is stated
+  // in terms of "every occurrence is replaced by its alternative".
+  viterbi_freq->assign(total, 0.0f);
+  {
+    Lattice lattice;
+    for (const auto& sentence : corpus_.sentences) {
+      lattice.SetSentence(sentence.first);
+      model.PopulateNodes(&lattice);
+      for (const auto* node : lattice.Viterbi().first) {
+        if (node->id >= 0 && static_cast<size_t>(node->id) < total) {
+          (*viterbi_freq)[node->id] += static_cast<float>(sentence.second);
+        }
+      }
+    }
+  }
+
+  double sum = 0.0;
+  for (size_t i = 0; i < total; ++i) sum += (*viterbi_freq)[i];
+  if (!(sum > 0.0)) {
+    return absl::FailedPreconditionError(
+        "Unigram continuation pruning: empty Viterbi frequency mass");
+  }
+  const double logsum = std::log(sum);
+
+  loss->assign(extensions.size(), 0.0);
+  Lattice lattice;
+  for (size_t k = 0; k < extensions.size(); ++k) {
+    const size_t id = base_n + k;
+    const double f = static_cast<double>((*viterbi_freq)[id]);
+
+    lattice.SetSentence(extensions[k].piece);
+    model.PopulateNodes(&lattice);
+    const auto nbests = lattice.NBest(2, false, 0.0);
+
+    if (nbests.empty()) {                       // unreachable; drop it
+      (*loss)[k] = -std::numeric_limits<double>::infinity();
+      continue;
+    }
+    if (nbests.size() == 1) {
+      // No second best: this piece is the only way to spell itself, so
+      // removing it would make its string unrepresentable. Must keep.
+      (*loss)[k] = std::numeric_limits<double>::infinity();
+      continue;
+    }
+    if (nbests[0].first.size() >= 2) {
+      // Its own Viterbi path already prefers a split, so the piece is never
+      // used and costs nothing to remove.
+      (*loss)[k] = -std::numeric_limits<double>::infinity();
+      continue;
+    }
+    if (f <= 0.0) {                             // never on a Viterbi path
+      (*loss)[k] = -std::numeric_limits<double>::infinity();
+      continue;
+    }
+
+    std::vector<int> alt;
+    alt.reserve(nbests[1].first.size());
+    for (const auto* node : nbests[1].first) {
+      if (node->id >= 0 && static_cast<size_t>(node->id) < total) {
+        alt.push_back(node->id);
+      }
+    }
+    if (alt.empty()) {                          // no usable alternative: keep
+      (*loss)[k] = std::numeric_limits<double>::infinity();
+      continue;
+    }
+
+    const double logprob_sp = std::log(f) - logsum;
+    // Removing the piece re-assigns its f occurrences to |alt| pieces each.
+    const double logsum_alt =
+        std::log(sum + f * (static_cast<double>(alt.size()) - 1.0));
+    double logprob_alt = 0.0;
+    for (const int n : alt) {
+      logprob_alt +=
+          std::log(static_cast<double>((*viterbi_freq)[n]) + f) - logsum_alt;
+    }
+    const double F = f / sum;
+    (*loss)[k] = F * (logprob_sp - logprob_alt);
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ContinuationTrainer::SolveMStepLambda(
     const std::vector<float>& expected, size_t extension_count,
     double* lambda) const {
@@ -736,12 +899,28 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
     }
 
     const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
+
+    // RANK BY DELETION LOSS, NOT BY EXPECTED COUNT.
+    // Until 2026-09-10 this sorted on expected[base_n + i], i.e. it kept the
+    // most FREQUENT extensions. That is not Unigram pruning and it selected a
+    // materially wrong vocabulary: expanding a 1200-piece piano tokenizer with
+    // 300 violin slots produced 241 single pitches, 28 time signatures and 20
+    // durations, and ZERO note bigrams -- while the phrase pieces the corpus
+    // overwhelmingly supports (Vn: is followed by a note 922,977 times) were
+    // discarded. Frequency alone cannot express that a piece is worth keeping
+    // BECAUSE its fallback is expensive; deletion loss can.
+    std::vector<double> loss;
+    std::vector<float> viterbi_freq;
+    ABSL_RETURN_IF_ERROR(ComputeExtensionDeletionLoss(
+        extension_candidates_, lambda_, &loss, &viterbi_freq));
+
     std::vector<size_t> order(extension_candidates_.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-      const double ea = expected[base_n + a];
-      const double eb = expected[base_n + b];
-      if (!ScoresTie(ea, eb)) return ea > eb;
+      const double la = loss[a];
+      const double lb = loss[b];
+      if (!ScoresTie(la, lb)) return la > lb;
+      // Deterministic tie-break, as before.
       return extension_candidates_[a].piece < extension_candidates_[b].piece;
     });
 
