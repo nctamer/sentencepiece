@@ -2137,6 +2137,38 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
         zero_count, " requested extension pieces have zero expected count"));
   }
 
+  // OPT-IN DIAGNOSTIC (SPM_DUMP_CONTINUATION_EXPECTED=<path>), emitted BEFORE
+  // the sort below, because that sort reorders extension_candidates_ while
+  // `expected` is still indexed by the working model's layout.
+  //
+  // HONEST CAVEAT, stated because it would be easy to overclaim: `expected` is
+  // the occupancy from the LAST E-STEP, which precedes the final M-step's
+  // score write, so it is the posterior under the score state one M-step
+  // earlier -- not under the exact scores that get serialized. Recomputing it
+  // under the final scores would cost another full corpus pass, which is
+  // exactly what this diagnostic is not allowed to do. It is a usage profile,
+  // not a likelihood term.
+  //
+  // Keyed by piece string so a reader can join it to the final artifact
+  // regardless of the reordering that follows.
+  if (const char* dump = std::getenv("SPM_DUMP_CONTINUATION_EXPECTED")) {
+    auto out = filesystem::NewWritableFile(dump);
+    if (out->status().ok()) {
+      for (size_t i = 0; i < base_n; ++i) {
+        out->WriteLine(absl::StrCat(i, "\t", prior_model_.pieces(i).piece(),
+                                    "\tinherited\t", expected[i]));
+      }
+      for (size_t i = 0; i < extension_candidates_.size(); ++i) {
+        out->WriteLine(absl::StrCat(base_n + i, "\t",
+                                    extension_candidates_[i].piece,
+                                    "\textension\t", expected[base_n + i]));
+      }
+      LOG(INFO) << "SPM_DUMP_CONTINUATION_EXPECTED wrote "
+                << (base_n + extension_candidates_.size()) << " rows to "
+                << dump;
+    }
+  }
+
   std::sort(extension_candidates_.begin(), extension_candidates_.end(),
             [](const ExtensionCandidate& a, const ExtensionCandidate& b) {
               if (!ScoresTie(a.score, b.score)) return a.score > b.score;

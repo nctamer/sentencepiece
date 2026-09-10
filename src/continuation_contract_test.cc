@@ -2753,5 +2753,63 @@ TEST(UnigramContinuationContractTest, BoundaryPolicyRecordsTheEffectiveFenceSet)
   EXPECT_EQ(a, back.boundary_policy());
 }
 
+
+// The continuation expected-count dump must be diagnostics ONLY: enabling it
+// may not move a score, a lambda or the piece table. It reads a vector already
+// in hand at EM exit.
+TEST(UnigramContinuationContractTest, ContinuationExpectedDumpDoesNotChangeTheResult) {
+  const ModelProto prior = MakeAbUnigramPrior();
+  const std::string prior_path = TempPath("cont_expdump_prior.model");
+  const std::string input = TempPath("cont_expdump_input.txt");
+  ASSERT_TRUE(WriteProto(prior_path, prior));
+  ASSERT_TRUE(WriteLines(input, std::vector<std::string>(60, "abababab")));
+  const std::string dump = TempPath("cont_expdump.tsv");
+  ::remove(dump.c_str());
+
+  auto run = [&](const std::string& tag, bool with_dump) {
+    const std::string prefix = TempPath("cont_expdump_" + tag);
+    std::unique_ptr<ScopedEnv> env;
+    if (with_dump) {
+      env = std::make_unique<ScopedEnv>("SPM_DUMP_CONTINUATION_EXPECTED", dump);
+    }
+    TrainerSpec trainer = UnigramContinuationSpec(
+        input, "text", prior_path, TempPath("cont_expdump_" + tag + ".result"),
+        prefix);
+    trainer.set_vocab_size(prior.pieces_size() + 3);
+    EXPECT_TRUE(RunTrainer(trainer, NormalizerSpec()).ok());
+    ModelProto m;
+    EXPECT_TRUE(ReadProto(prefix + ".model", &m));
+    return m;
+  };
+  const ModelProto plain = run("plain", false);
+  const ModelProto dumped = run("dumped", true);
+
+  ASSERT_EQ(plain.pieces_size(), dumped.pieces_size());
+  for (int i = 0; i < plain.pieces_size(); ++i) {
+    EXPECT_EQ(plain.pieces(i).piece(), dumped.pieces(i).piece());
+    EXPECT_EQ(plain.pieces(i).type(), dumped.pieces(i).type());
+    EXPECT_EQ(plain.pieces(i).score(), dumped.pieces(i).score())
+        << "enabling the dump moved the score at id " << i;
+  }
+  EXPECT_EQ(plain.expansion_result().unigram_lambda(),
+            dumped.expansion_result().unigram_lambda());
+
+  auto in = filesystem::NewReadableFile(dump);
+  ASSERT_TRUE(in->status().ok());
+  std::string line;
+  int rows = 0, inherited = 0, extension = 0;
+  while (in->ReadLine(&line)) {
+    if (line.empty()) continue;
+    const std::vector<std::string> f = absl::StrSplit(line, '\t');
+    ASSERT_EQ(4u, f.size()) << line;
+    if (f[2] == "inherited") ++inherited;
+    if (f[2] == "extension") ++extension;
+    ++rows;
+  }
+  EXPECT_EQ(plain.pieces_size(), rows);
+  EXPECT_EQ(prior.pieces_size(), inherited);
+  EXPECT_EQ(plain.pieces_size() - prior.pieces_size(), extension);
+}
+
 }  // namespace
 }  // namespace sentencepiece
