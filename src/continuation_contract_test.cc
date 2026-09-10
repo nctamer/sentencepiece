@@ -2632,5 +2632,126 @@ TEST(UnigramContinuationContractTest, FenceSetIsOrderIndependentAndDeduplicated)
   EXPECT_EQ(a, ReadWhole(d3)) << "duplicate fence entries changed extraction";
 }
 
+
+// ---------------------------------------------------------------------------
+// G3 provenance: the fence set is a MODELLING parameter and must be recorded.
+//
+// --continuation_fence_strings changes the candidate universe, so unlike
+// --continuation_spill_dir/-entries it can change the learned tokenizer. A
+// fenced and an unfenced run would otherwise ship the same serialized
+// TrainerSpec while having trained under different boundary policies.
+// ---------------------------------------------------------------------------
+
+std::string PolicyOf(const ModelProto& prior,
+                     const std::vector<std::string>& lines,
+                     const std::string& fence_spec, const std::string& tag,
+                     std::string* embedded_out = nullptr) {
+  const std::string prior_path = TempPath("g3p_" + tag + "_prior.model");
+  const std::string input = TempPath("g3p_" + tag + "_input.txt");
+  const std::string prefix = TempPath("g3p_" + tag + "_model");
+  const std::string result_path = TempPath("g3p_" + tag + ".result");
+  EXPECT_TRUE(WriteProto(prior_path, prior));
+  EXPECT_TRUE(WriteLines(input, lines));
+
+  const std::string saved = absl::GetFlag(FLAGS_continuation_fence_strings);
+  absl::SetFlag(&FLAGS_continuation_fence_strings, fence_spec);
+  TrainerSpec trainer = UnigramContinuationSpec(input, "text", prior_path,
+                                                result_path, prefix);
+  trainer.set_vocab_size(prior.pieces_size() + 2);
+  trainer.set_max_sentencepiece_length(8);
+  const absl::Status status = RunTrainer(trainer, NormalizerSpec());
+  absl::SetFlag(&FLAGS_continuation_fence_strings, saved);
+  EXPECT_TRUE(status.ok()) << status;
+
+  ExpansionResult standalone;
+  EXPECT_TRUE(ReadProto(result_path, &standalone));
+  if (embedded_out != nullptr) {
+    ModelProto m;
+    EXPECT_TRUE(ReadProto(prefix + ".model", &m));
+    *embedded_out = m.expansion_result().boundary_policy();
+  }
+  return standalone.boundary_policy();
+}
+
+TEST(UnigramContinuationContractTest, BoundaryPolicyEncodingIsCanonical) {
+  // Pure function, so the awkward cases are cheap to pin here rather than
+  // through a training run.
+  EXPECT_EQ("unigram_explicit_fences_v1:[]",
+            unigram::EncodeUnigramBoundaryPolicy({}));
+  EXPECT_EQ("unigram_explicit_fences_v1:[abc]",
+            unigram::EncodeUnigramBoundaryPolicy({"abc"}));
+  // Order- and duplicate-independent: a std::set, sorted by bytes.
+  EXPECT_EQ(unigram::EncodeUnigramBoundaryPolicy({"a", "b"}),
+            unigram::EncodeUnigramBoundaryPolicy({"b", "a", "b"}));
+  // A surface containing the separator must not be confusable with two
+  // surfaces. This is why the encoding escapes rather than trusting the data.
+  EXPECT_NE(unigram::EncodeUnigramBoundaryPolicy({"a,b"}),
+            unigram::EncodeUnigramBoundaryPolicy({"a", "b"}));
+  EXPECT_EQ("unigram_explicit_fences_v1:[a%2Cb]",
+            unigram::EncodeUnigramBoundaryPolicy({"a,b"}));
+  // Brackets too, so the envelope cannot be forged.
+  EXPECT_EQ("unigram_explicit_fences_v1:[%5D]",
+            unigram::EncodeUnigramBoundaryPolicy({"]"}));
+  // Multi-byte surfaces are escaped byte by byte and stay distinguishable.
+  EXPECT_EQ("unigram_explicit_fences_v1:[%E2%96%81Vn%3A]",
+            unigram::EncodeUnigramBoundaryPolicy({"\xe2\x96\x81Vn:"}));
+}
+
+TEST(UnigramContinuationContractTest, BoundaryPolicyRecordsTheEffectiveFenceSet) {
+  const ModelProto prior = MakeG3Prior();
+  std::vector<std::string> lines;
+  for (int i = 0; i < 40; ++i) {
+    lines.push_back("aa PL: bb");
+    lines.push_back("cc PR: dd");
+    lines.push_back("ee Vn: ff");
+  }
+
+  // 1. absent flag and explicitly empty flag agree, and are the canonical
+  //    "no explicit curriculum fence" policy.
+  std::string embedded_absent;
+  const std::string absent =
+      PolicyOf(prior, lines, "", "absent", &embedded_absent);
+  EXPECT_EQ("unigram_explicit_fences_v1:[]", absent);
+
+  // 2. reordered and duplicated fence lists are the same policy.
+  std::string embedded_a;
+  const std::string a =
+      PolicyOf(prior, lines, "PL:,PR:,Vn:", "seta", &embedded_a);
+  const std::string b = PolicyOf(prior, lines, "Vn:,PL:,PR:", "setb");
+  const std::string c = PolicyOf(prior, lines, "Vn:,PL:,Vn:,PR:,PR:", "setc");
+  EXPECT_EQ(a, b) << "fence list order changed the recorded policy";
+  EXPECT_EQ(a, c) << "duplicate entries changed the recorded policy";
+  EXPECT_NE(absent, a);
+
+  // The recorded surfaces are the NORMALIZED ones actually matched, not the
+  // caller's logical spelling.
+  EXPECT_EQ(unigram::EncodeUnigramBoundaryPolicy(
+                {NormalizeLikeTrainer(prior, "PL:"),
+                 NormalizeLikeTrainer(prior, "PR:"),
+                 NormalizeLikeTrainer(prior, "Vn:")}),
+            a);
+
+  // 3. a genuinely different fence set is a different policy.
+  const std::string only_vn = PolicyOf(prior, lines, "Vn:", "onlyvn");
+  EXPECT_NE(a, only_vn);
+  EXPECT_NE(absent, only_vn);
+
+  // 4. embedded ModelProto.expansion_result agrees with the standalone
+  //    .expansion in both the empty and non-empty cases.
+  EXPECT_EQ(absent, embedded_absent);
+  EXPECT_EQ(a, embedded_a);
+
+  // 5. the policy survives serialization/deserialization unchanged. Round-trip
+  //    the REAL artifact rather than a hand-built message: ExpansionResult has
+  //    required fields, so a partially populated one does not serialize at all
+  //    and the test would pass or fail for the wrong reason.
+  ExpansionResult on_disk;
+  ASSERT_TRUE(ReadProto(TempPath("g3p_seta.result"), &on_disk));
+  ASSERT_EQ(a, on_disk.boundary_policy());
+  ExpansionResult back;
+  ASSERT_TRUE(back.ParseFromString(on_disk.SerializeAsString()));
+  EXPECT_EQ(a, back.boundary_policy());
+}
+
 }  // namespace
 }  // namespace sentencepiece

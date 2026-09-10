@@ -791,6 +791,7 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
       }
     }
   }
+  explicit_fence_surfaces_ = fence_surface_storage;
   if (!fence_surface_storage.empty()) {
     std::set<absl::string_view> views;
     for (const auto& sfc : fence_surface_storage) views.insert(sfc);
@@ -2144,6 +2145,38 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
   return absl::OkStatus();
 }
 
+std::string EncodeUnigramBoundaryPolicy(
+    const std::set<std::string>& normalized_fence_surfaces) {
+  std::string out = "unigram_explicit_fences_v1:[";
+  bool first = true;
+  // std::set iterates in byte order, so this is deterministic and independent
+  // of the caller's list order; duplicates already collapsed on insert. Never
+  // rely on an unordered container's iteration for a provenance string.
+  for (const auto& surface : normalized_fence_surfaces) {
+    if (!first) out += ",";
+    first = false;
+    // Percent-escape everything outside [A-Za-z0-9._-], so a surface
+    // containing a comma or a bracket cannot be confused with the separators.
+    for (const unsigned char c : surface) {
+      const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                        c == '-';
+      if (safe) {
+        out += static_cast<char>(c);
+      } else {
+        // UPPERCASE hex, fixed two digits: the canonical form must not depend
+        // on a formatting default.
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        out += '%';
+        out += kHex[c >> 4];
+        out += kHex[c & 0x0F];
+      }
+    }
+  }
+  out += "]";
+  return out;
+}
+
 absl::Status VerifyPriorPrefixInvariant(const ModelProto& prior_model,
                                         const ModelProto& output,
                                         double lambda) {
@@ -2272,6 +2305,11 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   result.set_prior_model_sha256(continuation::Sha256Hex(prior_model_bytes_));
   result.set_prior_piece_count(prior_model_.pieces_size());
   result.set_unigram_lambda(lambda_);
+  // MODELLING PROVENANCE, not an execution detail: the fence set changes the
+  // candidate universe, so the artifact must say which policy produced it.
+  // Canonical and identical for "flag absent" and "flag empty".
+  result.set_boundary_policy(
+      EncodeUnigramBoundaryPolicy(explicit_fence_surfaces_));
 
   // THE GAUGED MODEL IS BUILT FIRST, because the sidecars must describe IT.
   //

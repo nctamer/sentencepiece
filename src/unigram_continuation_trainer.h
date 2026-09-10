@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include "absl/container/flat_hash_set.h"
 #include <vector>
@@ -40,6 +41,33 @@ absl::Status BisectMonotoneRoot(absl::string_view what,
 absl::Status VerifyPriorPrefixInvariant(const ModelProto& prior,
                                         const ModelProto& output,
                                         double lambda);
+
+// CANONICAL BOUNDARY POLICY for Unigram continuation, serialized into
+// ExpansionResult.boundary_policy.
+//
+// --continuation_fence_strings is NOT an execution knob like
+// --continuation_spill_dir or --continuation_spill_entries: it changes the
+// candidate universe and therefore the tokenizer that can be learned. Without
+// this, a fenced and an unfenced run could ship the same serialized
+// TrainerSpec while having trained under different boundary policies, which is
+// not acceptable provenance for a modelling parameter.
+//
+// What is recorded is the EFFECTIVE NORMALIZED UNIQUE surface set -- what
+// candidate generation actually matched -- not the caller's logical spelling.
+// The normalizer that produced those surfaces is identified by
+// prior_model_sha256, so the pair is self-describing.
+//
+// Encoding, versioned and unambiguous for arbitrary bytes:
+//
+//   unigram_explicit_fences_v1:[]              no explicit curriculum fence
+//   unigram_explicit_fences_v1:[<e1>,<e2>]     e_i sorted, percent-escaped
+//
+// Every byte outside [A-Za-z0-9._-] is escaped as %XX, so a surface containing
+// a comma or a bracket cannot be confused with the separator. Sorting is by
+// surface bytes, so the policy is independent of the caller's list order and
+// of duplicates -- exactly like the matcher it describes.
+std::string EncodeUnigramBoundaryPolicy(
+    const std::set<std::string>& normalized_fence_surfaces);
 
 // True continuation of a native Unigram ModelProto. Inherited NORMAL scores
 // are constrained to s_i + lambda * length(i); only extension probabilities
@@ -199,6 +227,8 @@ class ContinuationTrainer : public TrainerInterface {
   // otherwise unrepresentable. They consume extension budget but never enter
   // the deletion-loss ranking.
   absl::flat_hash_set<std::string> required_extensions_;
+  // Effective normalized fence surfaces, kept for provenance.
+  std::set<std::string> explicit_fence_surfaces_;
   ModelProto prior_model_;
   std::string prior_model_bytes_;
   continuation::PreparedCorpus corpus_;
