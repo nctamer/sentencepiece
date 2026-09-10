@@ -44,6 +44,27 @@ absl::Status VerifyPriorPrefixInvariant(const ModelProto& prior,
 // True continuation of a native Unigram ModelProto. Inherited NORMAL scores
 // are constrained to s_i + lambda * length(i); only extension probabilities
 // and their shared probability mass are learned from the continuation corpus.
+//
+// WHAT THE SCALAR GAUGE ACTUALLY PROVES, stated narrowly on purpose.
+//
+// For two segmentations of the SAME normalized surface that use inherited
+// NORMAL pieces only, the total length is the same, so the lambda*length terms
+// cancel and their score DIFFERENCE is unchanged. That is the theorem:
+//
+//     inherited-submodel segmentation geometry is preserved.
+//
+// It is NOT the claim that the expanded tokenizer emits the old token
+// sequence. Once extensions are appended, an extension is deliberately allowed
+// to beat the inherited segmentation -- that is the entire point of expanding
+// the vocabulary -- so the surface may retokenize. Any wording along the lines
+// of "old tokenization is preserved" is too strong and should not be used.
+//
+// The theorem is also about the inherited NORMAL probabilistic submodel only.
+// USER_DEFINED nodes are scored by the lattice's maximal-matching bonus
+// (GetUserDefinedScore) rather than by their stored score, and the UNKNOWN
+// fallback is scored from min_score() - kUnkPenalty, so neither participates in
+// the cancellation argument. Their stored scores are held bit-identical, which
+// is a separate guarantee.
 class ContinuationTrainer : public TrainerInterface {
  public:
   ContinuationTrainer(const TrainerSpec& trainer_spec,
@@ -142,22 +163,14 @@ class ContinuationTrainer : public TrainerInterface {
   // `loss[i]` is +inf for a candidate with no alternative segmentation (it is
   // the only way to spell itself, so it must be kept) and -inf for one whose
   // own Viterbi path is already split (it is unreachable and free to drop).
-  // Inherited pieces are never scored here: they are not candidates and
-  // cannot be pruned. Their frequencies ARE used, because an extension's
-  // alternative is usually inherited pieces.
-  // `posterior`, when supplied, is the E-step's forward-backward expected
-  // counts and is used as the occupancy statistic. Viterbi counts are only a
-  // fallback: a candidate can have Viterbi frequency 0 and substantial
-  // posterior mass, because initialization ties it exactly with its own
-  // inherited decomposition.
-  absl::Status ComputeExtensionDeletionLoss(
-      const std::vector<ExtensionCandidate>& extensions, double lambda,
-      std::vector<double>* loss, std::vector<float>* viterbi_freq,
-      const std::vector<float>* posterior = nullptr) const;
-  // Both lambdas are roots of monotone objectives. They report failure
-  // instead of returning a bracket endpoint that merely ran out of iterations.
-  absl::Status SolveInitialLambda(
-      const std::vector<ExtensionCandidate>& extensions, double* lambda) const;
+  // Removed 2026-09-10: ComputeExtensionDeletionLoss() and
+  // SolveInitialLambda() were the experimental deletion-loss pruner and its
+  // pre-covered-basis initializer. Neither had a production or test call site
+  // under the covered-basis initializer, and the deletion-loss statistics they
+  // fed were being read out of never-filled vectors in RunContinuationEM().
+  // Optional extension candidates are ranked by forward-backward posterior
+  // expected occupancy; deletion loss is not active.
+
   // Covered-basis normalization:
   //   Z_B(lambda) + sum_{k in R} e^{r_k} + sum_{i in O} e^{beta_i + lambda*h_i} = 1
   // The SAME function is used by the root solver and by score assignment, so

@@ -10,9 +10,12 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <cerrno>
+#include <cstdio>
 #include <queue>
 #include <set>
 #include <fstream>
+#include <iomanip>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -39,6 +42,11 @@
 #include "unigram_model_trainer.h"
 #include "util.h"
 
+ABSL_FLAG(std::string, continuation_spill_dir, "",
+          "directory under which candidate-extraction spill runs are created. "
+          "Empty means $TMPDIR, or /tmp when that is unset. Each run creates a "
+          "private mkdtemp() subdirectory that is removed on every exit path.");
+
 ABSL_FLAG(int32_t, continuation_spill_entries, 2097152,
           "Max in-memory candidate entries before continuation spills a "
           "sorted run to disk. Bounds aggregation memory only; it does NOT "
@@ -47,6 +55,64 @@ ABSL_FLAG(int32_t, continuation_spill_entries, 2097152,
 
 namespace sentencepiece::unigram {
 namespace {
+
+// A private, per-invocation scratch directory for candidate-extraction spill
+// runs, removed on EVERY exit path by the destructor.
+//
+// Uniqueness comes from mkdtemp(), not from getpid(): on a shared filesystem
+// two nodes can hold the same PID at the same time, and a PID-named directory
+// then lets one run delete another's sorted runs in the middle of its merge.
+// The base directory is a flag, else $TMPDIR, else /tmp -- never a path
+// belonging to one user's scratch space.
+class SpillScratch {
+ public:
+  SpillScratch() = default;
+  ~SpillScratch() { Cleanup(); }
+  SpillScratch(const SpillScratch&) = delete;
+  SpillScratch& operator=(const SpillScratch&) = delete;
+
+  absl::Status Open(absl::string_view base_dir) {
+    std::string base(base_dir);
+    if (base.empty()) {
+      const char* tmp = std::getenv("TMPDIR");
+      base = (tmp != nullptr && *tmp != '\0') ? tmp : "/tmp";
+    }
+    while (base.size() > 1 && base.back() == '/') base.pop_back();
+    std::string tmpl = absl::StrCat(base, "/spm_continuation_spill_XXXXXX");
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    if (::mkdtemp(buf.data()) == nullptr) {
+      return absl::InternalError(absl::StrCat(
+          "cannot create a continuation spill directory under ", base,
+          " (errno ", errno,
+          "); set --continuation_spill_dir to a writable location"));
+    }
+    dir_.assign(buf.data());
+    open_ = true;
+    return absl::OkStatus();
+  }
+
+  // Idempotent, and safe to call from an error path before the destructor.
+  void Cleanup() {
+    for (const auto& r : runs_) ::remove(r.c_str());
+    runs_.clear();
+    if (open_) {
+      ::rmdir(dir_.c_str());
+      open_ = false;
+    }
+  }
+
+  const std::string& dir() const { return dir_; }
+  void AddRun(std::string path) { runs_.push_back(std::move(path)); }
+  const std::vector<std::string>& runs() const { return runs_; }
+
+ private:
+  std::string dir_;
+  std::vector<std::string> runs_;
+  bool open_ = false;
+};
+
+
 
 bool Finite(double x) { return std::isfinite(x); }
 
@@ -442,10 +508,16 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
   // Second, seed_sentencepiece_size could not ENLARGE the pool, so there was
   // no way to ask for a wider search at a small K.
   //
-  // Now: seed_sentencepiece_size, when set, IS the pool size, independent of
-  // K; otherwise a fixed default (SentencePiece's own seed default) is used.
-  // The pool is only ever raised to extension_target, since a pool smaller
-  // than the budget cannot fill it.
+  // Now: seed_sentencepiece_size, when set, IS the pool size; otherwise a
+  // fixed default (SentencePiece's own seed default) is used. The pool is only
+  // ever raised to extension_target, since a pool smaller than the budget
+  // cannot fill it.
+  //
+  // INDEPENDENCE FROM K IS CONDITIONAL and the condition is stated where the
+  // threshold is computed: it holds under the validated default
+  // min_freq_alpha = 0. With a nonzero alpha the dynamic frequency floor reads
+  // vocab_size, so admission -- and therefore the pool contents, though not
+  // this cap -- becomes K-dependent again.
   constexpr size_t kDefaultContinuationCandidatePool = 1000000;
   size_t candidate_limit =
       trainer_spec_.seed_sentencepiece_size() > 0
@@ -488,14 +560,20 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     std::string piece;
     uint64_t count;
   };
-  const std::string spill_dir =
-      absl::StrCat("/gscratch/scrubbed/nctamer/pianotok_work/.spm_spill_",
-                   getpid());
-  std::vector<std::string> run_paths;
-  auto cleanup_runs = [&run_paths, &spill_dir]() {
-    for (const auto& r : run_paths) ::remove(r.c_str());
-    ::rmdir(spill_dir.c_str());
-  };
+  // SPILL SCRATCH IS PRIVATE, PORTABLE AND RAII-CLEANED.
+  //
+  // It used to be a hard-coded /gscratch path plus getpid(), removed by a
+  // lambda that had to be called on every return. Two problems: library code
+  // must not contain one user's absolute path, and a PID is not unique on a
+  // shared filesystem -- two nodes can and do collide on the same PID, and
+  // then one run deletes the other's sorted runs mid-merge. mkdtemp() gives
+  // both portability and per-invocation uniqueness, and the destructor makes
+  // "every exit path cleans up" a property of the type rather than of the
+  // author's diligence.
+  SpillScratch scratch;
+  ABSL_RETURN_IF_ERROR(
+      scratch.Open(absl::GetFlag(FLAGS_continuation_spill_dir)));
+  const std::string& spill_dir = scratch.dir();
 
   // DEFECT D: INHERITED META SYMBOLS FENCE CANDIDATE GENERATION.
   //
@@ -565,7 +643,6 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
               [](const SpillEntry& a, const SpillEntry& b) {
                 return a.piece < b.piece;
               });
-    ::mkdir(spill_dir.c_str(), 0700);
     const std::string path =
         absl::StrCat(spill_dir, "/run", spill_runs, ".bin");
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -585,8 +662,18 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
           absl::StrCat("short write on continuation spill run ", path));
     }
     out.close();
-    run_paths.push_back(path);
+    scratch.AddRun(path);
     ++spill_runs;
+    // TEST-ONLY fault injection: fail after N runs exist, so the cleanup
+    // guarantee can be exercised on an error path rather than asserted.
+    if (const char* fail_after = std::getenv("SPM_SPILL_FAIL_AFTER_RUNS")) {
+      int n = 0;
+      if (absl::SimpleAtoi(fail_after, &n) && n > 0 &&
+          static_cast<int>(scratch.runs().size()) >= n) {
+        return absl::InternalError(
+            "SPM_SPILL_FAIL_AFTER_RUNS: injected spill failure");
+      }
+    }
     spilled_entries += static_cast<uint64_t>(live.size());
     return absl::OkStatus();
   };
@@ -669,6 +756,18 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     }
   }
 
+  // CANDIDATE-POOL INDEPENDENCE FROM THE EXTENSION TARGET holds under the
+  // validated and default configuration, min_freq_alpha = 0: then
+  // global_min_freq is the constant 2 and nothing in admission reads
+  // vocab_size, so the pool a corpus produces is the same whatever K is asked
+  // for. That is what the K-independence claim means and all it means.
+  //
+  // With min_freq_alpha != 0 the threshold below divides by vocab*log(vocab),
+  // so the FINAL vocabulary size feeds back into which candidates are admitted
+  // at all: changing K changes the pool. That is a K-dependent filtering
+  // heuristic and it is named as one here rather than papered over. It is not
+  // redesigned in this cleanup, and it does not affect the validated
+  // experiment, which runs at alpha = 0.
   const double alpha =
       static_cast<double>(absl::GetFlag(FLAGS_min_freq_alpha));
   const double vocab = std::max<double>(1.0, trainer_spec_.vocab_size());
@@ -716,12 +815,12 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     }
   };
   std::vector<std::unique_ptr<RunReader>> readers;
-  readers.reserve(run_paths.size());
-  for (const auto& path : run_paths) {
+  readers.reserve(scratch.runs().size());
+  for (const auto& path : scratch.runs()) {
     auto r = std::make_unique<RunReader>();
     r->in.open(path, std::ios::binary);
     if (!r->in) {
-      cleanup_runs();
+      scratch.Cleanup();
       return absl::InternalError(
           absl::StrCat("cannot reopen continuation spill run ", path));
     }
@@ -743,7 +842,7 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     for (auto& r : readers) {
       while (r->ok && r->piece == key) {
         if (r->count > std::numeric_limits<uint64_t>::max() - total) {
-          cleanup_runs();
+          scratch.Cleanup();
           return absl::OutOfRangeError(absl::StrCat(
               "weighted Unigram candidate count overflow for piece: ", key));
         }
@@ -752,13 +851,22 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
       }
     }
     ++merged_distinct;
-    const uint64_t effective_min = key.size() <= 3 ? 2 : global_min_freq;
+    // UNICODE LENGTH, not UTF-8 byte length. This exemption spares SHORT
+    // candidates from the dynamic frequency floor, and "short" everywhere else
+    // in candidate handling means characters: the rank comparator uses
+    // UTF8Len, max_sentencepiece_length is applied in characters, and the
+    // required-coverage counts are per character. Using key.size() made the
+    // exemption depend on the encoding -- a 3-character ASCII candidate was
+    // exempt while a 2-character candidate containing one 3-byte codepoint was
+    // not. Nothing in the filter's purpose distinguishes those.
+    const uint64_t effective_min =
+        string_util::UTF8Len(key) <= 3 ? 2 : global_min_freq;
     if (total < effective_min) continue;
     best.emplace(key, total);
     if (best.size() > candidate_limit) best.pop();
   }
   readers.clear();
-  cleanup_runs();
+  scratch.Cleanup();
 
   std::vector<std::pair<std::string, uint64_t>> ranked;
   ranked.reserve(best.size());
@@ -785,15 +893,57 @@ absl::Status ContinuationTrainer::MakeWeightedExtensionCandidates() {
     absl::flat_hash_set<std::string> present;
     present.reserve(ranked.size());
     for (const auto& item : ranked) present.insert(item.first);
+    // EXACT WEIGHTED OCCURRENCE COUNTS, computed independently of the spill
+    // map. Looking the character up in `counts` gave every required extension
+    // freq = 1, for two compounding reasons: single-character ordinary
+    // candidates are skipped during substring enumeration, and by this point
+    // the map has been drained into sorted runs anyway. With exactly one
+    // missing character (V, in the validated piano->violin run) a constant is
+    // indistinguishable from a count, so nothing was measurably wrong -- but
+    // the initializer distributes the required mass in PROPORTION to these
+    // numbers, so with two or more missing characters synthetic 1s silently
+    // impose an equal split while the comments claim proportionality.
+    //
+    //   required_frequency[c] = sum over normalized records of
+    //                             record_weight * occurrences of c
+    //
+    // Counted over Unicode characters, matching every other length and
+    // identity convention in candidate handling.
+    absl::flat_hash_map<std::string, uint64_t> required_freq;
+    required_freq.reserve(required_coverage_extensions_.size());
+    for (const auto& ch : required_coverage_extensions_) required_freq[ch] = 0;
+    if (!required_freq.empty()) {
+      for (const auto& sentence : corpus_.sentences) {
+        const std::string& w = sentence.first;
+        const uint64_t weight = static_cast<uint64_t>(sentence.second);
+        for (size_t i = 0; i < w.size();) {
+          const size_t clen = std::min<size_t>(
+              string_util::OneCharLen(w.data() + i), w.size() - i);
+          auto it = required_freq.find(w.substr(i, clen));
+          if (it != required_freq.end()) it->second += weight;
+          i += clen;
+        }
+      }
+    }
+
     std::vector<std::pair<std::string, uint64_t>> prepend;
     for (const auto& ch : required_coverage_extensions_) {
       if (present.count(ch)) continue;
-      auto it = counts.find(ch);
-      // A required coverage character always occurs; fall back to 1 if the counter
-      // never saw it as a standalone substring.
-      prepend.emplace_back(ch, it == counts.end()
-                                   ? static_cast<uint64_t>(1)
-                                   : it->second);
+      const uint64_t freq = required_freq[ch];
+      // A required coverage character is by construction present in the
+      // corpus: VerifyCorpusCoverage() found it there. Zero would mean the
+      // character set and the corpus disagree, which is a bug, not a datum.
+      if (freq == 0) {
+        return absl::InternalError(absl::StrCat(
+            "required coverage extension ", ch,
+            " has weighted corpus frequency 0, but it was admitted because "
+            "the corpus contains it"));
+      }
+      prepend.emplace_back(ch, freq);
+    }
+    for (const auto& e : prepend) {
+      LOG(INFO) << "REQUIREDFREQ piece=" << e.first
+                << " weighted_occurrences=" << e.second;
     }
     if (!prepend.empty()) {
       ranked.insert(ranked.begin(), prepend.begin(), prepend.end());
@@ -911,37 +1061,6 @@ absl::Status ContinuationTrainer::SolveCoveredBasisLambda(
                             /*increasing=*/true, -1.0, 1.0, lambda);
 }
 
-absl::Status ContinuationTrainer::SolveInitialLambda(
-    const std::vector<ExtensionCandidate>& extensions, double* lambda) const {
-  auto log_mass = [&](double lambda) {
-    double max_term = -std::numeric_limits<double>::infinity();
-    for (const auto& piece : inherited_normal_) {
-      max_term = std::max(
-          max_term, piece.prior_score + lambda * piece.additive_length);
-    }
-    for (const auto& piece : extensions) {
-      const int len = static_cast<int>(string_util::UTF8Len(piece.piece));
-      max_term = std::max(
-          max_term, piece.inherited_best_score + lambda * len);
-    }
-    double sum = 0.0;
-    for (const auto& piece : inherited_normal_) {
-      sum += std::exp(piece.prior_score + lambda * piece.additive_length -
-                      max_term);
-    }
-    for (const auto& piece : extensions) {
-      const int len = static_cast<int>(string_util::UTF8Len(piece.piece));
-      sum += std::exp(piece.inherited_best_score + lambda * len - max_term);
-    }
-    return max_term + std::log(sum);
-  };
-
-  // Total mass over inherited and candidate pieces rises with lambda, and the
-  // initial gauge is the lambda that makes it exactly one.
-  return BisectMonotoneRoot("initial continuation lambda", log_mass,
-                            /*increasing=*/true, -1.0, 1.0, lambda);
-}
-
 absl::Status ContinuationTrainer::InitializeContinuationScores() {
   if (extension_target_ == 0) {
     lambda_ = 0.0;
@@ -1018,13 +1137,32 @@ absl::Status ContinuationTrainer::InitializeContinuationScores() {
     // "half of epsilon0" was an unjustified heuristic and left the basis
     // sub-normalized. These scores are initialization only; the constrained
     // M-step estimates the extension probabilities afterwards.
-    const double required_total = std::max(1e-12, eps0);
+    // EXACT eps0. This was max(1e-12, eps0), which OVERALLOCATES required mass
+    // whenever 0 < eps0 < 1e-12 and so breaks the covered-basis normalization
+    // it is supposed to satisfy. eps0 > 0 has already been established above,
+    // so the floor protected nothing and only introduced the error.
+    const double required_total = eps0;
     double fsum = 0.0;
     for (const auto& r : required_freq) fsum += static_cast<double>(r.second);
     for (const auto& r : required_freq) {
       const double q = required_total * (static_cast<double>(r.second) / fsum);
       normal_pieces.emplace_back(r.first, static_cast<float>(std::log(q)));
       normal_strings.insert(r.first);
+    }
+    // OPT-IN INITIALIZATION DUMP (SPM_DUMP_REQUIRED_INIT=<path>), so a test can
+    // check the required-mass split at INITIALIZATION. Final EM re-estimation
+    // would otherwise hide an initialization bug completely: the piece would
+    // still be present with a plausible score.
+    if (const char* dump = std::getenv("SPM_DUMP_REQUIRED_INIT")) {
+      std::ofstream out(dump, std::ios::trunc);
+      if (out) {
+        for (const auto& r : required_freq) {
+          const double q =
+              required_total * (static_cast<double>(r.second) / fsum);
+          out << r.first << "\t" << r.second << "\t" << std::setprecision(17)
+              << q << "\n";
+        }
+      }
     }
     LOG(INFO) << "GATE2 basis: inherited_normal=" << inherited_normal_.size()
               << " required=" << required_freq.size()
@@ -1655,56 +1793,50 @@ absl::Status ContinuationTrainer::RunContinuationEM() {
 
     const size_t base_n = static_cast<size_t>(prior_model_.pieces_size());
 
-    // RANK BY DELETION LOSS, NOT BY EXPECTED COUNT.
-    // Until 2026-09-10 this sorted on expected[base_n + i], i.e. it kept the
-    // most FREQUENT extensions. That is not Unigram pruning and it selected a
-    // materially wrong vocabulary: expanding a 1200-piece piano tokenizer with
-    // 300 violin slots produced 241 single pitches, 28 time signatures and 20
-    // durations, and ZERO note bigrams -- while the phrase pieces the corpus
-    // overwhelmingly supports (Vn: is followed by a note 922,977 times) were
-    // discarded. Frequency alone cannot express that a piece is worth keeping
-    // BECAUSE its fallback is expensive; deletion loss can.
-    // CONTROLLED TEST: the ORIGINAL expected-posterior-count ranking.
-    // The deletion-loss replacement is retained (ComputeExtensionDeletionLoss)
-    // but NOT used here. The earlier evidence against count ranking is
-    // confounded and must be discarded: those runs passed
-    // split_by_whitespace=true, so IsValidSentencePiece() rejected any piece
-    // containing an internal U+2581 and every multi-word candidate -- the bare
-    // note bigrams that define the acceptance criterion, and every Vn:+pitch
-    // piece -- was structurally impossible to enumerate. Count pruning was
-    // never actually tested on the intended candidate universe.
+    // RANK OPTIONAL EXTENSION CANDIDATES BY FORWARD-BACKWARD POSTERIOR
+    // EXPECTED OCCUPANCY. That is the active and only pruning rule here.
     //
-    // Note this ranking reads `expected`, i.e. forward-backward POSTERIOR
-    // occupancy, never Viterbi counts, so it is unaffected by the
-    // zero-Viterbi/positive-posterior defect measured separately (/128:
-    // Viterbi 0, posterior 363.8).
-    std::vector<double> loss;
-    std::vector<float> viterbi_freq;
+    // Deletion loss is NOT active. An earlier revision switched to it on
+    // evidence that is now known to be confounded: those runs passed
+    // split_by_whitespace=true, so IsValidSentencePiece() rejected any piece
+    // containing an internal U+2581 -- every multi-word candidate, including
+    // the bare note bigrams that define the acceptance criterion and every
+    // Vn:+pitch piece, was structurally impossible to enumerate. Expected-count
+    // pruning had never been tested on the intended candidate universe.
+    //
+    // `expected` is forward-backward POSTERIOR occupancy, never Viterbi
+    // counts, so this ranking is unaffected by the zero-Viterbi /
+    // positive-posterior discrepancy measured separately (/128: Viterbi 0,
+    // posterior 363.8).
 
     // PROVENANCE (opt-in via SPM_TRACK; see ReportTracked for why).
-    // Without this, "the phrase is absent" cannot be attributed to
-    // a cause: it may never have been a candidate, may have had zero Viterbi
-    // frequency, may have been ranked out, or may have been starved of mass.
+    // Without this, "the phrase is absent" cannot be attributed to a cause: it
+    // may never have been a candidate, may have been ranked out, or may have
+    // been starved of mass.
+    //
+    // The deletion-loss and Viterbi-frequency statistics that used to be
+    // printed here were read out of two vectors that this function declared
+    // and never filled -- `viterbi_freq[bn + i]` on an empty vector, i.e.
+    // undefined behaviour on every SPM_TRACK run. They are removed rather than
+    // repaired: reconstructing them costs a full extra corpus pass and a
+    // million-piece model rebuild, and ReportTracked() already computes the
+    // Viterbi/posterior diagnostics on request.
     if (std::getenv("SPM_TRACK") != nullptr) {
-      size_t n_pos_inf = 0, n_neg_inf = 0, n_zero_freq = 0, n_prefixed = 0;
+      size_t n_prefixed = 0, n_zero_posterior = 0;
       double ext_mass = 0.0;
-      const size_t bn = static_cast<size_t>(prior_model_.pieces_size());
+      const size_t bn = base_n;
       for (size_t i = 0; i < extension_candidates_.size(); ++i) {
-        if (!loss.empty() && std::isinf(loss[i])) {
-          (loss[i] > 0 ? n_pos_inf : n_neg_inf)++;
-        }
-        if (viterbi_freq[bn + i] <= 0.0f) ++n_zero_freq;
         if (absl::StartsWith(extension_candidates_[i].piece, "\xe2\x96\x81")) {
           ++n_prefixed;
         }
+        if (expected[bn + i] <= 0.0) ++n_zero_posterior;
         ext_mass += expected[bn + i];
       }
       double deriv_dbg = 0.0;
       const double base_mass_dbg = BaseMass(lambda_, &deriv_dbg);
       LOG(INFO) << "continuation provenance: cands="
                 << extension_candidates_.size() << " word_initial=" << n_prefixed
-                << " loss=+inf:" << n_pos_inf << " -inf:" << n_neg_inf
-                << " zero_viterbi_freq=" << n_zero_freq
+                << " zero_posterior=" << n_zero_posterior
                 << " extension_expected_mass=" << ext_mass
                 << " base_mass=" << base_mass_dbg
                 << " epsilon=" << (1.0 - base_mass_dbg);
@@ -1974,21 +2106,22 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   result.set_prior_piece_count(prior_model_.pieces_size());
   result.set_unigram_lambda(lambda_);
 
-  std::vector<ExpansionPiece> all_pieces;
-  all_pieces.reserve(prior_model_.pieces_size() + extension_candidates_.size());
-  for (int id = 0; id < prior_model_.pieces_size(); ++id) {
-    const auto& prior = prior_model_.pieces(id);
-    ExpansionPiece piece;
-    piece.set_external_id(id);
-    piece.set_piece(prior.piece());
-    piece.set_type(prior.type());
-    piece.set_score(prior.score());
-    piece.set_mergeable(false);
-    piece.set_atomic(string_util::UTF8Len(prior.piece()) == 1);
-    *result.add_base_pieces() = piece;
-    all_pieces.push_back(piece);
-  }
-
+  // THE GAUGED MODEL IS BUILT FIRST, because the sidecars must describe IT.
+  //
+  // base_pieces used to be filled from prior.score(), i.e. the PRE-GAUGE
+  // score, while the emitted .model carried prior_score + lambda*length. The
+  // three artifacts then disagreed: .model held final inherited scores while
+  // .expansion and .vocab held pre-gauge ones, and only the learned pieces
+  // matched everywhere. ExpansionResult is documented as authoritative
+  // continuation state, so that made it ambiguous read on its own.
+  //
+  // AUTHORITATIVE UNIGRAM SEMANTICS, from here on:
+  //     base_pieces.score    = the score in the FINAL emitted tokenizer
+  //     learned_pieces.score = the score in the FINAL emitted tokenizer
+  // so inherited NORMAL carries the final gauged float32, inherited non-NORMAL
+  // carries its original bit-identical score (the gauge never touches it), and
+  // extensions carry their learned score. The pre-gauge prior stays fully
+  // recoverable from prior_model_sha256, prior_piece_count and unigram_lambda.
   ModelProto output = prior_model_;
   double max_gauge_error = 0.0;
   for (const auto& inherited : inherited_normal_) {
@@ -2005,6 +2138,21 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
                           lambda_ * inherited.additive_length));
   }
   result.set_unigram_score_gauge_max_error(max_gauge_error);
+
+  std::vector<ExpansionPiece> all_pieces;
+  all_pieces.reserve(prior_model_.pieces_size() + extension_candidates_.size());
+  for (int id = 0; id < prior_model_.pieces_size(); ++id) {
+    const auto& final_piece = output.pieces(id);
+    ExpansionPiece piece;
+    piece.set_external_id(id);
+    piece.set_piece(final_piece.piece());
+    piece.set_type(final_piece.type());
+    piece.set_score(final_piece.score());   // FINAL, not pre-gauge
+    piece.set_mergeable(false);
+    piece.set_atomic(string_util::UTF8Len(final_piece.piece()) == 1);
+    *result.add_base_pieces() = piece;
+    all_pieces.push_back(piece);
+  }
 
   for (size_t i = 0; i < extension_candidates_.size(); ++i) {
     const auto& candidate = extension_candidates_[i];

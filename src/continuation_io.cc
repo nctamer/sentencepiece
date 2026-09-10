@@ -17,6 +17,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "filesystem.h"
 #include "normalizer.h"
@@ -218,8 +219,13 @@ absl::Status WriteExpansionVocab(
   auto output = filesystem::NewWritableFile(filename);
   if (!output->status().ok()) return output->status();
   for (const auto& piece : pieces) {
+    // %.9g round-trips float32 exactly. absl::StrCat's default float
+    // formatting does not, so the .vocab used to be a lossy view of scores the
+    // .model and .expansion carry exactly -- which made "the three artifacts
+    // describe the same tokenizer" untestable at the text layer.
     if (!output->WriteLine(
-            absl::StrCat(piece.piece(), "\t", piece.score(), "\t",
+            absl::StrCat(piece.piece(), "\t",
+                         absl::StrFormat("%.9g", piece.score()), "\t",
                          piece.external_id()))) {
       return absl::DataLossError(
           absl::StrCat("failed to write vocab: ", filename));
