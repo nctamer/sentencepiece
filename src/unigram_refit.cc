@@ -30,8 +30,136 @@ namespace {
 
 using ::sentencepiece::continuation::PreparedCorpus;
 
+// Relative tolerance for the production monotonicity guard.
+//
+// Scores are stored as float32 (~1.2e-7 relative resolution) and the M-step
+// writes through that storage, so a converged run does not sit still: measured
+// jitter at the fixed point is ~2e-8 relative, in both directions. Exact
+// monotonicity is therefore a fiction at the last bits and a guard at 1e-9
+// fires on arithmetic noise -- it did, on a converged toy model, during
+// development. 1e-6 leaves ~45x headroom over the observed jitter while still
+// being orders of magnitude below any real regression.
+constexpr double kObjectiveTolerance = 1e-6;
+
+// The floor is a numerical device for zero-occupancy pieces, and it is an
+// APPROXIMATION to exact ML: a piece with no posterior support is given a tiny
+// probability instead of zero, which costs a little mass. Tiny keeps that
+// harmless and keeps EM monotone in practice. A large floor is a different
+// estimator and no monotonicity is claimed for it, so it is refused rather
+// than silently accepted.
+constexpr double kMaxCountFloor = 1e-6;
+
 bool IsNormal(const ModelProto::SentencePiece& sp) {
   return sp.type() == ModelProto::SentencePiece::NORMAL;
+}
+
+// UNKNOWN IS NOT A TRAINABLE MEMBER OF THE NORMAL SIMPLEX.
+//
+// PopulateNodes() inserts an UNK node at every position that has no
+// single-character node -- including positions strictly inside a span that a
+// USER_DEFINED piece already covers. Those UNK nodes are scored
+// min_score() - kUnkPenalty, and min_score() is derived from the trainable
+// NORMAL scores. If they carried posterior mass, then changing a NORMAL score
+// would also move the UNK-path score, and
+//
+//     p_i = d_i / sum_NORMAL d_j
+//
+// would NOT be the exact maximizer of the objective, because it ignores that
+// dependence. So refit trains over KNOWN-SUPPORT segmentations only and UNK
+// contributes exactly zero posterior -- not a very negative finite score.
+//
+// Masking by setting node->score = -inf and reusing Lattice::PopulateMarginal
+// is not safe here: Lattice's LogSumExp computes vmax + log1p(exp(vmin-vmax)),
+// which is -inf - -inf = NaN when BOTH arguments are -inf, and that case
+// really occurs (a position inside "<X>" has only an UNK node). So this is an
+// explicit known-only forward-backward, in double precision, that skips UNK
+// nodes and every unreachable predecessor.
+//
+// Returns log Z over known-only paths FOR ONE RECORD (not freq-weighted; the
+// caller applies freq to the objective), or -infinity when no such path
+// exists. `expected` (optional) accumulates freq-weighted posterior occupancy
+// indexed by vocabulary id.
+constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+
+double LogAdd(double a, double b) {
+  if (a == kNegInf) return b;
+  if (b == kNegInf) return a;
+  const double lo = std::min(a, b), hi = std::max(a, b);
+  return hi + std::log1p(std::exp(lo - hi));
+}
+
+double KnownOnlyMarginal(const unigram::Lattice& lattice, int unk_index,
+                         double freq, std::vector<double>* expected) {
+  const int len = lattice.size();
+  int max_node_id = 0;
+  for (int pos = 0; pos <= len; ++pos) {
+    for (const auto* node : lattice.begin_nodes(pos)) {
+      max_node_id = std::max<int>(max_node_id, node->node_id);
+    }
+    for (const auto* node : lattice.end_nodes(pos)) {
+      max_node_id = std::max<int>(max_node_id, node->node_id);
+    }
+  }
+  const auto masked = [unk_index](const unigram::Lattice::Node* n) {
+    return n->id == unk_index;
+  };
+
+  std::vector<double> alpha(max_node_id + 1, kNegInf);
+  std::vector<double> beta(max_node_id + 1, kNegInf);
+
+  // BOS is end_nodes(0)[0] and EOS is begin_nodes(len)[0]; both carry id -1.
+  alpha[lattice.end_nodes(0)[0]->node_id] = 0.0;
+  for (int pos = 0; pos <= len; ++pos) {
+    for (const auto* rnode : lattice.begin_nodes(pos)) {
+      if (masked(rnode)) continue;
+      double acc = kNegInf;
+      for (const auto* lnode : lattice.end_nodes(pos)) {
+        if (masked(lnode)) continue;
+        const double a = alpha[lnode->node_id];
+        if (a == kNegInf) continue;
+        acc = LogAdd(acc, a + static_cast<double>(lnode->score));
+      }
+      alpha[rnode->node_id] = acc;
+    }
+  }
+
+  const int eos = lattice.begin_nodes(len)[0]->node_id;
+  const double Z = alpha[eos];
+  if (Z == kNegInf) return kNegInf;  // no known-only path
+  if (expected == nullptr) return Z;
+
+  beta[eos] = 0.0;
+  for (int pos = len; pos >= 0; --pos) {
+    for (const auto* lnode : lattice.end_nodes(pos)) {
+      if (masked(lnode)) continue;
+      double acc = kNegInf;
+      for (const auto* rnode : lattice.begin_nodes(pos)) {
+        if (masked(rnode)) continue;
+        const double b = beta[rnode->node_id];
+        if (b == kNegInf) continue;
+        acc = LogAdd(acc, b + static_cast<double>(rnode->score));
+      }
+      beta[lnode->node_id] = acc;
+    }
+  }
+
+  for (int pos = 0; pos < len; ++pos) {
+    for (const auto* node : lattice.begin_nodes(pos)) {
+      if (node->id < 0 || masked(node)) continue;
+      const double a = alpha[node->node_id], b = beta[node->node_id];
+      if (a == kNegInf || b == kNegInf) continue;
+      (*expected)[node->id] +=
+          freq * std::exp(a + static_cast<double>(node->score) + b - Z);
+    }
+  }
+  return Z;
+}
+
+int UnknownIndex(const ModelProto& proto) {
+  for (int i = 0; i < proto.pieces_size(); ++i) {
+    if (proto.pieces(i).type() == ModelProto::SentencePiece::UNKNOWN) return i;
+  }
+  return -1;
 }
 
 // REPRESENTABILITY IS A PATH PROPERTY, NOT A PER-CHARACTER ONE.
@@ -50,15 +178,14 @@ absl::Status VerifyCorpusCoverage(const unigram::Model& model,
   // REFIT MAY NOT REPAIR COVERAGE. Adding a missing character is continuation's
   // required-coverage-extension behaviour and it mutates support, which is the
   // one thing this operation promises never to do. So this fails.
-  if (proto.trainer_spec().byte_fallback()) return absl::OkStatus();
-
-  int unk_index = -1;
-  for (int i = 0; i < proto.pieces_size(); ++i) {
-    if (proto.pieces(i).type() == ModelProto::SentencePiece::UNKNOWN) {
-      unk_index = i;
-      break;
-    }
-  }
+  //
+  // BYTE FALLBACK IS NOT AN ESCAPE HATCH HERE. It is applied AFTER the Unigram
+  // model has produced an UNKNOWN span; BYTE pieces are not forward-backward
+  // nodes in PopulateNodes() at all. So a corpus that needs byte fallback for
+  // coverage cannot be refit with this objective, and `byte_fallback=true`
+  // does not waive the check. The rule is uniform: a complete non-UNKNOWN path
+  // must exist, whatever the fallback policy is.
+  const int unk_index = UnknownIndex(proto);
 
   std::vector<std::string> examples;
   int64_t unrepresentable = 0;
@@ -102,8 +229,10 @@ absl::Status VerifyCorpusCoverage(const unigram::Model& model,
   if (unrepresentable == 0) return absl::OkStatus();
   return absl::FailedPreconditionError(absl::StrCat(
       "fixed-vocabulary refit cannot represent ", unrepresentable,
-      " corpus record(s) without <unk> under the model's fallback policy "
-      "(byte_fallback=false), and refit may not add pieces. Characters with "
+      " corpus record(s) without <unk>, and refit may not add pieces. "
+      "byte_fallback does not waive this: BYTE pieces are applied after an "
+      "UNKNOWN span is produced and are not forward-backward nodes, so such a "
+      "corpus cannot be refit under this objective. Characters with "
       "no covering piece: ", absl::StrJoin(uncovered_chars, " "),
       ". Example record(s): ", absl::StrJoin(examples, " | "),
       ". Adding coverage is continuation's job, not refit's."));
@@ -181,8 +310,12 @@ absl::Status RefitFixedVocabulary(const ModelProto& input,
   if (options.num_iterations <= 0) {
     return absl::InvalidArgumentError("num_iterations must be >= 1");
   }
-  if (!(options.count_floor > 0.0)) {
-    return absl::InvalidArgumentError("count_floor must be > 0");
+  if (!(options.count_floor > 0.0) || options.count_floor > kMaxCountFloor) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "count_floor must be in (0, ", kMaxCountFloor,
+        "]; it is a numerical device for zero-occupancy pieces, not a "
+        "smoothing parameter, and monotonicity is not claimed for large "
+        "values"));
   }
 
   int64_t normal_count = 0;
@@ -230,6 +363,7 @@ absl::Status RefitFixedVocabulary(const ModelProto& input,
   // E-STEP: forward-backward POSTERIOR occupancy over the fixed lattice.
   // Never Viterbi counts. `expected` is indexed by proto id because lattice
   // node ids are proto ids.
+  const int unk_index = UnknownIndex(*output);
   auto run_estep = [&](std::vector<double>* expected) -> double {
     std::vector<std::vector<double>> parts(num_threads);
     std::vector<double> objs(num_threads, 0.0);
@@ -238,21 +372,27 @@ absl::Status RefitFixedVocabulary(const ModelProto& input,
       for (int t = 0; t < num_threads; ++t) {
         pool->Schedule([&, t]() {
           parts[t].assign(n, 0.0);
-          std::vector<float> local(n, 0.0f);
           unigram::Lattice lattice;
           for (size_t i = t; i < corpus.sentences.size(); i += num_threads) {
             const std::string& w = corpus.sentences[i].first;
             const int64_t freq = corpus.sentences[i].second;
             lattice.SetSentence(w);
             model->PopulateNodes(&lattice);
-            std::fill(local.begin(), local.end(), 0.0f);
-            const float Z = lattice.PopulateMarginal(
-                static_cast<float>(freq), &local);
-            // Accumulate in double per record: a float accumulator over a
-            // million records loses the small counts that keep rare pieces
-            // alive, and rare pieces are exactly what must not vanish here.
-            for (size_t k = 0; k < n; ++k) parts[t][k] += local[k];
-            objs[t] -= static_cast<double>(Z) / all_freq;
+            // Known-only: UNK contributes exactly zero posterior, so the
+            // NORMAL simplex really is the objective's free parameter set.
+            // Coverage already guaranteed a known-only path exists, so Z is
+            // finite here. Accumulation is in double throughout: a float
+            // accumulator over a million records loses the small counts that
+            // keep rare pieces alive, and those are exactly what must survive.
+            const double logz = KnownOnlyMarginal(
+                lattice, unk_index, static_cast<double>(freq), &parts[t]);
+            // The objective is the FREQ-WEIGHTED mean negative log-likelihood,
+            // matching the freq-weighted counts the M-step maximizes. Weight
+            // it here rather than inside the helper, which returns log Z for
+            // one record (Lattice::PopulateMarginal returns freq * Z instead,
+            // and mixing the two conventions is what the monotonicity guard
+            // caught during development).
+            objs[t] -= static_cast<double>(freq) * logz / all_freq;
           }
         });
       }
@@ -312,12 +452,41 @@ absl::Status RefitFixedVocabulary(const ModelProto& input,
     objective = run_estep(&expected);
     ++performed;
     stats->per_iteration.push_back({objective, floored});
+    const double improvement = prev - objective;
     LOG(INFO) << "REFIT iteration=" << performed << " objective=" << objective
-              << " delta=" << (objective - prev)
+              << " improvement=" << improvement
               << " floored_normal=" << floored;
-    if (options.objective_tolerance > 0.0 &&
-        prev - objective < options.objective_tolerance) {
-      LOG(INFO) << "REFIT early stop: improvement " << (prev - objective)
+
+    // PRODUCTION GUARD, not just a test assertion. Once the first M-step has
+    // projected the model into the fixed NORMAL simplex, known-only EM cannot
+    // increase the objective; if it does, the M-step is not the maximizer of
+    // the objective the E-step measured and the artifact is not trustworthy.
+    //
+    // The pre-refit objective is exempt: an input model need not be
+    // normalized, and an exp-sum above 1 inflates every path likelihood, so
+    // the FIRST M-step may legitimately raise it once.
+    //
+    // Tolerance is relative to the objective's own scale, because it is a mean
+    // negative log-likelihood whose magnitude is corpus-dependent.
+    const double tolerance =
+        kObjectiveTolerance * std::max(1.0, std::abs(prev));
+    if (performed > 1 && improvement < -tolerance) {
+      return absl::InternalError(absl::StrCat(
+          "fixed-support EM objective worsened at iteration ", performed,
+          ": ", prev, " -> ", objective, " (tolerance ", tolerance,
+          "). The M-step is not maximizing the objective the E-step measured. "
+          "A count_floor much larger than the default can cause this, since "
+          "flooring is an approximation to exact ML for zero-occupancy "
+          "pieces."));
+    }
+
+    // Early stop only on a genuine, small, NON-NEGATIVE improvement. The
+    // previous form (`prev - objective < tolerance`) also fired when the
+    // objective got WORSE, because the improvement is then negative -- it
+    // would have stopped precisely when stopping is least justified.
+    if (options.objective_tolerance > 0.0 && improvement >= 0.0 &&
+        improvement < options.objective_tolerance) {
+      LOG(INFO) << "REFIT early stop: improvement " << improvement
                 << " < tolerance " << options.objective_tolerance;
       break;
     }
