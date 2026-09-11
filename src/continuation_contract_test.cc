@@ -2905,6 +2905,100 @@ TEST(ExpansionProcessorTest, AppliesTheMergeProgramByRank) {
   EXPECT_EQ("abc", back);
 }
 
+
+TEST(ExpansionProcessorTest, HierarchyEligibilityIsOccurrenceLocalAtRuntime) {
+  ExpansionResult r;
+  r.set_schema_version(1);
+  r.set_model_type(EXPANSION_BPE);
+  const std::vector<std::pair<std::string, int>> base = {
+      {"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"/", kNORMAL},
+      {"1", kNORMAL}, {"2", kNORMAL}, {"8", kNORMAL}};
+  int id = 0;
+  for (const auto& [piece, type] : base) {
+    auto* p = r.add_base_pieces();
+    p->set_external_id(id++);
+    p->set_piece(piece);
+    p->set_type(static_cast<ModelProto::SentencePiece::Type>(type));
+  }
+  for (const std::string& piece : {"12", "/12"}) {
+    auto* p = r.add_learned_pieces();
+    p->set_external_id(id++);
+    p->set_piece(piece);
+    p->set_type(ModelProto::SentencePiece::NORMAL);
+  }
+  auto* m0 = r.add_learned_merges();
+  m0->set_rank(0); m0->set_left("1"); m0->set_right("2");
+  auto* m1 = r.add_learned_merges();
+  m1->set_rank(1); m1->set_left("/"); m1->set_right("12");
+  *r.mutable_contract()->mutable_normalizer_spec() = MusicNormalizer();
+  r.set_boundary_policy("bpe_hierarchical_completion_v1:test");
+
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+  EXPECT_TRUE(p.RequiresHierarchy());
+
+  std::vector<expansion::TokenSpan> flat;
+  EXPECT_FALSE(p.Encode("/12", &flat).ok())
+      << "hierarchical artifacts must fail closed without occurrence gates";
+
+  expansion::CompletionGate short_den;
+  short_den.level = 1;
+  short_den.cuts = {3, 4, 6};  // normalized "▁/12": "/" | "12"
+  std::vector<expansion::TokenSpan> short_out;
+  ASSERT_TRUE(p.EncodeWithHierarchy("/12", {short_den}, &short_out).ok());
+  ASSERT_EQ(2u, short_out.size());
+  EXPECT_EQ("\xe2\x96\x81", short_out[0].piece);
+  EXPECT_EQ("/12", short_out[1].piece)
+      << "/+12 is legal when 12 is the complete denominator child";
+
+  expansion::CompletionGate long_den;
+  long_den.level = 1;
+  long_den.cuts = {3, 4, 7};  // normalized "▁/128": "/" | "128"
+  std::vector<expansion::TokenSpan> long_out;
+  ASSERT_TRUE(p.EncodeWithHierarchy("/128", {long_den}, &long_out).ok());
+  std::vector<std::string> got;
+  for (const auto& x : long_out) got.push_back(x.piece);
+  EXPECT_EQ(std::vector<std::string>(
+                {"\xe2\x96\x81", "/", "12", "8"}),
+            got)
+      << "the SAME global /+12 rule must be blocked only in the /128 "
+         "occurrence; /128 must not poison /12 globally";
+}
+
+TEST(ExpansionProcessorTest, InheritedMergesAreNeverVetoedByNewHierarchy) {
+  ExpansionResult r;
+  r.set_schema_version(1);
+  r.set_model_type(EXPANSION_BPE);
+  const std::vector<std::pair<std::string, int>> pieces = {
+      {"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"a", kNORMAL},
+      {"b", kNORMAL}, {"c", kNORMAL}, {"ab", kNORMAL}};
+  int id = 0;
+  for (const auto& [piece, type] : pieces) {
+    auto* p = r.add_base_pieces();
+    p->set_external_id(id++);
+    p->set_piece(piece);
+    p->set_type(static_cast<ModelProto::SentencePiece::Type>(type));
+  }
+  auto* merge = r.add_base_merges();
+  merge->set_rank(0); merge->set_left("a"); merge->set_right("b");
+  *r.mutable_contract()->mutable_normalizer_spec() = MusicNormalizer();
+  r.set_boundary_policy("bpe_hierarchical_completion_v1:test");
+
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+  // New grammar says a | bc. The inherited a+b merge crosses that child
+  // boundary before bc is complete, but continuation is forbidden to change
+  // inherited/base tokenization.
+  expansion::CompletionGate gate;
+  gate.level = 1;
+  gate.cuts = {3, 4, 6};
+  std::vector<expansion::TokenSpan> out;
+  ASSERT_TRUE(p.EncodeWithHierarchy("abc", {gate}, &out).ok());
+  std::vector<std::string> got;
+  for (const auto& x : out) got.push_back(x.piece);
+  EXPECT_EQ(std::vector<std::string>({"\xe2\x96\x81", "ab", "c"}), got);
+}
+
 TEST(ExpansionProcessorTest, LeftmostOccurrenceOfTheBestRankWins) {
   const ExpansionResult r = MakeProgram(
       {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"a", kNORMAL},
