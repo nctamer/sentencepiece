@@ -121,6 +121,10 @@ class ContinuationTrainer : public TrainerInterface {
   void ResetFreq(int sid, int left, int right, const Symbol* best);
   absl::Status AcceptSymbol(Symbol* symbol);
   void DrainPendingQueue();
+  // After inherited/base replay, discard the ungated candidate index and
+  // rebuild it from the CURRENT segmentation with occurrence-local hierarchy
+  // eligibility. Inherited merges themselves are never hierarchy-gated.
+  void RebuildHierarchyCandidateIndex();
 
   // Completion-gated hierarchy. Empty bpe_hierarchy_file means ordinary
   // continuation semantics. The sidecar is keyed by the already-normalized
@@ -213,6 +217,10 @@ class ContinuationTrainer : public TrainerInterface {
   std::vector<std::vector<size_t>> span_begin_;
   std::vector<std::vector<size_t>> span_end_;
   std::string hierarchy_sha256_;
+  // False while replaying the inherited/base program; true only while learning
+  // appended continuation merges. This is the Qwen/continuation ABI invariant:
+  // a grammar invented for the continuation may never veto an inherited merge.
+  bool hierarchy_gating_enabled_ = false;
 
   std::vector<std::string> atomic_pieces_ordered_;
   absl::flat_hash_map<std::string, Symbol*> live_by_string_;
