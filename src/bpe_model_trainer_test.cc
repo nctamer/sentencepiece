@@ -777,6 +777,71 @@ TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
   EXPECT_EQ(1, result.learned_merges(1).grammar_level());
 }
 
+TEST(BPETrainerTest, HierarchyNeverVetoesInheritedMergeReplay) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "hier_inherited_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "hier_inherited.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "hier_inherited.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "hier_inherited_model");
+  const std::string result_path = prefix + ".expansion";
+  { auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("abc\t5")); }
+  { auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    ASSERT_TRUE(out->WriteLine("abc\t1:0,1,3")); }  // a | bc
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(5);
+  expansion.set_requested_new_pieces(1);
+  auto add = [&](int id, absl::string_view piece, bool atomic) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id); p->set_piece(std::string(piece));
+    p->set_type(id == 0 ? ModelProto::SentencePiece::UNKNOWN
+                        : ModelProto::SentencePiece::NORMAL);
+    p->set_mergeable(id != 0); p->set_atomic(atomic);
+  };
+  add(0, "<unk>", false); add(1, "a", true); add(2, "b", true);
+  add(3, "c", true); add(4, "ab", false);
+  auto* inherited = expansion.add_base_merges();
+  inherited->set_rank(0); inherited->set_left("a"); inherited->set_right("b");
+  inherited->set_external_id(4);
+  { auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString())); }
+
+  TrainerSpec ts;
+  ts.set_model_type(TrainerSpec::BPE); ts.add_input(input);
+  ts.set_input_format("tsv"); ts.set_model_prefix(prefix); ts.set_vocab_size(6);
+  ts.set_expansion_spec(spec_path); ts.set_expansion_result(result_path);
+  ts.set_bpe_hierarchy_file(hierarchy); ts.set_input_sentence_size(0);
+  ts.set_split_by_whitespace(false); ts.set_split_by_unicode_script(false);
+  ts.set_split_by_number(false); ts.set_split_digits(false);
+  ts.set_bos_id(-1); ts.set_eos_id(-1); ts.set_pad_id(-1);
+  ts.set_hard_vocab_limit(true);
+  NormalizerSpec ns; ns.set_name("identity"); ns.set_add_dummy_prefix(false);
+  ns.set_remove_extra_whitespaces(false);
+  NormalizerSpec dns;
+  ASSERT_TRUE(SentencePieceTrainer::Train(ts, ns, dns).ok());
+
+  std::string bytes;
+  { auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes)); }
+  ExpansionResult result; ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(1, result.base_merges_size());
+  ASSERT_EQ(1, result.learned_merges_size());
+  EXPECT_EQ("a", result.base_merges(0).left());
+  EXPECT_EQ("b", result.base_merges(0).right());
+  EXPECT_EQ("ab", result.learned_merges(0).left());
+  EXPECT_EQ("c", result.learned_merges(0).right())
+      << "base a+b must replay even though the later InterMo gate says a|bc";
+}
+
+
 
 
 }  // namespace
