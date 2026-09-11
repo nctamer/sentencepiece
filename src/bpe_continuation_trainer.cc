@@ -1449,10 +1449,17 @@ absl::Status ContinuationTrainer::ReconcileContinuationContract() {
     if (caller_is_default) {
       normalizer_spec_ = want;
     } else {
-      NormalizerSpec a = want, b = have;
-      a.clear_precompiled_charsmap();
-      b.clear_precompiled_charsmap();
-      if (a.SerializeAsString() != b.SerializeAsString()) {
+      // Compare the pipeline by VALUE. A spec authored from scratch (no
+      // native model to copy from) leaves normalization_rule_tsv unset while
+      // the CLI path sets it to ""; proto2 serializes that presence bit, so a
+      // byte comparison rejected an identical pipeline.
+      const bool same_pipeline =
+          want.name() == have.name() &&
+          want.add_dummy_prefix() == have.add_dummy_prefix() &&
+          want.remove_extra_whitespaces() == have.remove_extra_whitespaces() &&
+          want.escape_whitespaces() == have.escape_whitespaces() &&
+          want.normalization_rule_tsv() == have.normalization_rule_tsv();
+      if (!same_pipeline) {
         return absl::FailedPreconditionError(absl::StrCat(
             "BPE continuation normalizer conflicts with the inherited "
             "tokenizer: base name=", want.name(),

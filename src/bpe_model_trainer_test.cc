@@ -369,6 +369,86 @@ TEST(BPETrainerTest, CompletionHierarchyUnlocksOnlyWholeChildren) {
                 std::string("bpe_hierarchical_completion_v1:").size()));
 }
 
+TEST(BPETrainerTest, ContractNormalizerComparesByValueNotPresence) {
+  // A spec authored from scratch carries no normalization_rule_tsv field;
+  // the CLI always sets it (to ""). Same pipeline, different presence bits:
+  // this must reconcile, not fail.
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "norm_presence_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "norm_presence.spec");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "norm_presence_model");
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("abab\t5"));
+  }
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(3);
+  expansion.set_requested_new_pieces(1);
+  auto add = [&](int id, absl::string_view piece,
+                 ModelProto::SentencePiece::Type type, bool mergeable,
+                 bool atomic) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(type);
+    p->set_mergeable(mergeable);
+    p->set_atomic(atomic);
+  };
+  add(0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false, false);
+  add(1, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  add(2, "b", ModelProto::SentencePiece::NORMAL, true, true);
+  auto* ns = expansion.mutable_contract()->mutable_normalizer_spec();
+  ns->set_name("identity");
+  ns->set_add_dummy_prefix(false);
+  ns->set_remove_extra_whitespaces(false);
+  ns->set_escape_whitespaces(true);
+  ASSERT_FALSE(ns->has_normalization_rule_tsv());
+  {
+    auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString()));
+  }
+
+  TrainerSpec trainer_spec;
+  trainer_spec.set_model_type(TrainerSpec::BPE);
+  trainer_spec.add_input(input);
+  trainer_spec.set_input_format("tsv");
+  trainer_spec.set_model_prefix(prefix);
+  trainer_spec.set_vocab_size(4);
+  trainer_spec.set_expansion_spec(spec_path);
+  trainer_spec.set_expansion_result(prefix + ".expansion");
+  trainer_spec.set_input_sentence_size(0);
+  trainer_spec.set_split_by_whitespace(false);
+  trainer_spec.set_split_by_unicode_script(false);
+  trainer_spec.set_split_by_number(false);
+  trainer_spec.set_split_digits(false);
+  trainer_spec.set_bos_id(-1);
+  trainer_spec.set_eos_id(-1);
+  trainer_spec.set_pad_id(-1);
+
+  NormalizerSpec normalizer_spec;
+  normalizer_spec.set_name("identity");
+  normalizer_spec.set_add_dummy_prefix(false);
+  normalizer_spec.set_remove_extra_whitespaces(false);
+  normalizer_spec.set_escape_whitespaces(true);
+  normalizer_spec.set_normalization_rule_tsv("");
+  ASSERT_TRUE(normalizer_spec.has_normalization_rule_tsv());
+  NormalizerSpec denormalizer_spec;
+  EXPECT_TRUE(SentencePieceTrainer::Train(
+                  trainer_spec, normalizer_spec, denormalizer_spec)
+                  .ok());
+
+  // A real value conflict is still refused.
+  normalizer_spec.set_add_dummy_prefix(true);
+  EXPECT_FALSE(SentencePieceTrainer::Train(
+                   trainer_spec, normalizer_spec, denormalizer_spec)
+                   .ok());
+}
+
 TEST(BPETrainerTest, CompletionHierarchyRejectsContextDependentGlobalPair) {
   const std::string input =
       filesystem::JoinPath(::testing::TempDir(), "hier_global_input.tsv");
