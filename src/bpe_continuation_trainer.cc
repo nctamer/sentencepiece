@@ -223,7 +223,7 @@ void ContinuationTrainer::DrainPendingQueue() {
   pending_queue_.clear();
 }
 
-void ContinuationTrainer::RebuildHierarchyCandidateIndex() {
+absl::Status ContinuationTrainer::RebuildHierarchyCandidateIndex() {
   // An inherited tokenizer is authoritative. If one of its already-produced
   // tokens partially straddles a NEW grammar parent's child boundary, that
   // parent cannot be enforced without changing inherited segmentation. Disable
@@ -254,6 +254,13 @@ void ContinuationTrainer::RebuildHierarchyCandidateIndex() {
     }
   }
   if (disabled != 0) {
+    if (base_merges_.empty() && bootstrap_merges_.empty()) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "fresh hierarchical BPE found ", disabled,
+          " grammar gates already crossed by its initial segmentation; "
+          "fresh training has no inherited tokenizer to preserve, so disabling "
+          "a gate would hide a hierarchy/atomization bug"));
+    }
     LOG(INFO) << "Hierarchy disabled " << disabled
               << " gates incompatible with inherited/base segmentation";
   }
@@ -284,6 +291,7 @@ void ContinuationTrainer::RebuildHierarchyCandidateIndex() {
     }
   }
   DrainPendingQueue();
+  return absl::OkStatus();
 }
 
 absl::Status ContinuationTrainer::SegmentAtoms(
@@ -458,9 +466,9 @@ int ContinuationTrainer::GrammarLevelForPair(int sid, int left,
   }
   const size_t boundary = span_end_[sid][left];
   const auto it = hierarchy_[sid].gate_at_boundary.find(boundary);
-  return it == hierarchy_[sid].gate_at_boundary.end()
-             ? 0
-             : hierarchy_[sid].gates[it->second].level;
+  if (it == hierarchy_[sid].gate_at_boundary.end()) return 0;
+  const HierarchyGate& gate = hierarchy_[sid].gates[it->second];
+  return gate.enabled ? gate.level : 0;
 }
 
 int ContinuationTrainer::MaxGrammarLevel(const Symbol* symbol) const {
@@ -1909,7 +1917,7 @@ absl::Status ContinuationTrainer::Train() {
   // sees the continuation hierarchy. This is required for Qwen/base expansion
   // compatibility as well as for semantic parity with hierarchy-aware runtime.
   if (!hierarchy_.empty()) {
-    RebuildHierarchyCandidateIndex();
+    ABSL_RETURN_IF_ERROR(RebuildHierarchyCandidateIndex());
   }
   ABSL_RETURN_IF_ERROR(LearnExpansion());
   ABSL_RETURN_IF_ERROR(FinalizeArtifacts());
