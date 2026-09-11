@@ -131,26 +131,16 @@ ContinuationTrainer::Symbol* ContinuationTrainer::GetPairSymbol(
 void ContinuationTrainer::ComputeFreq(Symbol* symbol) const {
   if (!symbol->needs_recomputation) return;
   symbol->freq = 0;
-  symbol->hierarchy_blocked = false;
   for (auto it = symbol->positions.begin(); it != symbol->positions.end();) {
     const Position pos = DecodePos(*it);
     if (symbol->left != symbols_[pos.sid][pos.left] ||
         symbol->right != symbols_[pos.sid][pos.right]) {
       it = symbol->positions.erase(it);
     } else {
-      if (!CanMerge(pos.sid, pos.left, pos.right)) {
-        symbol->hierarchy_blocked = true;
-      } else {
-        symbol->freq += static_cast<uint64_t>(sentences_[pos.sid].second);
-      }
+      symbol->freq += static_cast<uint64_t>(sentences_[pos.sid].second);
       ++it;
     }
   }
-  // A context-free BPE rank may only be learned when EVERY occurrence that
-  // exists after all earlier ranks is legal.  A blocked occurrence can vanish
-  // later when an earlier-rank child-completion merge consumes one operand, so
-  // this state is intentionally recomputed rather than made permanent.
-  if (symbol->hierarchy_blocked) symbol->freq = 0;
   symbol->needs_recomputation = false;
 }
 
@@ -173,14 +163,16 @@ void ContinuationTrainer::AddNewPair(int sid, int left, int right) {
   if (left == -1 || right == -1) return;
   if (fence_group_[sid][left] != fence_group_[sid][right]) return;
   Symbol* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
-  if (symbol == nullptr || !symbol->active) return;
+  if (symbol == nullptr) return;
 
-  // Keep both legal and currently-blocked occurrences.  A pair is eligible
-  // only when ComputeFreq sees that ALL of its current occurrences are legal.
-  // This is rank-local safety: an incomplete occurrence may disappear after a
-  // lower-rank merge completes the child that contains it.
+  // Hierarchy eligibility is occurrence-local. The same surface pair may be
+  // eligible in one record and blocked in another (for example /+12 in /12
+  // versus the prefix /+12 inside /128). Only the eligible occurrence enters
+  // this candidate's count/index; an ineligible occurrence must not poison the
+  // pair globally.
+  if (!CanMerge(sid, left, right) || !symbol->active) return;
+
   symbol->positions.insert(EncodePos(sid, left, right));
-  symbol->needs_recomputation = true;
   if (!symbol->pending) {
     symbol->pending = true;
     pending_queue_.push_back(symbol);
@@ -191,16 +183,7 @@ void ContinuationTrainer::ResetFreq(int sid, int left, int right,
                                     const Symbol* best) {
   if (left == -1 || right == -1) return;
   Symbol* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
-  if (symbol == nullptr || symbol == best || !symbol->active) return;
-  symbol->needs_recomputation = true;
-  // A formerly blocked global pair may become safe precisely because this
-  // adjacency is about to disappear. Requeue that zero-frequency candidate
-  // even if no new occurrence of the pair is created by the accepted merge.
-  // Ordinary legal candidates already retain a priority-queue entry.
-  if (symbol->hierarchy_blocked && !symbol->pending) {
-    symbol->pending = true;
-    pending_queue_.push_back(symbol);
-  }
+  if (symbol != nullptr && symbol != best) symbol->needs_recomputation = true;
 }
 
 absl::Status ContinuationTrainer::AcceptSymbol(Symbol* symbol) {
@@ -1155,14 +1138,10 @@ absl::Status ContinuationTrainer::ReplayMerges(
           "constraints at effective rank ", merge.rank(), ": ", merge.left(),
           " + ", merge.right()));
     }
+    // positions contains only hierarchy-eligible occurrences at this rank.
+    // Replaying a global pair therefore mutates only those occurrences.
     symbol->needs_recomputation = true;
     ComputeFreq(symbol);
-    if (symbol->hierarchy_blocked) {
-      return absl::FailedPreconditionError(absl::StrCat(
-          label, " merge is context-dependent under the completion hierarchy "
-          "at effective rank ", merge.rank(), ": ", merge.left(), " + ",
-          merge.right()));
-    }
     if (symbol->freq == 0) {
       ++absent;
       continue;
@@ -1196,8 +1175,6 @@ absl::Status ContinuationTrainer::LearnExpansion() {
     }
 
     if (best == nullptr) break;
-    RET_CHECK(!best->hierarchy_blocked)
-        << "blocked hierarchy pair reached the positive-frequency queue";
     if (!best->IsBigram()) {
       return absl::InternalError("BPE continuation selected a non-bigram");
     }
@@ -1454,10 +1431,17 @@ absl::Status ContinuationTrainer::ReconcileContinuationContract() {
     if (caller_is_default) {
       normalizer_spec_ = want;
     } else {
-      NormalizerSpec a = want, b = have;
-      a.clear_precompiled_charsmap();
-      b.clear_precompiled_charsmap();
-      if (a.SerializeAsString() != b.SerializeAsString()) {
+      // Compare the pipeline by VALUE. A spec authored from scratch (no
+      // native model to copy from) leaves normalization_rule_tsv unset while
+      // the CLI path sets it to ""; proto2 serializes that presence bit, so a
+      // byte comparison rejected an identical pipeline.
+      const bool same_pipeline =
+          want.name() == have.name() &&
+          want.add_dummy_prefix() == have.add_dummy_prefix() &&
+          want.remove_extra_whitespaces() == have.remove_extra_whitespaces() &&
+          want.escape_whitespaces() == have.escape_whitespaces() &&
+          want.normalization_rule_tsv() == have.normalization_rule_tsv();
+      if (!same_pipeline) {
         return absl::FailedPreconditionError(absl::StrCat(
             "BPE continuation normalizer conflicts with the inherited "
             "tokenizer: base name=", want.name(),
