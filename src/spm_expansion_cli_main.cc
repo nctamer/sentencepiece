@@ -17,7 +17,9 @@
 #include "init.h"
 
 ABSL_FLAG(std::string, expansion, "", "serialized ExpansionResult");
-ABSL_FLAG(std::string, mode, "ids", "ids | pieces | spans | idmap_sha");
+ABSL_FLAG(std::string, mode, "ids",
+          "ids | pieces | spans | idmap_sha | idmap (the <id>\\t<piece>\\t<type> "
+          "preimage of idmap_sha)");
 
 int main(int argc, char* argv[]) {
   sentencepiece::ParseCommandLineFlags(argv[0], &argc, &argv, true);
@@ -26,6 +28,12 @@ int main(int argc, char* argv[]) {
   if (!st.ok()) { std::cerr << st.message() << "\n"; return 1; }
   const std::string mode = absl::GetFlag(FLAGS_mode);
   if (mode == "idmap_sha") { std::cout << p.IdMapSha256() << "\n"; return 0; }
+  if (mode == "idmap") {
+    for (int i = 0; i < p.GetPieceSize(); ++i) {
+      std::cout << i << "\t" << p.IdToPiece(i) << "\t" << p.IdToType(i) << "\n";
+    }
+    return 0;
+  }
   std::string line;
   while (std::getline(std::cin, line)) {
     std::vector<sentencepiece::expansion::TokenSpan> spans;

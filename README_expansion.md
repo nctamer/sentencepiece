@@ -124,13 +124,38 @@ budget; it is retired rather than re-derived through some other ancestry.
 1. Validate the spec: IDs, types, atom alphabet, and that the inherited merge
    program is well-formed **on its own** (rank-prepended bootstrap state may not
    retroactively make a malformed inherited tokenizer constructible).
-2. Segment the corpus into declared atoms — exactly one parse per record.
+2. Segment the corpus: every `USER_DEFINED` occurrence first (longest prefix
+   match, leftmost), each one a frozen unit; every run of text between them
+   into declared atoms — exactly one parse per run.
 3. Replay the effective inherited prefix in serialized order (bootstrap first
    when `allow_rank_prepend`, otherwise after the inherited ranks).
 4. Learn new merges, appending ranks, recording exact `(left, right)`
    provenance **at acceptance time**, before the corpus is mutated.
 5. Verify every learned piece is reachable under the final serialized table.
    Zero unreachable pieces is a precondition for success, not a statistic.
+
+### `USER_DEFINED` pieces are frozen units, in training and at inference
+
+Native SentencePiece gives a `USER_DEFINED` piece one role: at inference it is
+recognized by longest prefix match **before** any merge runs and is frozen on
+both sides (`bpe_model.cc`); native training reaches the same statistics by
+replacing every occurrence with a pretokenization boundary
+(`trainer_interface.cc`). Continuation and the explicit runtime implement that
+role, not an approximation of it:
+
+* a `USER_DEFINED` base piece must be declared `mergeable=false, atomic=false`
+  — anything else is refused, not corrected;
+* in the corpus, each occurrence becomes one frozen symbol that forms no pair
+  on either side, so no merge is ever learned inside it or across it, and it
+  is absent from the replay table (a merge naming it is rejected);
+* its external ID and type are inherited verbatim through every stage;
+* `ExpansionProcessor::Encode` runs the same longest-prefix match first and
+  skips every pair with a frozen side; `Load` rejects a program in which any
+  merge names a `USER_DEFINED` string as a child.
+
+`USER_DEFINED` is **not** `--protected_pieces_file`. The latter is a Unigram
+pruning shield: the listed pieces stay `NORMAL`, keep learned scores, and
+merge/segment like any other piece. The two mechanisms are unrelated.
 
 ### Shape options are about NEW pieces
 

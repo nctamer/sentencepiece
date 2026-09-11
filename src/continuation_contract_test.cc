@@ -3125,5 +3125,187 @@ TEST(BPEContinuationContractTest, ExplicitProcessorAgreesWithNativeWhenEquivalen
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// USER_DEFINED pieces.
+//
+// Native SentencePiece gives a USER_DEFINED piece one role at inference: it is
+// recognized by longest prefix match BEFORE any merge runs and is frozen on
+// both sides (bpe_model.cc). Native training reaches the same statistics by
+// replacing every occurrence with a pretokenization boundary
+// (trainer_interface.cc). The explicit runtime and the continuation trainer
+// implement that role, not an approximation of it.
+// ---------------------------------------------------------------------------
+
+const int kUSER = ModelProto::SentencePiece::USER_DEFINED;
+
+// <unk>, U+2581, the atoms of "<|v|>", "a", "b", the USER_DEFINED "<|v|>",
+// and a merge program that WOULD build "<|v" and "a<" from those atoms.
+ExpansionResult UserDefinedProgram() {
+  return MakeProgram(
+      {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"<", kNORMAL},
+       {"|", kNORMAL}, {"v", kNORMAL}, {">", kNORMAL}, {"a", kNORMAL},
+       {"b", kNORMAL}, {"<|", kNORMAL}, {"<|v", kNORMAL}, {"a<", kNORMAL},
+       {"<|v|>", kUSER}},
+      {{"<", "|"}, {"<|", "v"}, {"a", "<"}});
+}
+
+TEST(ExpansionProcessorTest, UserDefinedIsRecognizedBeforeAnyMerge) {
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(UserDefinedProgram()).ok());
+  const int ud = p.PieceToId("<|v|>");
+  ASSERT_TRUE(p.IsUserDefined(ud));
+  EXPECT_EQ(kUSER, p.IdToType(ud));
+
+  // Inside: the program's "<|" and "<|v" merges must not fire within it.
+  // Across: "a<" is a declared merge and must not consume the "<" of the
+  // USER_DEFINED occurrence.
+  std::vector<expansion::TokenSpan> spans;
+  ASSERT_TRUE(p.Encode("a<|v|>b", &spans).ok());
+  std::vector<std::string> got;
+  for (const auto& sp : spans) got.push_back(sp.piece);
+  EXPECT_EQ(std::vector<std::string>({"\xe2\x96\x81", "a", "<|v|>", "b"}), got);
+  EXPECT_EQ(ud, spans[2].id);
+  // Exact byte spans over the NORMALIZED text: U+2581 is 3 bytes.
+  EXPECT_EQ(3, spans[1].begin); EXPECT_EQ(4, spans[1].end);
+  EXPECT_EQ(4, spans[2].begin); EXPECT_EQ(9, spans[2].end);
+  EXPECT_EQ(9, spans[3].begin); EXPECT_EQ(10, spans[3].end);
+
+  // The same characters OUTSIDE a complete USER_DEFINED string still merge:
+  // the freeze is the occurrence, not the alphabet.
+  ASSERT_TRUE(p.Encode("<|v", &spans).ok());
+  got.clear();
+  for (const auto& sp : spans) got.push_back(sp.piece);
+  EXPECT_EQ(std::vector<std::string>({"\xe2\x96\x81", "<|v"}), got);
+
+  // Adjacent occurrences are two frozen units, never one merged one.
+  std::vector<int> ids;
+  ASSERT_TRUE(p.EncodeIds("<|v|><|v|>", &ids).ok());
+  EXPECT_EQ(std::vector<int>({p.PieceToId("\xe2\x96\x81"), ud, ud}), ids);
+
+  std::string back;
+  ASSERT_TRUE(p.Decode({p.PieceToId("\xe2\x96\x81"), p.PieceToId("a"), ud,
+                        p.PieceToId("b")}, &back).ok());
+  EXPECT_EQ("a<|v|>b", back);
+}
+
+TEST(ExpansionProcessorTest, RejectsAMergeNamingAUserDefinedChild) {
+  ExpansionResult r = UserDefinedProgram();
+  auto* m = r.add_base_merges();
+  m->set_rank(3); m->set_left("a"); m->set_right("<|v|>");
+  expansion::ExpansionProcessor p;
+  const absl::Status st = p.Load(r);
+  EXPECT_FALSE(st.ok());
+  EXPECT_NE(std::string::npos,
+            std::string(st.message()).find("USER_DEFINED"));
+}
+
+ExpansionSpec UserDefinedSpec(bool declare_mergeable) {
+  ExpansionSpec e;
+  e.set_schema_version(1);
+  e.set_model_type(EXPANSION_BPE);
+  e.set_preserve_base_ids(true);
+  e.set_requested_new_pieces(2);
+  AddPiece(&e, 0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false, false);
+  AddPiece(&e, 1, "<|v|>", ModelProto::SentencePiece::USER_DEFINED,
+           declare_mergeable, false);
+  int id = 2;
+  for (const char* c : {"a", "b", "c", "<", "|", "v", ">"}) {
+    AddPiece(&e, id++, c, ModelProto::SentencePiece::NORMAL, true, true);
+  }
+  *e.mutable_contract()->mutable_normalizer_spec() = IdentityNormalizer();
+  return e;
+}
+
+TEST(BPEContinuationContractTest, RejectsAMergeableUserDefinedPiece) {
+  const std::string input = TempPath("ud_mergeable_input.txt");
+  const std::string spec_path = TempPath("ud_mergeable.pb");
+  ASSERT_TRUE(WriteLines(input, {"a<|v|>b"}));
+  ASSERT_TRUE(WriteProto(spec_path, UserDefinedSpec(/*declare_mergeable=*/true)));
+  const absl::Status st = RunTrainer(
+      BpeContinuationSpec(input, spec_path, TempPath("ud_mergeable.result"),
+                          TempPath("ud_mergeable_model"), 11),
+      IdentityNormalizer());
+  EXPECT_FALSE(st.ok());
+  EXPECT_NE(std::string::npos,
+            std::string(st.message()).find("USER_DEFINED"));
+}
+
+TEST(BPEContinuationContractTest, UserDefinedIsInheritedFrozenAndNeverMerged) {
+  const std::string input = TempPath("ud_frozen_input.txt");
+  const std::string spec_path = TempPath("ud_frozen.pb");
+  const std::string result_path = TempPath("ud_frozen.result");
+  const std::string prefix = TempPath("ud_frozen_model");
+  RemoveIfPresent(prefix + ".model");
+  // The ONLY "<", "|", "v", ">" in the corpus sit inside the USER_DEFINED
+  // occurrence, and "a<|v|>b" is by far the most frequent adjacency. Without
+  // the freeze, the first learned merge would be a+"<" or "<"+"|".
+  std::vector<std::string> lines;
+  for (int i = 0; i < 20; ++i) lines.push_back("a<|v|>b");
+  for (int i = 0; i < 3; ++i) lines.push_back("abc");
+  ASSERT_TRUE(WriteLines(input, lines));
+  ASSERT_TRUE(WriteProto(spec_path, UserDefinedSpec(false)));
+  ASSERT_TRUE(RunTrainer(BpeContinuationSpec(input, spec_path, result_path,
+                                             prefix, 11),
+                         IdentityNormalizer())
+                  .ok());
+
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  // Exact ID and type inheritance.
+  ASSERT_EQ(9, result.base_pieces_size());
+  EXPECT_EQ(1, result.base_pieces(1).external_id());
+  EXPECT_EQ("<|v|>", result.base_pieces(1).piece());
+  EXPECT_EQ(ModelProto::SentencePiece::USER_DEFINED, result.base_pieces(1).type());
+  EXPECT_FALSE(result.base_pieces(1).mergeable());
+  EXPECT_FALSE(result.base_pieces(1).atomic());
+
+  // No learned piece contains a character that occurs only inside the
+  // USER_DEFINED occurrence, and no learned merge names it.
+  ASSERT_EQ(2, result.learned_pieces_size());
+  for (const auto& piece : result.learned_pieces()) {
+    EXPECT_EQ(std::string::npos, piece.piece().find_first_of("<|v>"))
+        << "a merge entered or crossed a USER_DEFINED occurrence: "
+        << piece.piece();
+  }
+  for (const auto& merge : result.learned_merges()) {
+    EXPECT_NE("<|v|>", merge.left());
+    EXPECT_NE("<|v|>", merge.right());
+  }
+  // The learnable statistics are exactly those of "abc": every learned
+  // piece is drawn from {a, b, c}.
+  for (const auto& piece : result.learned_pieces()) {
+    EXPECT_EQ(std::string::npos, piece.piece().find_first_not_of("abc"))
+        << piece.piece();
+  }
+
+  // Explicit runtime on the artifact: the freeze survives serialization.
+  // (IdentityNormalizer() adds no dummy prefix, so there is no U+2581.)
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(result).ok());
+  std::vector<int> ids;
+  ASSERT_TRUE(p.EncodeIds("a<|v|>b", &ids).ok());
+  EXPECT_EQ(std::vector<int>({p.PieceToId("a"), 1, p.PieceToId("b")}), ids);
+
+  // Native parity, where a native model was emitted: SentencePiece's own
+  // matcher must agree with the explicit runtime on every probe, including
+  // the USER_DEFINED occurrences.
+  ModelProto m;
+  if (!ReadProto(prefix + ".model", &m)) {
+    GTEST_SKIP() << "native model withheld; explicit runtime already checked";
+  }
+  EXPECT_EQ(ModelProto::SentencePiece::USER_DEFINED, m.pieces(1).type());
+  SentencePieceProcessor sp;
+  ASSERT_TRUE(sp.Load(prefix + ".model").ok());
+  for (const std::string& probe :
+       {std::string("a<|v|>b"), std::string("<|v|><|v|>"), std::string("ab<|v|>"),
+        std::string("abc"), std::string("<|v")}) {
+    std::vector<int> native, explicit_ids;
+    ASSERT_TRUE(sp.Encode(probe, &native).ok());
+    ASSERT_TRUE(p.EncodeIds(probe, &explicit_ids).ok());
+    EXPECT_EQ(native, explicit_ids) << "disagreement on " << probe;
+  }
+}
+
 }  // namespace
 }  // namespace sentencepiece

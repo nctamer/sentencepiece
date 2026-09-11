@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <set>
 
 #include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
@@ -25,6 +26,7 @@ std::string Key(absl::string_view l, absl::string_view r) {
 absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
   id_to_piece_.clear(); id_to_type_.clear();
   piece_to_id_.clear(); merge_rank_.clear();
+  user_defined_matcher_.reset();
 
   std::vector<ExpansionPiece> pieces;
   for (const auto& p : result.base_pieces()) pieces.push_back(p);
@@ -63,6 +65,27 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
     return status_;
   }
 
+  // USER_DEFINED pieces are matched before any merge runs, the same role they
+  // have in native inference. They are declared as pieces, never as merge
+  // children, and the trainer refuses a program that says otherwise; here we
+  // only build the matcher.
+  {
+    std::set<absl::string_view> user_defined;
+    for (size_t i = 0; i < pieces.size(); ++i) {
+      if (pieces[i].type() != ModelProto::SentencePiece::USER_DEFINED) continue;
+      if (id_to_piece_[i].empty()) {
+        status_ = absl::FailedPreconditionError(
+            absl::StrCat("USER_DEFINED piece ", i, " is empty"));
+        return status_;
+      }
+      user_defined.insert(id_to_piece_[i]);
+    }
+    if (!user_defined.empty()) {
+      user_defined_matcher_ =
+          std::make_unique<normalizer::PrefixMatcher>(user_defined);
+    }
+  }
+
   std::vector<ExpansionMerge> merges;
   for (const auto& m : result.base_merges()) merges.push_back(m);
   for (const auto& m : result.bootstrap_merges()) merges.push_back(m);
@@ -74,6 +97,18 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
   for (size_t i = 0; i < merges.size(); ++i) {
     // Effective rank is position in the sorted program, so a table whose
     // declared ranks are sparse still applies in the intended order.
+    for (const std::string& side : {merges[i].left(), merges[i].right()}) {
+      const auto it = piece_to_id_.find(side);
+      if (it != piece_to_id_.end() &&
+          id_to_type_[it->second] ==
+              static_cast<int>(ModelProto::SentencePiece::USER_DEFINED)) {
+        status_ = absl::FailedPreconditionError(absl::StrCat(
+            "merge at rank ", merges[i].rank(), " names the USER_DEFINED piece \"",
+            side, "\" as a child; USER_DEFINED pieces are frozen units and "
+            "never merge participants"));
+        return status_;
+      }
+    }
     merge_rank_.emplace(Key(merges[i].left(), merges[i].right()),
                         static_cast<int>(i));
   }
@@ -127,21 +162,41 @@ int ExpansionProcessor::PieceToId(absl::string_view piece) const {
   return it == piece_to_id_.end() ? unk_id_ : it->second;
 }
 
+int ExpansionProcessor::IdToType(int id) const {
+  if (id < 0 || id >= static_cast<int>(id_to_type_.size())) return -1;
+  return id_to_type_[id];
+}
+
+bool ExpansionProcessor::IsUserDefined(int id) const {
+  return IdToType(id) ==
+         static_cast<int>(ModelProto::SentencePiece::USER_DEFINED);
+}
+
 absl::Status ExpansionProcessor::Encode(absl::string_view text,
                                         std::vector<TokenSpan>* out) const {
   ABSL_RETURN_IF_ERROR(status_);
   out->clear();
   const std::string norm = Normalize(text);
 
-  // Atoms: one entry per UTF-8 character, carrying its byte span so the spans
-  // survive every merge. Spans are byte offsets into the NORMALIZED text.
-  struct Sym { std::string s; int begin; int end; };
+  // Atoms: a USER_DEFINED occurrence (longest prefix match, as native
+  // inference does) is one FROZEN unit; everything else is one entry per
+  // UTF-8 character. Each carries its byte span so the spans survive every
+  // merge. Spans are byte offsets into the NORMALIZED text.
+  struct Sym { std::string s; int begin; int end; bool frozen; };
   std::vector<Sym> syms;
   for (size_t i = 0; i < norm.size();) {
-    const size_t len = std::min<size_t>(
-        string_util::OneCharLen(norm.data() + i), norm.size() - i);
+    const absl::string_view rest(norm.data() + i, norm.size() - i);
+    bool found = false;
+    size_t len = 0;
+    if (user_defined_matcher_ != nullptr) {
+      len = static_cast<size_t>(user_defined_matcher_->PrefixMatch(rest, &found));
+    }
+    if (!found) {
+      len = std::min<size_t>(string_util::OneCharLen(norm.data() + i),
+                             norm.size() - i);
+    }
     syms.push_back({norm.substr(i, len), static_cast<int>(i),
-                    static_cast<int>(i + len)});
+                    static_cast<int>(i + len), found});
     i += len;
   }
   if (syms.empty()) return absl::OkStatus();
@@ -150,6 +205,7 @@ absl::Status ExpansionProcessor::Encode(absl::string_view text,
     int best = std::numeric_limits<int>::max();
     size_t at = syms.size();
     for (size_t i = 0; i + 1 < syms.size(); ++i) {
+      if (syms[i].frozen || syms[i + 1].frozen) continue;
       const auto it = merge_rank_.find(Key(syms[i].s, syms[i + 1].s));
       if (it != merge_rank_.end() && it->second < best) {
         best = it->second;
@@ -157,7 +213,8 @@ absl::Status ExpansionProcessor::Encode(absl::string_view text,
       }
     }
     if (at == syms.size()) break;
-    syms[at] = {syms[at].s + syms[at + 1].s, syms[at].begin, syms[at + 1].end};
+    syms[at] = {syms[at].s + syms[at + 1].s, syms[at].begin, syms[at + 1].end,
+                false};
     syms.erase(syms.begin() + at + 1);
   }
 

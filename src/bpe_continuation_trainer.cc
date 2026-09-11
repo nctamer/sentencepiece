@@ -69,9 +69,30 @@ ContinuationTrainer::Symbol* ContinuationTrainer::GetAtomicSymbol(
   return out;
 }
 
+ContinuationTrainer::Symbol* ContinuationTrainer::GetFrozenSymbol(
+    absl::string_view piece) {
+  const uint64_t fp = absl::HashOf(uint64_t{2}, piece);
+  const auto it = symbols_cache_.find(fp);
+  if (it != symbols_cache_.end()) {
+    CHECK_EQ(it->second->ToString(), piece)
+        << "hash collision in BPE continuation USER_DEFINED symbols";
+    return it->second;
+  }
+  auto s = std::make_unique<Symbol>();
+  s->fp = fp;
+  s->chars = string_util::UTF8ToUnicodeText(piece);
+  s->frozen = true;
+  s->freq = 1;
+  Symbol* out = s.get();
+  symbols_cache_.emplace(fp, out);
+  allocated_.push_back(std::move(s));
+  return out;
+}
+
 ContinuationTrainer::Symbol* ContinuationTrainer::GetPairSymbol(
     const Symbol* left, const Symbol* right) {
-  if (left == nullptr || right == nullptr || left->is_unk || right->is_unk) {
+  if (left == nullptr || right == nullptr || left->is_unk || right->is_unk ||
+      left->frozen || right->frozen) {
     return nullptr;
   }
   const uint64_t fp = absl::HashOf(uint64_t{1}, left->fp, right->fp);
@@ -243,6 +264,37 @@ absl::Status ContinuationTrainer::SegmentAtoms(
   return absl::OkStatus();
 }
 
+absl::Status ContinuationTrainer::SegmentRecord(
+    absl::string_view text, std::vector<Symbol*>* symbols) {
+  RET_CHECK(symbols != nullptr);
+  symbols->clear();
+  std::vector<std::string> atoms;
+  auto flush_run = [&](absl::string_view run) -> absl::Status {
+    if (run.empty()) return absl::OkStatus();
+    ABSL_RETURN_IF_ERROR(SegmentAtoms(run, &atoms));
+    for (const std::string& atom : atoms) {
+      symbols->push_back(GetAtomicSymbol(atom));
+    }
+    return absl::OkStatus();
+  };
+  if (user_defined_matcher_ == nullptr) return flush_run(text);
+
+  size_t run_begin = 0;
+  for (size_t i = 0; i < text.size();) {
+    bool found = false;
+    const int len = user_defined_matcher_->PrefixMatch(text.substr(i), &found);
+    if (!found) {
+      i += static_cast<size_t>(len);
+      continue;
+    }
+    ABSL_RETURN_IF_ERROR(flush_run(text.substr(run_begin, i - run_begin)));
+    symbols->push_back(GetFrozenSymbol(text.substr(i, len)));
+    i += static_cast<size_t>(len);
+    run_begin = i;
+  }
+  return flush_run(text.substr(run_begin));
+}
+
 absl::Status ContinuationTrainer::ValidateMergeProgram(
     const std::vector<ExpansionMerge>& merges,
     bool require_all_declared_pieces) const {
@@ -411,6 +463,17 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
       return absl::InvalidArgumentError(absl::StrCat(
           "atomic BPE pieces must be mergeable: ", piece.piece()));
     }
+    if (piece.type() == ModelProto::SentencePiece::USER_DEFINED) {
+      // Native semantics: prefix-matched before any merge, frozen on both
+      // sides. A spec that declares one mergeable or atomic is asking for a
+      // tokenizer native inference cannot be, so it is refused, not corrected.
+      if (piece.mergeable() || piece.atomic()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "USER_DEFINED piece must be declared nonmergeable and nonatomic: ",
+            piece.piece()));
+      }
+      user_defined_piece_strings_.insert(piece.piece());
+    }
     max_id = std::max(max_id, piece.external_id());
     existing_piece_strings_.insert(piece.piece());
     if (piece.atomic() ||
@@ -425,6 +488,11 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
   if (atomic_pieces_ordered_.empty()) {
     return absl::InvalidArgumentError(
         "ExpansionSpec has no mergeable reversible atomic BPE pieces");
+  }
+  if (!user_defined_piece_strings_.empty()) {
+    std::set<absl::string_view> views(user_defined_piece_strings_.begin(),
+                                      user_defined_piece_strings_.end());
+    user_defined_matcher_ = std::make_unique<normalizer::PrefixMatcher>(views);
   }
 
   first_new_external_id_ = expansion_spec_.first_new_external_id() >= 0
@@ -692,29 +760,30 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
   uint64_t weighted_positions = 0;
 
   for (size_t sid = 0; sid < sentences_.size(); ++sid) {
-    std::vector<std::string> atoms;
-    ABSL_RETURN_IF_ERROR(SegmentAtoms(sentences_[sid].first, &atoms));
-    if (atoms.size() > kMaxAtomsPerRecord) {
+    std::vector<Symbol*> record;
+    ABSL_RETURN_IF_ERROR(SegmentRecord(sentences_[sid].first, &record));
+    if (record.size() > kMaxAtomsPerRecord) {
       return absl::OutOfRangeError(absl::StrCat(
-          "continuation training unit segments into ", atoms.size(),
+          "continuation training unit segments into ", record.size(),
           " atomic symbols, which exceeds the ", kMaxAtomsPerRecord,
           " this trainer can index; split the record or shrink "
           "max_sentence_length"));
     }
     const uint64_t weight = static_cast<uint64_t>(sentences_[sid].second);
     if (weight != 0 &&
-        atoms.size() > (std::numeric_limits<uint64_t>::max() -
-                        weighted_positions) / weight) {
+        record.size() > (std::numeric_limits<uint64_t>::max() -
+                         weighted_positions) / weight) {
       return absl::OutOfRangeError(
           "weighted continuation corpus exceeds the exact integer range of "
           "BPE pair frequencies; reduce the TSV counts");
     }
-    weighted_positions += static_cast<uint64_t>(atoms.size()) * weight;
+    weighted_positions += static_cast<uint64_t>(record.size()) * weight;
 
-    for (const std::string& atom : atoms) {
-      Symbol* symbol = GetAtomicSymbol(atom);
+    for (Symbol* symbol : record) {
       symbols_[sid].push_back(symbol);
-      live_by_string_[atom] = symbol;
+      // A frozen USER_DEFINED unit is not addressable by a merge, so it is
+      // deliberately absent from live_by_string_.
+      if (!symbol->frozen) live_by_string_[symbol->ToString()] = symbol;
     }
   }
 
@@ -1357,6 +1426,8 @@ absl::Status ContinuationTrainer::Train() {
   existing_piece_strings_.clear();
   atomic_piece_strings_.clear();
   atomic_pieces_ordered_.clear();
+  user_defined_matcher_.reset();
+  user_defined_piece_strings_.clear();
   live_by_string_.clear();
   base_pieces_.clear();
   bootstrap_pieces_.clear();

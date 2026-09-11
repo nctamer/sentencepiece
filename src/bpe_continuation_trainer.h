@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <queue>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "continuation_io.h"
+#include "normalizer.h"
 #include "sentencepiece_model.pb.h"
 #include "trainer_interface.h"
 
@@ -45,6 +47,10 @@ class ContinuationTrainer : public TrainerInterface {
     uint64_t fp = 0;
     uint64_t freq = 0;
     bool is_unk = false;
+    // A USER_DEFINED occurrence. Never a merge participant on either side,
+    // which is exactly what native training achieves by replacing the
+    // occurrence with a pretokenization boundary (trainer_interface.cc).
+    bool frozen = false;
     bool active = true;
     bool pending = false;
     bool needs_recomputation = true;
@@ -81,6 +87,7 @@ class ContinuationTrainer : public TrainerInterface {
   static Position DecodePos(uint64_t n);
 
   Symbol* GetAtomicSymbol(absl::string_view atom);
+  Symbol* GetFrozenSymbol(absl::string_view piece);
   Symbol* GetPairSymbol(const Symbol* left, const Symbol* right);
   void ComputeFreq(Symbol* symbol) const;
   int GetNextIndex(int sid, int index) const;
@@ -95,6 +102,11 @@ class ContinuationTrainer : public TrainerInterface {
   // and multiple parses mean the alphabet representation is ambiguous.
   absl::Status SegmentAtoms(absl::string_view text,
                             std::vector<std::string>* atoms) const;
+  // Segments one record into corpus symbols: USER_DEFINED occurrences first
+  // (longest prefix match, the native rule), each one frozen; every run of
+  // text between them through SegmentAtoms.
+  absl::Status SegmentRecord(absl::string_view text,
+                             std::vector<Symbol*>* symbols);
 
   absl::Status LoadAndValidateSpec();
   // The inherited text pipeline and special-token ABI are authoritative, the
@@ -144,6 +156,10 @@ class ContinuationTrainer : public TrainerInterface {
 
   absl::flat_hash_set<std::string> existing_piece_strings_;
   absl::flat_hash_set<std::string> atomic_piece_strings_;
+  // USER_DEFINED base piece strings and their longest-prefix matcher. The
+  // matcher borrows the strings, so the set must outlive it.
+  std::set<std::string> user_defined_piece_strings_;
+  std::unique_ptr<normalizer::PrefixMatcher> user_defined_matcher_;
   std::vector<std::string> atomic_pieces_ordered_;
   absl::flat_hash_map<std::string, Symbol*> live_by_string_;
 

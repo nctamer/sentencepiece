@@ -18,10 +18,13 @@
 //
 // Semantics, in order:
 //   1. normalize with the artifact's own authoritative normalizer;
-//   2. start from the declared reversible atomic alphabet;
-//   3. among adjacent pairs present in the program, LOWEST effective rank
-//      wins, leftmost occurrence first;
-//   4. external IDs are preserved exactly.
+//   2. USER_DEFINED pieces are recognized FIRST by longest prefix match,
+//      exactly as native SentencePiece does (bpe_model.cc, PrefixMatcher):
+//      each occurrence is one frozen unit that no merge may enter or cross;
+//   3. everything else starts from single characters;
+//   4. among adjacent non-frozen pairs present in the program, LOWEST
+//      effective rank wins, leftmost occurrence first;
+//   5. external IDs are preserved exactly.
 
 #ifndef EXPANSION_PROCESSOR_H_
 #define EXPANSION_PROCESSOR_H_
@@ -64,6 +67,10 @@ class ExpansionProcessor {
   int unk_id() const { return unk_id_; }
   const std::string& IdToPiece(int id) const;
   int PieceToId(absl::string_view piece) const;
+  // ModelProto::SentencePiece::Type of `id` (NORMAL=1, UNKNOWN=2, CONTROL=3,
+  // USER_DEFINED=4 ...); -1 when out of range.
+  int IdToType(int id) const;
+  bool IsUserDefined(int id) const;
 
   // "<id>\t<piece>\t<type>" per line, SHA-256. Two tokenizers of the same size
   // with different meanings differ here; this is the warm-start identity.
@@ -77,6 +84,9 @@ class ExpansionProcessor {
   absl::flat_hash_map<std::string, int> piece_to_id_;
   absl::flat_hash_map<std::string, int> merge_rank_;  // left \x01 right -> rank
   std::unique_ptr<normalizer::Normalizer> normalizer_;
+  // Longest-prefix matcher over the USER_DEFINED piece strings. Owns nothing;
+  // the strings live in id_to_piece_.
+  std::unique_ptr<normalizer::PrefixMatcher> user_defined_matcher_;
   NormalizerSpec normalizer_spec_;
   int unk_id_ = 0;
   std::string unk_piece_ = "<unk>";
