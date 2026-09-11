@@ -224,6 +224,40 @@ void ContinuationTrainer::DrainPendingQueue() {
 }
 
 void ContinuationTrainer::RebuildHierarchyCandidateIndex() {
+  // An inherited tokenizer is authoritative. If one of its already-produced
+  // tokens partially straddles a NEW grammar parent's child boundary, that
+  // parent cannot be enforced without changing inherited segmentation. Disable
+  // only that gate for that record; compatible gates remain active.
+  size_t disabled = 0;
+  for (size_t sid = 0; sid < hierarchy_.size(); ++sid) {
+    HierarchyRecord& record = hierarchy_[sid];
+    for (HierarchyGate& gate : record.gates) {
+      gate.enabled = true;
+      for (size_t i = 0; i < symbols_[sid].size(); ++i) {
+        if (symbols_[sid][i] == nullptr) continue;
+        const size_t begin = span_begin_[sid][i];
+        const size_t end = span_end_[sid][i];
+        auto cut = std::upper_bound(gate.cuts.begin(), gate.cuts.end(), begin);
+        const bool crosses_internal =
+            cut != gate.cuts.end() && *cut < end && *cut < gate.end;
+        if (!crosses_internal) continue;
+        const bool begin_is_cut =
+            std::binary_search(gate.cuts.begin(), gate.cuts.end(), begin);
+        const bool end_is_cut =
+            std::binary_search(gate.cuts.begin(), gate.cuts.end(), end);
+        if (!(begin_is_cut && end_is_cut)) {
+          gate.enabled = false;
+          ++disabled;
+          break;
+        }
+      }
+    }
+  }
+  if (disabled != 0) {
+    LOG(INFO) << "Hierarchy disabled " << disabled
+              << " gates incompatible with inherited/base segmentation";
+  }
+
   // Inherited replay deliberately indexed every live pair occurrence. Those
   // counts are not the continuation counts: discard them and rebuild exactly
   // once from the post-replay segmentation with occurrence-local eligibility.
@@ -408,6 +442,7 @@ bool ContinuationTrainer::CanMerge(int sid, int left, int right) const {
   if (it == record.gate_at_boundary.end()) return true;
 
   const HierarchyGate& gate = record.gates[it->second];
+  if (!gate.enabled) return true;
   const size_t begin = span_begin_[sid][left];
   const size_t end = span_end_[sid][right];
   if (begin < gate.begin || end > gate.end) return false;
