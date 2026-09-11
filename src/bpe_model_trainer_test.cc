@@ -24,6 +24,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "filesystem.h"
+#include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
 #include "sentencepiece_trainer.h"
 #include "trainer_interface.h"
@@ -256,6 +257,117 @@ TEST(BPETrainerTest, EndToEndTestWithAutoCharacterCoverage) {
   EXPECT_TRUE(sp.Decode(tok, &decoded).ok());
   EXPECT_EQ("吾輩は猫である。未知の漢字驫。", decoded);
 }
+
+TEST(BPETrainerTest, CompletionHierarchyUnlocksOnlyWholeChildren) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "hier_bpe_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "hier_bpe.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "hier_bpe.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "hier_bpe_model");
+  const std::string result_path = prefix + ".expansion";
+
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("abcd\t5"));
+  }
+  {
+    // One parent with children "ab" and "cd".  The byte boundary at 2 may be
+    // crossed only when the current left token starts at 0 and the current
+    // right token ends at 4.  Thus a+b and c+d must happen before ab+cd.
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    ASSERT_TRUE(out->WriteLine("abcd\t1:0,2,4"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(5);
+  expansion.set_requested_new_pieces(3);
+
+  auto add = [&](int id, absl::string_view piece,
+                 ModelProto::SentencePiece::Type type, bool mergeable,
+                 bool atomic) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(type);
+    p->set_mergeable(mergeable);
+    p->set_atomic(atomic);
+  };
+  add(0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false, false);
+  add(1, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  add(2, "b", ModelProto::SentencePiece::NORMAL, true, true);
+  add(3, "c", ModelProto::SentencePiece::NORMAL, true, true);
+  add(4, "d", ModelProto::SentencePiece::NORMAL, true, true);
+  {
+    auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString()));
+  }
+
+  TrainerSpec trainer_spec;
+  trainer_spec.set_model_type(TrainerSpec::BPE);
+  trainer_spec.add_input(input);
+  trainer_spec.set_input_format("tsv");
+  trainer_spec.set_model_prefix(prefix);
+  trainer_spec.set_vocab_size(8);
+  trainer_spec.set_expansion_spec(spec_path);
+  trainer_spec.set_expansion_result(result_path);
+  trainer_spec.set_bpe_hierarchy_file(hierarchy);
+  trainer_spec.set_input_sentence_size(0);
+  trainer_spec.set_split_by_whitespace(false);
+  trainer_spec.set_split_by_unicode_script(false);
+  trainer_spec.set_split_by_number(false);
+  trainer_spec.set_split_digits(false);
+  trainer_spec.set_bos_id(-1);
+  trainer_spec.set_eos_id(-1);
+  trainer_spec.set_pad_id(-1);
+  trainer_spec.set_hard_vocab_limit(true);
+
+  NormalizerSpec normalizer_spec;
+  normalizer_spec.set_name("identity");
+  normalizer_spec.set_add_dummy_prefix(false);
+  normalizer_spec.set_remove_extra_whitespaces(false);
+  NormalizerSpec denormalizer_spec;
+
+  ASSERT_TRUE(SentencePieceTrainer::Train(
+                  trainer_spec, normalizer_spec, denormalizer_spec)
+                  .ok());
+
+  std::string bytes;
+  {
+    auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes));
+  }
+  ExpansionResult result;
+  ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(3, result.learned_merges_size());
+
+  EXPECT_EQ("a", result.learned_merges(0).left());
+  EXPECT_EQ("b", result.learned_merges(0).right());
+  EXPECT_EQ(0, result.learned_merges(0).grammar_level());
+  EXPECT_EQ(5, result.learned_merges(0).weighted_count());
+
+  EXPECT_EQ("c", result.learned_merges(1).left());
+  EXPECT_EQ("d", result.learned_merges(1).right());
+  EXPECT_EQ(0, result.learned_merges(1).grammar_level());
+  EXPECT_EQ(5, result.learned_merges(1).weighted_count());
+
+  EXPECT_EQ("ab", result.learned_merges(2).left());
+  EXPECT_EQ("cd", result.learned_merges(2).right());
+  EXPECT_EQ(1, result.learned_merges(2).grammar_level());
+  EXPECT_EQ(5, result.learned_merges(2).weighted_count());
+  EXPECT_TRUE(absl::StartsWith(
+      result.boundary_policy(), "bpe_hierarchical_completion_v1:"));
+  EXPECT_EQ(result.contract().bpe_hierarchy_sha256(),
+            result.boundary_policy().substr(
+                std::string("bpe_hierarchical_completion_v1:").size()));
+}
+
 
 }  // namespace
 }  // namespace bpe
