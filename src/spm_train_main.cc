@@ -69,6 +69,9 @@ ABSL_FLAG(std::string, expansion_result, "",
           "optional output path for the serialized ExpansionResult");
 ABSL_FLAG(std::string, unigram_prior_model, "",
           "prior Unigram ModelProto for true Unigram continuation");
+ABSL_FLAG(std::string, bpe_hierarchy_file, "",
+          "completion-gated BPE hierarchy sidecar "
+          "(sentencepiece-bpe-hierarchy-v1)");
 // Legacy intermo compatibility flags (TrainerSpec extensions 200/201/204/205).
 // Superseded by --expansion_spec / --unigram_prior_model; see
 // README_expansion.md.
@@ -240,6 +243,7 @@ int main(int argc, char* argv[]) {
   SetTrainerSpecFromFlag(expansion_spec);
   SetTrainerSpecFromFlag(expansion_result);
   SetTrainerSpecFromFlag(unigram_prior_model);
+  SetTrainerSpecFromFlag(bpe_hierarchy_file);
   // Legacy intermo extensions live in the extension range, so they are set
   // with SetExtension rather than a generated set_X accessor.
   trainer_spec.SetExtension(::sentencepiece::split_by_interval,
