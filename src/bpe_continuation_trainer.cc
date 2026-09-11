@@ -194,9 +194,10 @@ void ContinuationTrainer::ResetFreq(int sid, int left, int right,
   if (symbol == nullptr || symbol == best || !symbol->active) return;
   symbol->needs_recomputation = true;
   // A formerly blocked global pair may become safe precisely because this
-  // adjacency is about to disappear. Requeue it even if no new occurrence of
-  // that pair is created by the accepted merge.
-  if (!symbol->pending) {
+  // adjacency is about to disappear. Requeue that zero-frequency candidate
+  // even if no new occurrence of the pair is created by the accepted merge.
+  // Ordinary legal candidates already retain a priority-queue entry.
+  if (symbol->hierarchy_blocked && !symbol->pending) {
     symbol->pending = true;
     pending_queue_.push_back(symbol);
   }
