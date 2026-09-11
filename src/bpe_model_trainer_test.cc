@@ -370,6 +370,116 @@ TEST(BPETrainerTest, CompletionHierarchyUnlocksOnlyWholeChildren) {
 }
 
 
+
+TEST(BPETrainerTest, CompletionHierarchyUnlocksNestedParentsBottomUp) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "hier_nested_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "hier_nested.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "hier_nested.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "hier_nested_model");
+  const std::string result_path = prefix + ".expansion";
+
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("abcdef\t5"));
+  }
+  {
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    // Level 1: [2,6] = "cd" | "ef".
+    // Level 2: [0,6] = "ab" | "cdef".
+    // Therefore cdef must complete before the level-2 boundary can unlock.
+    ASSERT_TRUE(out->WriteLine("abcdef\t1:2,4,6;2:0,2,6"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(7);
+  expansion.set_requested_new_pieces(5);
+  auto add = [&](int id, absl::string_view piece,
+                 ModelProto::SentencePiece::Type type, bool mergeable,
+                 bool atomic) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(type);
+    p->set_mergeable(mergeable);
+    p->set_atomic(atomic);
+  };
+  add(0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false, false);
+  add(1, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  add(2, "b", ModelProto::SentencePiece::NORMAL, true, true);
+  add(3, "c", ModelProto::SentencePiece::NORMAL, true, true);
+  add(4, "d", ModelProto::SentencePiece::NORMAL, true, true);
+  add(5, "e", ModelProto::SentencePiece::NORMAL, true, true);
+  add(6, "f", ModelProto::SentencePiece::NORMAL, true, true);
+  {
+    auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString()));
+  }
+
+  TrainerSpec trainer_spec;
+  trainer_spec.set_model_type(TrainerSpec::BPE);
+  trainer_spec.add_input(input);
+  trainer_spec.set_input_format("tsv");
+  trainer_spec.set_model_prefix(prefix);
+  trainer_spec.set_vocab_size(12);
+  trainer_spec.set_expansion_spec(spec_path);
+  trainer_spec.set_expansion_result(result_path);
+  trainer_spec.set_bpe_hierarchy_file(hierarchy);
+  trainer_spec.set_input_sentence_size(0);
+  trainer_spec.set_split_by_whitespace(false);
+  trainer_spec.set_split_by_unicode_script(false);
+  trainer_spec.set_split_by_number(false);
+  trainer_spec.set_split_digits(false);
+  trainer_spec.set_bos_id(-1);
+  trainer_spec.set_eos_id(-1);
+  trainer_spec.set_pad_id(-1);
+  trainer_spec.set_hard_vocab_limit(true);
+
+  NormalizerSpec normalizer_spec;
+  normalizer_spec.set_name("identity");
+  normalizer_spec.set_add_dummy_prefix(false);
+  normalizer_spec.set_remove_extra_whitespaces(false);
+  NormalizerSpec denormalizer_spec;
+
+  ASSERT_TRUE(SentencePieceTrainer::Train(
+                  trainer_spec, normalizer_spec, denormalizer_spec)
+                  .ok());
+
+  std::string bytes;
+  {
+    auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes));
+  }
+  ExpansionResult result;
+  ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(5, result.learned_merges_size());
+
+  int nested_rank = -1;
+  int outer_rank = -1;
+  for (const auto& merge : result.learned_merges()) {
+    const std::string piece = absl::StrCat(merge.left(), merge.right());
+    if (piece == "cdef") {
+      nested_rank = merge.rank();
+      EXPECT_EQ(1, merge.grammar_level());
+      EXPECT_EQ(5, merge.weighted_count());
+    } else if (piece == "abcdef") {
+      outer_rank = merge.rank();
+      EXPECT_EQ(2, merge.grammar_level());
+      EXPECT_EQ(5, merge.weighted_count());
+    }
+  }
+  ASSERT_GE(nested_rank, 0);
+  ASSERT_GE(outer_rank, 0);
+  EXPECT_LT(nested_rank, outer_rank);
+}
+
 TEST(BPETrainerTest, CompletionHierarchyKeepsUserDefinedFrozen) {
   const std::string input =
       filesystem::JoinPath(::testing::TempDir(), "hier_ud_input.tsv");
