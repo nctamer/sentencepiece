@@ -236,6 +236,11 @@ class ContinuationTrainer : public TrainerInterface {
   std::vector<Symbol*> pending_queue_;
   std::vector<std::unique_ptr<Symbol>> allocated_;
   std::vector<std::vector<Symbol*>> symbols_;
+  // Intrusive live-neighbor links over the fixed occurrence slots. Merges
+  // tombstone the right slot but update only these two links, so neighbour
+  // discovery is O(1) instead of scanning across an ever-growing run of nulls.
+  std::vector<std::vector<int>> prev_live_;
+  std::vector<std::vector<int>> next_live_;
 };
 
 }  // namespace sentencepiece::bpe
