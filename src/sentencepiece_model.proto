@@ -20,7 +20,7 @@ option optimize_for = LITE_RUNTIME;
 package sentencepiece;
 
 // TrainerSpec encodes a various parameters for SentencePiece training.
-// Next id: 58
+// Next id: 59
 message TrainerSpec {
   ///////////////////////////////////////////////////////////////////
   // General parameters
@@ -121,6 +121,13 @@ message TrainerSpec {
   // All inherited piece IDs/types are copied from this file; inherited NORMAL
   // scores are constrained to the common additive-length gauge during EM.
   optional string unigram_prior_model = 57 [default = ""];
+
+  // Optional hierarchy sidecar for completion-gated BPE continuation.
+  // Format is sentencepiece-bpe-hierarchy-v1; rows are keyed by the normalized
+  // corpus surface and carry laminar grammar-parent child boundaries.  The
+  // trainer uses it only for BPE pair eligibility; counts remain the ordinary
+  // occurrence-weighted corpus counts.
+  optional string bpe_hierarchy_file = 58 [default = ""];
 
   reserved 6;
   reserved 12;
@@ -227,6 +234,14 @@ message ExpansionMerge {
   required string left = 2;
   required string right = 3;
   optional int32 external_id = 4 [default = -1];
+
+  // Audit data for newly learned merges.  Old/inherited artifacts legitimately
+  // omit these fields.
+  optional uint64 weighted_count = 5 [default = 0];
+  // 0 = no grammar boundary crossed; positive values are hierarchy levels
+  // supplied by the sidecar (InterMo uses 1=sub-lexical grammar,
+  // 2=context/whitespace composition, 3=whole-interval composition).
+  optional int32 grammar_level = 6 [default = 0];
 }
 
 enum ExpansionModelType {
@@ -285,6 +300,8 @@ message ContinuationContract {
   optional int64 corpus_weight = 42;
   optional string base_id_map_sha256 = 43;   // ordered piece table identity
   optional string base_merges_sha256 = 44;
+  // Exact hierarchy sidecar used by completion-gated BPE, if any.
+  optional string bpe_hierarchy_sha256 = 45;
 }
 
 message ExpansionSpec {
