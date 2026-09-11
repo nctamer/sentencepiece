@@ -22,6 +22,7 @@
 #include "absl/flags/flag.h"
 #include "absl/flags/reflection.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_join.h"
 #include "filesystem.h"
 #include "sentencepiece_model.pb.h"
