@@ -185,12 +185,31 @@ complete children), the ordinary weighted pair enters the BPE competition.
 Ungated boundaries retain ordinary BPE behavior. The hierarchy and explicit
 string fences are mutually exclusive.
 
-The exported rank program is context-free, so the trainer applies a second
-safety law: if the same surface pair is ever observed at a hierarchy boundary
-where it is ineligible, that surface pair is permanently ineligible as a
-learned global merge. This is the deeper-hierarchy analogue of BoundlessBPE's
-whole-pretoken condition and prevents training-only contextual eligibility from
-being lost at inference.
+Hierarchy eligibility is **occurrence-local**. A surface pair can be a valid
+candidate in one occurrence and blocked in another. Only eligible occurrences
+contribute their TSV weights to the candidate count, and accepting the pair
+rewrites only those eligible occurrences. An ineligible occurrence never
+poisons the pair globally. For example, after `1+2 -> 12`, `/+12` may be
+eligible in `/12` while remaining blocked as a proper prefix in `/128`.
+
+That semantic condition survives into inference. A hierarchical
+`ExpansionResult` is not a standalone context-free merge table:
+`ExpansionProcessor::Encode` fails closed, and the caller must use
+`EncodeWithHierarchy(text, gates, ...)`. The runtime uses an intrusive
+live-neighbour sequence plus a rank heap; after each merge only the two adjacent
+pairs are reconsidered.
+
+Continuation is explicitly two-phase:
+
+1. base/bootstrap merges replay first, unconditionally and in their inherited
+   rank order, so an existing tokenizer such as Qwen is reproduced exactly;
+2. only appended learned merges are hierarchy-gated per occurrence.
+
+If inherited tokenization already partially crosses a newly introduced grammar
+child boundary, continuation cannot undo that token without changing the base
+tokenizer. That gate alone is disabled for that input occurrence. Fresh
+hierarchical training has no inherited tokenizer to preserve, so the same
+condition is a hard error rather than permission to disable a gate.
 
 Learned `ExpansionMerge` records carry `weighted_count` and
 `grammar_level` for review. The exact sidecar SHA-256 is recorded in the
@@ -393,10 +412,15 @@ a semantically false model. `ExpansionResult.native_model_emitted` and
 `native_model_refusal` record the outcome.
 
 `expansion::ExpansionProcessor` (`src/expansion_processor.h`) is the
-authoritative runtime for the explicit ranked merge program: normalize with the
-artifact's own normalizer, start from the declared atomic alphabet, apply the
-lowest effective rank leftmost-first, preserve external IDs. It provides
-encode/decode, `IdToPiece`/`PieceToId`, exact per-token UTF-8 byte spans over
-the normalized text, and `IdMapSha256()` -- the ordered-ID-map identity that
-distinguishes two tokenizers of the same size with different meanings.
-`spm_expansion_cli` exposes it for cross-language parity checks.
+authoritative explicit-program runtime. Ordinary expansion artifacts normalize
+with the artifact's own normalizer and replay their ranked merge program.
+Hierarchical artifacts additionally require the adapter-produced per-input
+completion gates and use `EncodeWithHierarchy`: inherited/base ranks replay
+first without grammar veto, then appended ranks replay with occurrence-local
+eligibility. External IDs never change.
+
+The implementation uses live-neighbour links plus a priority heap rather than
+rescanning the token sequence for every rank. It provides encode/decode,
+`IdToPiece`/`PieceToId`, exact per-token UTF-8 byte spans over the normalized
+text, and `IdMapSha256()`. `spm_expansion_cli --hierarchy_file=...` exposes
+the same hierarchical runtime for cross-language corpus/parity checks.
