@@ -107,6 +107,7 @@ class ExpansionProcessor {
   int unk_id_ = 0;
   std::string unk_piece_ = "<unk>";
   bool requires_hierarchy_ = false;
+  bool has_inherited_merge_program_ = false;
 
   absl::Status EncodeImpl(absl::string_view text,
                           const std::vector<CompletionGate>* gates,
