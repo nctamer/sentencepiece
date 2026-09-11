@@ -369,6 +369,106 @@ TEST(BPETrainerTest, CompletionHierarchyUnlocksOnlyWholeChildren) {
                 std::string("bpe_hierarchical_completion_v1:").size()));
 }
 
+TEST(BPETrainerTest, CompletionHierarchyRejectsContextDependentGlobalPair) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "hier_global_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "hier_global.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "hier_global.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "hier_global_model");
+  const std::string result_path = prefix + ".expansion";
+
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("abcd\t5"));
+    ASSERT_TRUE(out->WriteLine("xabcd\t7"));
+  }
+  {
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    // In the first row ab|cd are complete siblings. In the second row the
+    // same eventual surface pair sits inside xab|cd: bare "ab" is only a
+    // suffix of the left child, so ab+cd must NOT become a context-free merge.
+    ASSERT_TRUE(out->WriteLine("abcd\t1:0,2,4"));
+    ASSERT_TRUE(out->WriteLine("xabcd\t1:0,3,5"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(6);
+  expansion.set_requested_new_pieces(3);
+  auto add = [&](int id, absl::string_view piece,
+                 ModelProto::SentencePiece::Type type, bool mergeable,
+                 bool atomic) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(type);
+    p->set_mergeable(mergeable);
+    p->set_atomic(atomic);
+  };
+  add(0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false, false);
+  add(1, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  add(2, "b", ModelProto::SentencePiece::NORMAL, true, true);
+  add(3, "c", ModelProto::SentencePiece::NORMAL, true, true);
+  add(4, "d", ModelProto::SentencePiece::NORMAL, true, true);
+  add(5, "x", ModelProto::SentencePiece::NORMAL, true, true);
+  {
+    auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString()));
+  }
+
+  TrainerSpec trainer_spec;
+  trainer_spec.set_model_type(TrainerSpec::BPE);
+  trainer_spec.add_input(input);
+  trainer_spec.set_input_format("tsv");
+  trainer_spec.set_model_prefix(prefix);
+  trainer_spec.set_vocab_size(9);
+  trainer_spec.set_expansion_spec(spec_path);
+  trainer_spec.set_expansion_result(result_path);
+  trainer_spec.set_bpe_hierarchy_file(hierarchy);
+  trainer_spec.set_input_sentence_size(0);
+  trainer_spec.set_split_by_whitespace(false);
+  trainer_spec.set_split_by_unicode_script(false);
+  trainer_spec.set_split_by_number(false);
+  trainer_spec.set_split_digits(false);
+  trainer_spec.set_bos_id(-1);
+  trainer_spec.set_eos_id(-1);
+  trainer_spec.set_pad_id(-1);
+  trainer_spec.set_hard_vocab_limit(true);
+
+  NormalizerSpec normalizer_spec;
+  normalizer_spec.set_name("identity");
+  normalizer_spec.set_add_dummy_prefix(false);
+  normalizer_spec.set_remove_extra_whitespaces(false);
+  NormalizerSpec denormalizer_spec;
+  ASSERT_TRUE(SentencePieceTrainer::Train(
+                  trainer_spec, normalizer_spec, denormalizer_spec)
+                  .ok());
+
+  std::string bytes;
+  {
+    auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes));
+  }
+  ExpansionResult result;
+  ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(3, result.learned_merges_size());
+  bool saw_ab_cd = false;
+  for (const auto& merge : result.learned_merges()) {
+    if (merge.left() == "ab" && merge.right() == "cd") saw_ab_cd = true;
+  }
+  EXPECT_FALSE(saw_ab_cd);
+  // The third slot goes to the safe completion of the first child in xab|cd.
+  EXPECT_EQ("x", result.learned_merges(2).left());
+  EXPECT_EQ("ab", result.learned_merges(2).right());
+}
+
+
 
 }  // namespace
 }  // namespace bpe
