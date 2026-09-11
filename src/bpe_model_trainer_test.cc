@@ -578,28 +578,28 @@ TEST(BPETrainerTest, CompletionHierarchyKeepsUserDefinedFrozen) {
   }
 }
 
-TEST(BPETrainerTest, CompletionHierarchyRejectsContextDependentGlobalPair) {
+TEST(BPETrainerTest, CompletionHierarchyCountsOnlyEligibleOccurrences) {
   const std::string input =
-      filesystem::JoinPath(::testing::TempDir(), "hier_global_input.tsv");
+      filesystem::JoinPath(::testing::TempDir(), "hier_occurrence_input.tsv");
   const std::string spec_path =
-      filesystem::JoinPath(::testing::TempDir(), "hier_global.spec");
+      filesystem::JoinPath(::testing::TempDir(), "hier_occurrence.spec");
   const std::string hierarchy =
-      filesystem::JoinPath(::testing::TempDir(), "hier_global.tsv");
+      filesystem::JoinPath(::testing::TempDir(), "hier_occurrence.tsv");
   const std::string prefix =
-      filesystem::JoinPath(::testing::TempDir(), "hier_global_model");
+      filesystem::JoinPath(::testing::TempDir(), "hier_occurrence_model");
   const std::string result_path = prefix + ".expansion";
 
   {
     auto out = filesystem::NewWritableFile(input);
-    ASSERT_TRUE(out->WriteLine("abcd\t5"));
+    ASSERT_TRUE(out->WriteLine("abcd\t20"));
     ASSERT_TRUE(out->WriteLine("xabcd\t7"));
   }
   {
     auto out = filesystem::NewWritableFile(hierarchy);
     ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
-    // In the first row ab|cd are complete siblings. In the second row the
-    // same eventual surface pair sits inside xab|cd: bare "ab" is only a
-    // suffix of the left child, so ab+cd must NOT become a context-free merge.
+    // After a+b and c+d, ab+cd is a complete-child crossing in "abcd" but
+    // the same surface pair is only a suffix of the unfinished left child
+    // "xab" in "xabcd". The eligible occurrence must still be learnable.
     ASSERT_TRUE(out->WriteLine("abcd\t1:0,2,4"));
     ASSERT_TRUE(out->WriteLine("xabcd\t1:0,3,5"));
   }
@@ -655,6 +655,7 @@ TEST(BPETrainerTest, CompletionHierarchyRejectsContextDependentGlobalPair) {
   normalizer_spec.set_add_dummy_prefix(false);
   normalizer_spec.set_remove_extra_whitespaces(false);
   NormalizerSpec denormalizer_spec;
+
   ASSERT_TRUE(SentencePieceTrainer::Train(
                   trainer_spec, normalizer_spec, denormalizer_spec)
                   .ok());
@@ -667,18 +668,19 @@ TEST(BPETrainerTest, CompletionHierarchyRejectsContextDependentGlobalPair) {
   ExpansionResult result;
   ASSERT_TRUE(result.ParseFromString(bytes));
   ASSERT_EQ(3, result.learned_merges_size());
+
   bool saw_ab_cd = false;
   for (const auto& merge : result.learned_merges()) {
-    if (merge.left() == "ab" && merge.right() == "cd") saw_ab_cd = true;
+    if (merge.left() == "ab" && merge.right() == "cd") {
+      saw_ab_cd = true;
+      EXPECT_EQ(20, merge.weighted_count());
+      EXPECT_EQ(1, merge.grammar_level());
+    }
   }
-  EXPECT_FALSE(saw_ab_cd);
-  // The third slot goes to the safe completion of the first child in xab|cd.
-  EXPECT_EQ("x", result.learned_merges(2).left());
-  EXPECT_EQ("ab", result.learned_merges(2).right());
+  EXPECT_TRUE(saw_ab_cd);
 }
 
-
-TEST(BPETrainerTest, CompletionHierarchyReconsidersSharedPrefixAtLaterRank) {
+TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
   const std::string input =
       filesystem::JoinPath(::testing::TempDir(), "hier_prefix_input.tsv");
   const std::string spec_path =
@@ -691,16 +693,12 @@ TEST(BPETrainerTest, CompletionHierarchyReconsidersSharedPrefixAtLaterRank) {
 
   {
     auto out = filesystem::NewWritableFile(input);
-    ASSERT_TRUE(out->WriteLine("/12\t5"));
+    ASSERT_TRUE(out->WriteLine("/12\t20"));
     ASSERT_TRUE(out->WriteLine("/128\t7"));
   }
   {
     auto out = filesystem::NewWritableFile(hierarchy);
     ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
-    // '/' may cross into the denominator only after that denominator is
-    // complete.  Once 1+2 has formed "12", /+12 is legal in /12 but still
-    // blocked in /128 until 12+8 forms "128".  Ranked BPE must defer /+12,
-    // not retire it permanently.
     ASSERT_TRUE(out->WriteLine("/12\t1:0,1,3"));
     ASSERT_TRUE(out->WriteLine("/128\t1:0,1,4"));
   }
@@ -710,7 +708,7 @@ TEST(BPETrainerTest, CompletionHierarchyReconsidersSharedPrefixAtLaterRank) {
   expansion.set_model_type(EXPANSION_BPE);
   expansion.set_preserve_base_ids(true);
   expansion.set_first_new_external_id(5);
-  expansion.set_requested_new_pieces(4);
+  expansion.set_requested_new_pieces(2);
   auto add = [&](int id, absl::string_view piece,
                  ModelProto::SentencePiece::Type type, bool mergeable,
                  bool atomic) {
@@ -736,7 +734,7 @@ TEST(BPETrainerTest, CompletionHierarchyReconsidersSharedPrefixAtLaterRank) {
   trainer_spec.add_input(input);
   trainer_spec.set_input_format("tsv");
   trainer_spec.set_model_prefix(prefix);
-  trainer_spec.set_vocab_size(9);
+  trainer_spec.set_vocab_size(7);
   trainer_spec.set_expansion_spec(spec_path);
   trainer_spec.set_expansion_result(result_path);
   trainer_spec.set_bpe_hierarchy_file(hierarchy);
@@ -767,25 +765,16 @@ TEST(BPETrainerTest, CompletionHierarchyReconsidersSharedPrefixAtLaterRank) {
   }
   ExpansionResult result;
   ASSERT_TRUE(result.ParseFromString(bytes));
-  ASSERT_EQ(4, result.learned_merges_size());
+  ASSERT_EQ(2, result.learned_merges_size());
 
   EXPECT_EQ("1", result.learned_merges(0).left());
   EXPECT_EQ("2", result.learned_merges(0).right());
-  EXPECT_EQ(12, result.learned_merges(0).weighted_count());
+  EXPECT_EQ(27, result.learned_merges(0).weighted_count());
 
-  EXPECT_EQ("12", result.learned_merges(1).left());
-  EXPECT_EQ("8", result.learned_merges(1).right());
-  EXPECT_EQ(7, result.learned_merges(1).weighted_count());
-
-  EXPECT_EQ("/", result.learned_merges(2).left());
-  EXPECT_EQ("128", result.learned_merges(2).right());
-  EXPECT_EQ(1, result.learned_merges(2).grammar_level());
-  EXPECT_EQ(7, result.learned_merges(2).weighted_count());
-
-  EXPECT_EQ("/", result.learned_merges(3).left());
-  EXPECT_EQ("12", result.learned_merges(3).right());
-  EXPECT_EQ(1, result.learned_merges(3).grammar_level());
-  EXPECT_EQ(5, result.learned_merges(3).weighted_count());
+  EXPECT_EQ("/", result.learned_merges(1).left());
+  EXPECT_EQ("12", result.learned_merges(1).right());
+  EXPECT_EQ(20, result.learned_merges(1).weighted_count());
+  EXPECT_EQ(1, result.learned_merges(1).grammar_level());
 }
 
 
