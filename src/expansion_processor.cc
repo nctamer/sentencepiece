@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <queue>
 #include <set>
 
 #include "absl/status/status_macros.h"
@@ -25,8 +26,9 @@ std::string Key(absl::string_view l, absl::string_view r) {
 
 absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
   id_to_piece_.clear(); id_to_type_.clear();
-  piece_to_id_.clear(); merge_rank_.clear();
+  piece_to_id_.clear(); merge_rule_.clear();
   user_defined_matcher_.reset();
+  requires_hierarchy_ = false;
 
   std::vector<ExpansionPiece> pieces;
   for (const auto& p : result.base_pieces()) pieces.push_back(p);
@@ -86,31 +88,45 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
     }
   }
 
-  std::vector<ExpansionMerge> merges;
-  for (const auto& m : result.base_merges()) merges.push_back(m);
-  for (const auto& m : result.bootstrap_merges()) merges.push_back(m);
-  for (const auto& m : result.learned_merges()) merges.push_back(m);
+  const std::string hierarchy_prefix = "bpe_hierarchical_completion_v1:";
+  requires_hierarchy_ =
+      result.boundary_policy().compare(0, hierarchy_prefix.size(),
+                                       hierarchy_prefix) == 0;
+
+  struct RankedMerge {
+    ExpansionMerge merge;
+    bool hierarchy_gated = false;
+  };
+  std::vector<RankedMerge> merges;
+  for (const auto& m : result.base_merges()) merges.push_back({m, false});
+  for (const auto& m : result.bootstrap_merges()) merges.push_back({m, false});
+  for (const auto& m : result.learned_merges()) {
+    // Only merges learned by a hierarchical continuation are occurrence
+    // conditioned. The inherited/base program is authoritative and remains
+    // unconditional even when it crosses a continuation grammar boundary.
+    merges.push_back({m, requires_hierarchy_});
+  }
   std::sort(merges.begin(), merges.end(),
-            [](const ExpansionMerge& a, const ExpansionMerge& b) {
-              return a.rank() < b.rank();
+            [](const RankedMerge& a, const RankedMerge& b) {
+              return a.merge.rank() < b.merge.rank();
             });
   for (size_t i = 0; i < merges.size(); ++i) {
-    // Effective rank is position in the sorted program, so a table whose
-    // declared ranks are sparse still applies in the intended order.
-    for (const std::string& side : {merges[i].left(), merges[i].right()}) {
+    const ExpansionMerge& merge = merges[i].merge;
+    for (const std::string& side : {merge.left(), merge.right()}) {
       const auto it = piece_to_id_.find(side);
       if (it != piece_to_id_.end() &&
           id_to_type_[it->second] ==
               static_cast<int>(ModelProto::SentencePiece::USER_DEFINED)) {
         status_ = absl::FailedPreconditionError(absl::StrCat(
-            "merge at rank ", merges[i].rank(), " names the USER_DEFINED piece \"",
+            "merge at rank ", merge.rank(), " names the USER_DEFINED piece \"",
             side, "\" as a child; USER_DEFINED pieces are frozen units and "
             "never merge participants"));
         return status_;
       }
     }
-    merge_rank_.emplace(Key(merges[i].left(), merges[i].right()),
-                        static_cast<int>(i));
+    merge_rule_.emplace(
+        Key(merge.left(), merge.right()),
+        MergeRule{static_cast<int>(i), merges[i].hierarchy_gated});
   }
 
   // THE ARTIFACT'S OWN NORMALIZER IS AUTHORITATIVE. Falling back to a default
@@ -172,68 +188,232 @@ bool ExpansionProcessor::IsUserDefined(int id) const {
          static_cast<int>(ModelProto::SentencePiece::USER_DEFINED);
 }
 
-absl::Status ExpansionProcessor::Encode(absl::string_view text,
-                                        std::vector<TokenSpan>* out) const {
+absl::Status ExpansionProcessor::Encode(
+    absl::string_view text, std::vector<TokenSpan>* out) const {
+  if (requires_hierarchy_) {
+    return absl::FailedPreconditionError(
+        "hierarchical ExpansionResult requires per-input completion gates; "
+        "use EncodeWithHierarchy instead of flat Encode");
+  }
+  return EncodeImpl(text, nullptr, out);
+}
+
+absl::Status ExpansionProcessor::EncodeIds(
+    absl::string_view text, std::vector<int>* ids) const {
+  std::vector<TokenSpan> spans;
+  ABSL_RETURN_IF_ERROR(Encode(text, &spans));
+  ids->clear();
+  ids->reserve(spans.size());
+  for (const auto& s : spans) ids->push_back(s.id);
+  return absl::OkStatus();
+}
+
+absl::Status ExpansionProcessor::EncodeWithHierarchy(
+    absl::string_view text, const std::vector<CompletionGate>& gates,
+    std::vector<TokenSpan>* out) const {
+  return EncodeImpl(text, &gates, out);
+}
+
+absl::Status ExpansionProcessor::EncodeIdsWithHierarchy(
+    absl::string_view text, const std::vector<CompletionGate>& gates,
+    std::vector<int>* ids) const {
+  std::vector<TokenSpan> spans;
+  ABSL_RETURN_IF_ERROR(EncodeWithHierarchy(text, gates, &spans));
+  ids->clear();
+  ids->reserve(spans.size());
+  for (const auto& s : spans) ids->push_back(s.id);
+  return absl::OkStatus();
+}
+
+absl::Status ExpansionProcessor::EncodeImpl(
+    absl::string_view text, const std::vector<CompletionGate>* gates,
+    std::vector<TokenSpan>* out) const {
   ABSL_RETURN_IF_ERROR(status_);
+  if (out == nullptr) {
+    return absl::InvalidArgumentError("Encode output must not be null");
+  }
   out->clear();
   const std::string norm = Normalize(text);
 
-  // Atoms: a USER_DEFINED occurrence (longest prefix match, as native
-  // inference does) is one FROZEN unit; everything else is one entry per
-  // UTF-8 character. Each carries its byte span so the spans survive every
-  // merge. Spans are byte offsets into the NORMALIZED text.
-  struct Sym { std::string s; int begin; int end; bool frozen; };
+  // Compile the shallow laminar hierarchy once for this input. The hot path
+  // performs one boundary lookup plus two binary searches over a parent's cuts.
+  absl::flat_hash_map<int, int> gate_at_boundary;
+  if (gates != nullptr) {
+    for (size_t gi = 0; gi < gates->size(); ++gi) {
+      const CompletionGate& gate = (*gates)[gi];
+      if (gate.level <= 0 || gate.cuts.size() < 3 ||
+          !std::is_sorted(gate.cuts.begin(), gate.cuts.end()) ||
+          std::adjacent_find(gate.cuts.begin(), gate.cuts.end()) !=
+              gate.cuts.end()) {
+        return absl::InvalidArgumentError(
+            "completion gate cuts must be strictly increasing with >=2 children");
+      }
+      if (gate.cuts.front() < 0 ||
+          gate.cuts.back() > static_cast<int>(norm.size())) {
+        return absl::InvalidArgumentError(
+            "completion gate lies outside normalized input");
+      }
+      for (int cut : gate.cuts) {
+        if (cut != 0 && cut != static_cast<int>(norm.size()) &&
+            (static_cast<unsigned char>(norm[cut]) & 0xC0) == 0x80) {
+          return absl::InvalidArgumentError(
+              "completion gate cut falls inside a UTF-8 codepoint");
+        }
+      }
+      for (size_t ci = 1; ci + 1 < gate.cuts.size(); ++ci) {
+        if (!gate_at_boundary
+                 .emplace(gate.cuts[ci], static_cast<int>(gi))
+                 .second) {
+          return absl::InvalidArgumentError(
+              "two completion parents claim the same child boundary");
+        }
+      }
+    }
+    for (size_t i = 0; i < gates->size(); ++i) {
+      const auto& a = (*gates)[i].cuts;
+      for (size_t j = i + 1; j < gates->size(); ++j) {
+        const auto& b = (*gates)[j].cuts;
+        const bool disjoint = a.back() <= b.front() || b.back() <= a.front();
+        const bool a_contains = a.front() <= b.front() && b.back() <= a.back();
+        const bool b_contains = b.front() <= a.front() && a.back() <= b.back();
+        if (!(disjoint || a_contains || b_contains)) {
+          return absl::InvalidArgumentError(
+              "completion hierarchy spans are not laminar");
+        }
+      }
+    }
+  } else if (requires_hierarchy_) {
+    return absl::FailedPreconditionError(
+        "hierarchical ExpansionResult requires per-input completion gates");
+  }
+
+  struct Sym {
+    std::string s;
+    int begin = 0;
+    int end = 0;
+    int prev = -1;
+    int next = -1;
+    int version = 0;
+    bool frozen = false;
+    bool alive = true;
+  };
   std::vector<Sym> syms;
   for (size_t i = 0; i < norm.size();) {
     const absl::string_view rest(norm.data() + i, norm.size() - i);
     bool found = false;
     size_t len = 0;
     if (user_defined_matcher_ != nullptr) {
-      len = static_cast<size_t>(user_defined_matcher_->PrefixMatch(rest, &found));
+      len = static_cast<size_t>(
+          user_defined_matcher_->PrefixMatch(rest, &found));
     }
     if (!found) {
       len = std::min<size_t>(string_util::OneCharLen(norm.data() + i),
                              norm.size() - i);
     }
-    syms.push_back({norm.substr(i, len), static_cast<int>(i),
-                    static_cast<int>(i + len), found});
+    const int idx = static_cast<int>(syms.size());
+    syms.push_back(
+        {norm.substr(i, len), static_cast<int>(i),
+         static_cast<int>(i + len), idx - 1, -1, 0, found, true});
+    if (idx > 0) syms[idx - 1].next = idx;
     i += len;
   }
   if (syms.empty()) return absl::OkStatus();
 
-  while (syms.size() > 1) {
-    int best = std::numeric_limits<int>::max();
-    size_t at = syms.size();
-    for (size_t i = 0; i + 1 < syms.size(); ++i) {
-      if (syms[i].frozen || syms[i + 1].frozen) continue;
-      const auto it = merge_rank_.find(Key(syms[i].s, syms[i + 1].s));
-      if (it != merge_rank_.end() && it->second < best) {
-        best = it->second;
-        at = i;   // leftmost occurrence of the best rank wins
-      }
+  auto occurrence_allowed =
+      [&](const Sym& left, const Sym& right, const MergeRule& rule) -> bool {
+    if (!rule.hierarchy_gated) return true;
+    if (gates == nullptr) return false;
+    const int boundary = left.end;
+    if (boundary != right.begin) return false;
+    const auto it = gate_at_boundary.find(boundary);
+    if (it == gate_at_boundary.end()) return true;
+    const CompletionGate& gate = (*gates)[it->second];
+    if (left.begin < gate.cuts.front() || right.end > gate.cuts.back()) {
+      return false;
     }
-    if (at == syms.size()) break;
-    syms[at] = {syms[at].s + syms[at + 1].s, syms[at].begin, syms[at + 1].end,
-                false};
-    syms.erase(syms.begin() + at + 1);
+    return std::binary_search(gate.cuts.begin(), gate.cuts.end(), left.begin) &&
+           std::binary_search(gate.cuts.begin(), gate.cuts.end(), right.end);
+  };
+
+  struct Candidate {
+    int rank;
+    int left;
+    int right;
+    int left_version;
+    int right_version;
+  };
+  struct Worse {
+    bool operator()(const Candidate& a, const Candidate& b) const {
+      if (a.rank != b.rank) return a.rank > b.rank;  // min rank first
+      return a.left > b.left;                        // then leftmost
+    }
+  };
+  std::priority_queue<Candidate, std::vector<Candidate>, Worse> pq;
+
+  auto push_pair = [&](int left, int right) {
+    if (left < 0 || right < 0) return;
+    const Sym& l = syms[left];
+    const Sym& r = syms[right];
+    if (!l.alive || !r.alive || l.next != right || r.prev != left ||
+        l.frozen || r.frozen) {
+      return;
+    }
+    const auto it = merge_rule_.find(Key(l.s, r.s));
+    if (it == merge_rule_.end() || !occurrence_allowed(l, r, it->second)) {
+      return;
+    }
+    pq.push({it->second.rank, left, right, l.version, r.version});
+  };
+
+  for (int i = 0; i + 1 < static_cast<int>(syms.size()); ++i) {
+    push_pair(i, i + 1);
   }
 
-  out->reserve(syms.size());
-  for (const auto& s : syms) {
-    const auto it = piece_to_id_.find(s.s);
-    out->push_back({it == piece_to_id_.end() ? unk_id_ : it->second, s.s,
-                    s.begin, s.end});
-  }
-  return absl::OkStatus();
-}
+  while (!pq.empty()) {
+    const Candidate c = pq.top();
+    pq.pop();
+    Sym& left = syms[c.left];
+    Sym& right = syms[c.right];
+    if (!left.alive || !right.alive || left.version != c.left_version ||
+        right.version != c.right_version || left.next != c.right ||
+        right.prev != c.left) {
+      continue;
+    }
+    const auto rule_it = merge_rule_.find(Key(left.s, right.s));
+    if (rule_it == merge_rule_.end() || rule_it->second.rank != c.rank ||
+        !occurrence_allowed(left, right, rule_it->second)) {
+      continue;
+    }
 
-absl::Status ExpansionProcessor::EncodeIds(absl::string_view text,
-                                           std::vector<int>* ids) const {
-  std::vector<TokenSpan> spans;
-  ABSL_RETURN_IF_ERROR(Encode(text, &spans));
-  ids->clear();
-  ids->reserve(spans.size());
-  for (const auto& s : spans) ids->push_back(s.id);
+    const int prev = left.prev;
+    const int next = right.next;
+    left.s += right.s;
+    left.end = right.end;
+    ++left.version;
+    left.next = next;
+    if (next >= 0) {
+      syms[next].prev = c.left;
+      ++syms[next].version;
+    }
+    right.alive = false;
+    ++right.version;
+
+    push_pair(prev, c.left);
+    push_pair(c.left, next);
+  }
+
+  int at = 0;
+  while (at >= 0 && at < static_cast<int>(syms.size()) &&
+         !syms[at].alive) {
+    at = syms[at].next;
+  }
+  while (at >= 0) {
+    const Sym& sym = syms[at];
+    const auto it = piece_to_id_.find(sym.s);
+    out->push_back({it == piece_to_id_.end() ? unk_id_ : it->second,
+                    sym.s, sym.begin, sym.end});
+    at = sym.next;
+  }
   return absl::OkStatus();
 }
 
