@@ -49,6 +49,11 @@ struct TokenSpan {
   int end = 0;
 };
 
+struct CompletionGate {
+  int level = 0;  // audit/debug label only
+  std::vector<int> cuts;  // normalized UTF-8 child boundaries incl. begin/end
+};
+
 class ExpansionProcessor {
  public:
   ExpansionProcessor() = default;
@@ -59,8 +64,18 @@ class ExpansionProcessor {
 
   const absl::Status& status() const { return status_; }
 
+  // Flat encode fails closed for hierarchical artifacts.
   absl::Status Encode(absl::string_view text, std::vector<TokenSpan>* out) const;
   absl::Status EncodeIds(absl::string_view text, std::vector<int>* ids) const;
+  // Base/bootstrap merges are unconditional; learned continuation merges are
+  // occurrence-locally gated by the supplied grammar completion hierarchy.
+  absl::Status EncodeWithHierarchy(absl::string_view text,
+                                   const std::vector<CompletionGate>& gates,
+                                   std::vector<TokenSpan>* out) const;
+  absl::Status EncodeIdsWithHierarchy(
+      absl::string_view text, const std::vector<CompletionGate>& gates,
+      std::vector<int>* ids) const;
+  bool RequiresHierarchy() const { return requires_hierarchy_; }
   absl::Status Decode(const std::vector<int>& ids, std::string* out) const;
 
   int GetPieceSize() const { return static_cast<int>(id_to_piece_.size()); }
@@ -81,8 +96,9 @@ class ExpansionProcessor {
   absl::Status status_;
   std::vector<std::string> id_to_piece_;
   std::vector<int> id_to_type_;
+  struct MergeRule { int rank = 0; bool hierarchy_gated = false; };
   absl::flat_hash_map<std::string, int> piece_to_id_;
-  absl::flat_hash_map<std::string, int> merge_rank_;  // left \x01 right -> rank
+  absl::flat_hash_map<std::string, MergeRule> merge_rule_;
   std::unique_ptr<normalizer::Normalizer> normalizer_;
   // Longest-prefix matcher over the USER_DEFINED piece strings. Owns nothing;
   // the strings live in id_to_piece_.
@@ -90,6 +106,11 @@ class ExpansionProcessor {
   NormalizerSpec normalizer_spec_;
   int unk_id_ = 0;
   std::string unk_piece_ = "<unk>";
+  bool requires_hierarchy_ = false;
+
+  absl::Status EncodeImpl(absl::string_view text,
+                          const std::vector<CompletionGate>* gates,
+                          std::vector<TokenSpan>* out) const;
 };
 
 }  // namespace sentencepiece::expansion
