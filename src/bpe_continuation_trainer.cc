@@ -131,16 +131,26 @@ ContinuationTrainer::Symbol* ContinuationTrainer::GetPairSymbol(
 void ContinuationTrainer::ComputeFreq(Symbol* symbol) const {
   if (!symbol->needs_recomputation) return;
   symbol->freq = 0;
+  symbol->hierarchy_blocked = false;
   for (auto it = symbol->positions.begin(); it != symbol->positions.end();) {
     const Position pos = DecodePos(*it);
     if (symbol->left != symbols_[pos.sid][pos.left] ||
         symbol->right != symbols_[pos.sid][pos.right]) {
       it = symbol->positions.erase(it);
     } else {
-      symbol->freq += static_cast<uint64_t>(sentences_[pos.sid].second);
+      if (!CanMerge(pos.sid, pos.left, pos.right)) {
+        symbol->hierarchy_blocked = true;
+      } else {
+        symbol->freq += static_cast<uint64_t>(sentences_[pos.sid].second);
+      }
       ++it;
     }
   }
+  // A context-free BPE rank may only be learned when EVERY occurrence that
+  // exists after all earlier ranks is legal.  A blocked occurrence can vanish
+  // later when an earlier-rank child-completion merge consumes one operand, so
+  // this state is intentionally recomputed rather than made permanent.
+  if (symbol->hierarchy_blocked) symbol->freq = 0;
   symbol->needs_recomputation = false;
 }
 
@@ -163,21 +173,14 @@ void ContinuationTrainer::AddNewPair(int sid, int left, int right) {
   if (left == -1 || right == -1) return;
   if (fence_group_[sid][left] != fence_group_[sid][right]) return;
   Symbol* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
-  if (symbol == nullptr) return;
+  if (symbol == nullptr || !symbol->active) return;
 
-  // The exported rank program is global: it cannot say "merge this surface
-  // pair only in these grammar contexts". BoundlessBPE gets this property for
-  // free because its supermerge operands denote whole pretokens. In the deeper
-  // InterMo hierarchy, the same surface pair can occur once as complete
-  // siblings and elsewhere across an unfinished parent. Such a pair is unsafe
-  // as a context-free merge and is therefore permanently retired.
-  if (!CanMerge(sid, left, right)) {
-    symbol->hierarchy_unsafe = true;
-    return;
-  }
-  if (symbol->hierarchy_unsafe || !symbol->active) return;
-
+  // Keep both legal and currently-blocked occurrences.  A pair is eligible
+  // only when ComputeFreq sees that ALL of its current occurrences are legal.
+  // This is rank-local safety: an incomplete occurrence may disappear after a
+  // lower-rank merge completes the child that contains it.
   symbol->positions.insert(EncodePos(sid, left, right));
+  symbol->needs_recomputation = true;
   if (!symbol->pending) {
     symbol->pending = true;
     pending_queue_.push_back(symbol);
@@ -188,7 +191,15 @@ void ContinuationTrainer::ResetFreq(int sid, int left, int right,
                                     const Symbol* best) {
   if (left == -1 || right == -1) return;
   Symbol* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
-  if (symbol != nullptr && symbol != best) symbol->needs_recomputation = true;
+  if (symbol == nullptr || symbol == best || !symbol->active) return;
+  symbol->needs_recomputation = true;
+  // A formerly blocked global pair may become safe precisely because this
+  // adjacency is about to disappear. Requeue it even if no new occurrence of
+  // that pair is created by the accepted merge.
+  if (!symbol->pending) {
+    symbol->pending = true;
+    pending_queue_.push_back(symbol);
+  }
 }
 
 absl::Status ContinuationTrainer::AcceptSymbol(Symbol* symbol) {
@@ -1143,15 +1154,14 @@ absl::Status ContinuationTrainer::ReplayMerges(
           "constraints at effective rank ", merge.rank(), ": ", merge.left(),
           " + ", merge.right()));
     }
-    if (symbol->hierarchy_unsafe) {
-      return absl::FailedPreconditionError(absl::StrCat(
-          label, " merge is context-dependent under the completion hierarchy "
-          "and therefore cannot be represented by the global rank program at "
-          "effective rank ", merge.rank(), ": ", merge.left(), " + ",
-          merge.right()));
-    }
     symbol->needs_recomputation = true;
     ComputeFreq(symbol);
+    if (symbol->hierarchy_blocked) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          label, " merge is context-dependent under the completion hierarchy "
+          "at effective rank ", merge.rank(), ": ", merge.left(), " + ",
+          merge.right()));
+    }
     if (symbol->freq == 0) {
       ++absent;
       continue;
@@ -1185,14 +1195,8 @@ absl::Status ContinuationTrainer::LearnExpansion() {
     }
 
     if (best == nullptr) break;
-    if (best->hierarchy_unsafe) {
-      // Keep the inactive tombstone in symbols_cache_: if this surface pair is
-      // recreated later after some local completions, it is still globally
-      // unsafe because a context-free inference program cannot distinguish the
-      // earlier illegal occurrence.
-      best->active = false;
-      continue;
-    }
+    RET_CHECK(!best->hierarchy_blocked)
+        << "blocked hierarchy pair reached the positive-frequency queue";
     if (!best->IsBigram()) {
       return absl::InternalError("BPE continuation selected a non-bigram");
     }
