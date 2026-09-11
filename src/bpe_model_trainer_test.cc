@@ -463,7 +463,8 @@ TEST(BPETrainerTest, CompletionHierarchyKeepsUserDefinedFrozen) {
   for (const auto& merge : result.learned_merges()) {
     EXPECT_NE("<X>", merge.left());
     EXPECT_NE("<X>", merge.right());
-    EXPECT_EQ(std::string::npos, merge.piece().find("<X>"));
+    EXPECT_EQ(std::string::npos,
+              absl::StrCat(merge.left(), merge.right()).find("<X>"));
   }
 }
 
