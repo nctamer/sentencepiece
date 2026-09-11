@@ -238,6 +238,55 @@ enum ExpansionModelType {
 // Adapter-produced authoritative continuation state. Generic trainer code must
 // not reconstruct merge ranks, IDs, token types, regexes, byte mappings or
 // tokenizer-specific grammar from piece strings.
+// SELF-DESCRIBING CONTINUATION STATE.
+//
+// A continuation artifact used to be auditable only against the training log:
+// the normalizer, the pretokenizer flags and the inherited special-token ABI
+// lived nowhere in the bundle. That made an .expansion unusable on its own,
+// and it let BPE continuation silently train under the CLI's default
+// nmt_nfkc while its own base was built under identity.
+//
+// Every field here answers a question a reader would otherwise have to take
+// on trust. All optional, so old artifacts still parse.
+message ContinuationContract {
+  // The authoritative text pipeline of the INHERITED tokenizer.
+  optional NormalizerSpec normalizer_spec = 1;
+  optional NormalizerSpec denormalizer_spec = 2;
+
+  // The pretokenizer/grammar policy actually used to learn new pieces. These
+  // decide which pieces are POSSIBLE, so they are provenance, not tuning.
+  optional int32 max_sentencepiece_length = 10;
+  optional bool split_by_whitespace = 11;
+  optional bool split_by_unicode_script = 12;
+  optional bool split_by_number = 13;
+  optional bool split_digits = 14;
+  optional bool treat_whitespace_as_suffix = 15;
+  optional bool allow_whitespace_only_pieces = 16;
+  optional bool hard_vocab_limit = 17;
+  optional string input_format = 18;
+  optional int32 input_sentence_size = 19;
+  // Recorded for provenance only. Continuation takes its atomic alphabet from
+  // the inherited piece table, NOT from character_coverage.
+  optional float character_coverage = 20;
+
+  // The inherited special-token ABI. Copying a caller's TrainerSpec defaults
+  // here would describe inherited music pieces at IDs 1 and 2 as BOS/EOS.
+  optional int32 unk_id = 30 [default = 0];
+  optional int32 bos_id = 31 [default = -1];
+  optional int32 eos_id = 32 [default = -1];
+  optional int32 pad_id = 33 [default = -1];
+  optional string unk_piece = 34;
+  optional string unk_surface = 35;
+  optional bool byte_fallback = 36;
+
+  // Inputs, so a bundle identifies what produced it.
+  optional string corpus_sha256 = 40;
+  optional int64 corpus_records = 41;
+  optional int64 corpus_weight = 42;
+  optional string base_id_map_sha256 = 43;   // ordered piece table identity
+  optional string base_merges_sha256 = 44;
+}
+
 message ExpansionSpec {
   optional int32 schema_version = 1 [default = 1];
   required ExpansionModelType model_type = 2;
@@ -254,6 +303,9 @@ message ExpansionSpec {
   optional string tokenizer_sha256 = 13;
   optional string pretokenizer_sha256 = 14;
   optional string boundary_policy = 15;
+
+  // Authoritative inherited tokenizer semantics. See ContinuationContract.
+  optional ContinuationContract contract = 16;
 }
 
 // Self-auditing continuation artifact. This is authoritative for external
@@ -284,6 +336,15 @@ message ExpansionResult {
   optional int32 prior_piece_count = 20 [default = 0];
   optional double unigram_lambda = 21 [default = 0.0];
   optional double unigram_score_gauge_max_error = 22 [default = 0.0];
+
+  // The EFFECTIVE contract this run trained under -- what was actually
+  // used, after reconciliation, not what the caller typed.
+  optional ContinuationContract contract = 23;
+
+  // Native .model emission status, so a consumer knows whether the
+  // explicit program is the only valid tokenizer for this artifact.
+  optional bool native_model_emitted = 24 [default = false];
+  optional string native_model_refusal = 25;
 }
 
 // ModelProto stores model parameters.

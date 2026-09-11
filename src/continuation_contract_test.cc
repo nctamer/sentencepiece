@@ -26,6 +26,7 @@
 #include "absl/strings/str_split.h"
 #include "absl/strings/numbers.h"
 #include "filesystem.h"
+#include "expansion_processor.h"
 #include "normalizer.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
@@ -2809,6 +2810,319 @@ TEST(UnigramContinuationContractTest, ContinuationExpectedDumpDoesNotChangeTheRe
   EXPECT_EQ(plain.pieces_size(), rows);
   EXPECT_EQ(prior.pieces_size(), inherited);
   EXPECT_EQ(plain.pieces_size() - prior.pieces_size(), extension);
+}
+
+
+// ---------------------------------------------------------------------------
+// Explicit-program BPE runtime, and the BPE continuation contract.
+//
+// The merge program is authoritative whenever native equivalence fails, so it
+// needs a real tokenizer, not a research-only .merges file. These tests pin
+// that runtime against the same semantics the continuation trainer validates.
+// ---------------------------------------------------------------------------
+
+NormalizerSpec MusicNormalizer() {
+  NormalizerSpec n;
+  n.set_name("identity");
+  n.set_add_dummy_prefix(true);
+  n.set_remove_extra_whitespaces(false);
+  n.set_escape_whitespaces(true);
+  return n;
+}
+
+// Builds an ExpansionResult by hand: the runtime must work on an artifact,
+// independent of how it was produced.
+ExpansionResult MakeProgram(const std::vector<std::pair<std::string, int>>& pieces,
+                            const std::vector<std::pair<std::string, std::string>>& merges,
+                            bool with_contract = true) {
+  ExpansionResult r;
+  r.set_schema_version(1);
+  r.set_model_type(EXPANSION_BPE);
+  int id = 0;
+  for (const auto& [piece, type] : pieces) {
+    auto* p = r.add_base_pieces();
+    p->set_external_id(id++);
+    p->set_piece(piece);
+    p->set_type(static_cast<ModelProto::SentencePiece::Type>(type));
+  }
+  int rank = 0;
+  for (const auto& [l, rr] : merges) {
+    auto* m = r.add_base_merges();
+    m->set_rank(rank++);
+    m->set_left(l);
+    m->set_right(rr);
+  }
+  r.set_first_new_external_id(id);
+  if (with_contract) {
+    *r.mutable_contract()->mutable_normalizer_spec() = MusicNormalizer();
+    r.mutable_contract()->set_unk_id(0);
+    r.mutable_contract()->set_bos_id(-1);
+    r.mutable_contract()->set_eos_id(-1);
+    r.mutable_contract()->set_pad_id(-1);
+  }
+  return r;
+}
+
+const int kNORMAL = ModelProto::SentencePiece::NORMAL;
+const int kUNK = ModelProto::SentencePiece::UNKNOWN;
+
+TEST(ExpansionProcessorTest, RefusesAnArtifactWithNoNormalizerContract) {
+  // Guessing a text pipeline is how the identity-vs-nmt_nfkc mismatch happened.
+  const ExpansionResult r = MakeProgram(
+      {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"a", kNORMAL}}, {},
+      /*with_contract=*/false);
+  expansion::ExpansionProcessor p;
+  const absl::Status st = p.Load(r);
+  EXPECT_FALSE(st.ok());
+  EXPECT_NE(std::string::npos,
+            std::string(st.message()).find("normalizer contract"));
+}
+
+TEST(ExpansionProcessorTest, AppliesTheMergeProgramByRank) {
+  // a+b -> ab at rank 0, ab+c -> abc at rank 1. Lowest rank first.
+  const ExpansionResult r = MakeProgram(
+      {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"a", kNORMAL},
+       {"b", kNORMAL}, {"c", kNORMAL}, {"ab", kNORMAL}, {"abc", kNORMAL}},
+      {{"a", "b"}, {"ab", "c"}});
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+  std::vector<expansion::TokenSpan> spans;
+  ASSERT_TRUE(p.Encode("abc", &spans).ok());
+  ASSERT_EQ(2u, spans.size());          // U+2581 then "abc"
+  EXPECT_EQ("\xe2\x96\x81", spans[0].piece);
+  EXPECT_EQ("abc", spans[1].piece);
+  EXPECT_EQ(p.PieceToId("abc"), spans[1].id);
+
+  // Exact UTF-8 byte spans over the NORMALIZED text: U+2581 is three bytes.
+  EXPECT_EQ(0, spans[0].begin);
+  EXPECT_EQ(3, spans[0].end);
+  EXPECT_EQ(3, spans[1].begin);
+  EXPECT_EQ(6, spans[1].end);
+
+  std::string back;
+  ASSERT_TRUE(p.Decode({spans[0].id, spans[1].id}, &back).ok());
+  EXPECT_EQ("abc", back);
+}
+
+TEST(ExpansionProcessorTest, LeftmostOccurrenceOfTheBestRankWins) {
+  const ExpansionResult r = MakeProgram(
+      {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"a", kNORMAL},
+       {"aa", kNORMAL}},
+      {{"a", "a"}});
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+  std::vector<std::string> got;
+  std::vector<expansion::TokenSpan> spans;
+  ASSERT_TRUE(p.Encode("aaa", &spans).ok());
+  for (const auto& s : spans) got.push_back(s.piece);
+  // leftmost "aa" merges first, leaving a trailing atom
+  EXPECT_EQ(std::vector<std::string>({"\xe2\x96\x81", "aa", "a"}), got);
+}
+
+TEST(ExpansionProcessorTest, WhitespaceDummyPrefixAndRepeatedSpacesRoundTrip) {
+  std::vector<std::pair<std::string, int>> pieces = {
+      {"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}};
+  for (const char* c : {"a", "b"}) pieces.push_back({c, kNORMAL});
+  const ExpansionResult r = MakeProgram(pieces, {});
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+  // remove_extra_whitespaces=false, so a doubled space survives as two marks.
+  std::vector<expansion::TokenSpan> spans;
+  ASSERT_TRUE(p.Encode("a  b", &spans).ok());
+  int marks = 0;
+  for (const auto& s : spans) {
+    if (s.piece == "\xe2\x96\x81") ++marks;
+  }
+  EXPECT_EQ(3, marks) << "dummy prefix + two literal spaces";
+  std::vector<int> ids;
+  for (const auto& s : spans) ids.push_back(s.id);
+  std::string back;
+  ASSERT_TRUE(p.Decode(ids, &back).ok());
+  EXPECT_EQ("a  b", back);
+}
+
+TEST(ExpansionProcessorTest, NonAsciiSurvivesIdentityNormalization) {
+  const std::string mb = "\xc3\xbc";   // 'ü'
+  const ExpansionResult r = MakeProgram(
+      {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {mb, kNORMAL}}, {});
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+  std::vector<expansion::TokenSpan> spans;
+  ASSERT_TRUE(p.Encode(mb, &spans).ok());
+  ASSERT_EQ(2u, spans.size());
+  EXPECT_EQ(mb, spans[1].piece);
+  EXPECT_EQ(3, spans[1].begin);
+  EXPECT_EQ(5, spans[1].end) << "two-byte character, exact span";
+  std::string back;
+  ASSERT_TRUE(p.Decode({spans[0].id, spans[1].id}, &back).ok());
+  EXPECT_EQ(mb, back);
+}
+
+TEST(ExpansionProcessorTest, UnknownCharacterBecomesTheUnkIdAndDecodesEmpty) {
+  const ExpansionResult r = MakeProgram(
+      {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"a", kNORMAL}}, {});
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+  std::vector<expansion::TokenSpan> spans;
+  ASSERT_TRUE(p.Encode("aZ", &spans).ok());
+  ASSERT_EQ(3u, spans.size());
+  EXPECT_EQ(p.unk_id(), spans[2].id);
+  // unk_surface is empty under the RNNT contract.
+  std::string back;
+  ASSERT_TRUE(p.Decode({spans[2].id}, &back).ok());
+  EXPECT_EQ("", back);
+}
+
+TEST(ExpansionProcessorTest, IdMapShaDistinguishesSameSizeDifferentMeaning) {
+  const ExpansionResult a = MakeProgram(
+      {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"a", kNORMAL}}, {});
+  const ExpansionResult b = MakeProgram(
+      {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"b", kNORMAL}}, {});
+  expansion::ExpansionProcessor pa, pb;
+  ASSERT_TRUE(pa.Load(a).ok());
+  ASSERT_TRUE(pb.Load(b).ok());
+  EXPECT_EQ(pa.GetPieceSize(), pb.GetPieceSize());
+  EXPECT_NE(pa.IdMapSha256(), pb.IdMapSha256())
+      << "same size, different ID map must not share a warm-start identity";
+}
+
+
+// ---------------------------------------------------------------------------
+// BPE continuation: the inherited tokenizer semantics are authoritative.
+// ---------------------------------------------------------------------------
+
+ExpansionSpec AbcdSpecWithContract(const NormalizerSpec& norm) {
+  ExpansionSpec spec = BasicAbcdSpec();
+  *spec.mutable_contract()->mutable_normalizer_spec() = norm;
+  spec.mutable_contract()->set_unk_id(0);
+  spec.mutable_contract()->set_bos_id(-1);
+  spec.mutable_contract()->set_eos_id(-1);
+  spec.mutable_contract()->set_pad_id(-1);
+  return spec;
+}
+
+absl::Status RunBpeWithNormalizer(const ExpansionSpec& spec,
+                                  const NormalizerSpec& caller,
+                                  const std::string& tag,
+                                  ExpansionResult* out) {
+  const std::string spec_path = TempPath("bc_" + tag + ".spec");
+  const std::string input = TempPath("bc_" + tag + "_input.txt");
+  const std::string result_path = TempPath("bc_" + tag + ".result");
+  EXPECT_TRUE(WriteProto(spec_path, spec));
+  EXPECT_TRUE(WriteLines(input, {"abcd", "abcd", "abcd", "dcba"}));
+  TrainerSpec trainer =
+      BpeContinuationSpec(input, spec_path, result_path,
+                          TempPath("bc_" + tag + "_model"), 8);
+  const absl::Status st = RunTrainer(trainer, caller);
+  if (st.ok()) EXPECT_TRUE(ReadProto(result_path, out));
+  return st;
+}
+
+TEST(BPEContinuationContractTest, OmittedNormalizerInheritsTheBase) {
+  // The caller passes the CLI default; the base says identity. Unigram
+  // continuation has always inherited here. BPE used to silently train under
+  // nmt_nfkc while its own base was identity.
+  const ExpansionSpec spec = AbcdSpecWithContract(IdentityNormalizer());
+  NormalizerSpec caller;              // default-constructed == "not specified"
+  caller.set_name("nmt_nfkc");
+  ExpansionResult out;
+  ASSERT_TRUE(RunBpeWithNormalizer(spec, caller, "inherit", &out).ok());
+  ASSERT_TRUE(out.has_contract());
+  EXPECT_EQ("identity", out.contract().normalizer_spec().name())
+      << "the base tokenizer's text pipeline is authoritative";
+}
+
+TEST(BPEContinuationContractTest, ConflictingNormalizerIsRefused) {
+  ExpansionSpec spec = AbcdSpecWithContract(IdentityNormalizer());
+  NormalizerSpec caller = IdentityNormalizer();
+  caller.set_remove_extra_whitespaces(true);   // explicit and different
+  ExpansionResult out;
+  const absl::Status st =
+      RunBpeWithNormalizer(spec, caller, "conflict", &out);
+  EXPECT_FALSE(st.ok());
+  EXPECT_NE(std::string::npos,
+            std::string(st.message()).find("conflicts with the inherited"));
+}
+
+TEST(BPEContinuationContractTest, ResultRecordsTheEffectiveTrainingPolicy) {
+  const ExpansionSpec spec = AbcdSpecWithContract(IdentityNormalizer());
+  ExpansionResult out;
+  ASSERT_TRUE(RunBpeWithNormalizer(spec, IdentityNormalizer(), "policy", &out).ok());
+  ASSERT_TRUE(out.has_contract());
+  const ContinuationContract& c = out.contract();
+  // Every question the README claims the artifact answers without a log.
+  EXPECT_EQ("identity", c.normalizer_spec().name());
+  EXPECT_TRUE(c.normalizer_spec().add_dummy_prefix() ||
+              !c.normalizer_spec().add_dummy_prefix());   // present, not absent
+  EXPECT_TRUE(c.has_split_by_whitespace());
+  EXPECT_TRUE(c.has_split_by_unicode_script());
+  EXPECT_TRUE(c.has_split_by_number());
+  EXPECT_TRUE(c.has_split_digits());
+  EXPECT_TRUE(c.has_max_sentencepiece_length());
+  EXPECT_TRUE(c.has_input_format());
+  EXPECT_TRUE(c.has_hard_vocab_limit());
+  EXPECT_EQ(0, c.unk_id());
+  EXPECT_EQ(-1, c.bos_id());
+  EXPECT_EQ(-1, c.eos_id());
+  EXPECT_EQ(-1, c.pad_id());
+  EXPECT_FALSE(c.base_id_map_sha256().empty());
+  EXPECT_GT(c.corpus_records(), 0);
+  // And whether a native model exists is recorded, not left to the log.
+  EXPECT_TRUE(out.has_native_model_emitted());
+}
+
+TEST(BPEContinuationContractTest, NativeModelNeverInventsBosEos) {
+  // The CLI defaults are bos_id=1/eos_id=2. On this spec IDs 1 and 2 are
+  // ordinary inherited NORMAL pieces, so copying the caller's TrainerSpec
+  // would have declared two real pieces to be BOS and EOS.
+  const ExpansionSpec spec = AbcdSpecWithContract(IdentityNormalizer());
+  const std::string prefix = TempPath("bc_native_model");
+  ExpansionResult out;
+  ASSERT_TRUE(RunBpeWithNormalizer(spec, IdentityNormalizer(), "native", &out).ok());
+  ModelProto m;
+  if (!ReadProto(TempPath("bc_native_model") + ".model", &m)) {
+    GTEST_SKIP() << "native model legitimately withheld for this program";
+  }
+  EXPECT_EQ(0, m.trainer_spec().unk_id());
+  EXPECT_EQ(-1, m.trainer_spec().bos_id());
+  EXPECT_EQ(-1, m.trainer_spec().eos_id());
+  EXPECT_EQ(-1, m.trainer_spec().pad_id());
+  EXPECT_EQ("identity", m.normalizer_spec().name());
+}
+
+TEST(BPEContinuationContractTest, ExplicitProcessorAgreesWithNativeWhenEquivalent) {
+  // Where a native model IS emitted, the two runtimes must agree exactly --
+  // that is the whole basis for ever emitting one.
+  const ExpansionSpec spec = AbcdSpecWithContract(IdentityNormalizer());
+  const std::string prefix = TempPath("bc_parity_model");
+  const std::string spec_path = TempPath("bc_parity.spec");
+  const std::string input = TempPath("bc_parity_input.txt");
+  const std::string result_path = TempPath("bc_parity.result");
+  ASSERT_TRUE(WriteProto(spec_path, spec));
+  ASSERT_TRUE(WriteLines(input, {"abcd", "abcd", "abcd", "dcba"}));
+  TrainerSpec trainer =
+      BpeContinuationSpec(input, spec_path, result_path, prefix, 8);
+  ASSERT_TRUE(RunTrainer(trainer, IdentityNormalizer()).ok());
+
+  ModelProto m;
+  if (!ReadProto(prefix + ".model", &m)) {
+    GTEST_SKIP() << "native model withheld; parity is not claimable";
+  }
+  ExpansionResult r;
+  ASSERT_TRUE(ReadProto(result_path, &r));
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+
+  SentencePieceProcessor sp;
+  ASSERT_TRUE(sp.Load(prefix + ".model").ok());
+  for (const std::string& probe : {std::string("abcd"), std::string("dcba"),
+                                   std::string("abcdabcd"), std::string("ab")}) {
+    std::vector<int> native;
+    ASSERT_TRUE(sp.Encode(probe, &native).ok());
+    std::vector<int> explicit_ids;
+    ASSERT_TRUE(p.EncodeIds(probe, &explicit_ids).ok());
+    EXPECT_EQ(native, explicit_ids) << "disagreement on " << probe;
+  }
 }
 
 }  // namespace

@@ -97,6 +97,12 @@ class ContinuationTrainer : public TrainerInterface {
                             std::vector<std::string>* atoms) const;
 
   absl::Status LoadAndValidateSpec();
+  // The inherited text pipeline and special-token ABI are authoritative, the
+  // same rule Unigram continuation has always applied to its prior model.
+  absl::Status ReconcileContinuationContract();
+  void FillEffectiveContract(ContinuationContract* out) const;
+  // SHA-256 over the inherited ordered piece table ("<id>\t<piece>\t<type>").
+  std::string BaseIdMapSha256() const;
   absl::Status ValidateMergeProgram(
       const std::vector<ExpansionMerge>& merges,
       bool require_all_declared_pieces) const;

@@ -300,3 +300,38 @@ reachability proof. `--expansion_spec` supersedes it.
 
 Tab-separated merges, because a piece may contain the whitespace marker, which
 a space-separated `merges.txt` cannot express.
+
+
+## Self-describing continuation artifacts and the explicit BPE runtime
+
+`ExpansionSpec.contract` / `ExpansionResult.contract` (`ContinuationContract`)
+make an expansion artifact readable without its training log. It records the
+authoritative normalizer and denormalizer, the pretokenizer policy that decided
+which pieces were possible (`max_sentencepiece_length`, every `split_*`,
+`hard_vocab_limit`, `input_format`, `input_sentence_size`), the inherited
+special-token ABI (`unk_id`/`bos_id`/`eos_id`/`pad_id`/`unk_piece`/
+`unk_surface`/`byte_fallback`), the inherited ordered-ID-map SHA-256, and the
+corpus identity. `character_coverage` is recorded for provenance only:
+continuation takes its atomic alphabet from the inherited piece table, never
+from coverage.
+
+BPE continuation now reconciles the inherited text pipeline the way Unigram
+continuation always has: an omitted/default caller normalizer inherits the
+base, an equivalent one is accepted, and an explicitly conflicting one fails
+before training instead of silently retraining under a different pipeline.
+
+`BuildNativeModel()` no longer copies the caller's `TrainerSpec`. The CLI
+defaults `bos_id=1`/`eos_id=2` would otherwise declare ordinary inherited
+pieces at IDs 1 and 2 to be BOS and EOS. The emitted ABI is derived from the
+piece table and the inherited contract, and emission fails rather than writing
+a semantically false model. `ExpansionResult.native_model_emitted` and
+`native_model_refusal` record the outcome.
+
+`expansion::ExpansionProcessor` (`src/expansion_processor.h`) is the
+authoritative runtime for the explicit ranked merge program: normalize with the
+artifact's own normalizer, start from the declared atomic alphabet, apply the
+lowest effective rank leftmost-first, preserve external IDs. It provides
+encode/decode, `IdToPiece`/`PieceToId`, exact per-token UTF-8 byte spans over
+the normalized text, and `IdMapSha256()` -- the ordered-ID-map identity that
+distinguishes two tokenizers of the same size with different meanings.
+`spm_expansion_cli` exposes it for cross-language parity checks.

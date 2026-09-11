@@ -1005,6 +1005,120 @@ absl::Status ContinuationTrainer::VerifyNativeMergeEquivalence(
   return absl::OkStatus();
 }
 
+// RECONCILE THE INHERITED TEXT PIPELINE.
+//
+// Unigram continuation has always treated its prior model's normalizer as
+// authoritative (unigram_continuation_trainer.cc, ReconcileNormalization).
+// BPE continuation did not, and passed the CALLER's spec straight to the
+// corpus loader. A run that omitted --normalization_rule_name therefore
+// trained under the CLI default nmt_nfkc while its own base had been built
+// under identity -- an internally inconsistent pipeline that no log line
+// flagged. Measured on the music corpus the two agreed on 200k/200k records,
+// so nothing shipped was wrong; that was luck, not a contract.
+//
+// Rule, identical to Unigram's:
+//   caller omitted / left at default -> inherit the base normalizer
+//   caller equals the base           -> accept
+//   caller conflicts explicitly      -> fail BEFORE training
+absl::Status ContinuationTrainer::ReconcileContinuationContract() {
+  if (!expansion_spec_.has_contract()) {
+    // Pre-contract artifact: nothing authoritative to inherit. Keep the
+    // caller's pipeline and say so in the effective contract.
+    return absl::OkStatus();
+  }
+  const ContinuationContract& base = expansion_spec_.contract();
+  if (base.has_normalizer_spec()) {
+    const NormalizerSpec& want = base.normalizer_spec();
+    NormalizerSpec have = normalizer_spec_;
+    const bool caller_is_default =
+        have.name().empty() || have.name() == "nmt_nfkc";
+    if (caller_is_default) {
+      normalizer_spec_ = want;
+    } else {
+      NormalizerSpec a = want, b = have;
+      a.clear_precompiled_charsmap();
+      b.clear_precompiled_charsmap();
+      if (a.SerializeAsString() != b.SerializeAsString()) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "BPE continuation normalizer conflicts with the inherited "
+            "tokenizer: base name=", want.name(),
+            " add_dummy_prefix=", want.add_dummy_prefix(),
+            " remove_extra_whitespaces=", want.remove_extra_whitespaces(),
+            " escape_whitespaces=", want.escape_whitespaces(),
+            " but caller asked for name=", have.name(),
+            " add_dummy_prefix=", have.add_dummy_prefix(),
+            " remove_extra_whitespaces=", have.remove_extra_whitespaces(),
+            " escape_whitespaces=", have.escape_whitespaces(),
+            ". The base tokenizer's text pipeline is authoritative; omit the "
+            "normalizer flags to inherit it, or pass exactly the same ones."));
+      }
+      normalizer_spec_ = want;
+    }
+  }
+  if (base.has_denormalizer_spec() &&
+      denormalizer_spec_.normalization_rule_tsv().empty()) {
+    denormalizer_spec_ = base.denormalizer_spec();
+  }
+  return absl::OkStatus();
+}
+
+// The EFFECTIVE contract: what this run actually trained under, after
+// reconciliation. Written into ExpansionResult so the artifact answers
+// "which normalizer / which split_* / which special tokens" without a log.
+void ContinuationTrainer::FillEffectiveContract(ContinuationContract* out) const {
+  if (expansion_spec_.has_contract()) *out = expansion_spec_.contract();
+  *out->mutable_normalizer_spec() = normalizer_spec_;
+  if (!denormalizer_spec_.normalization_rule_tsv().empty()) {
+    *out->mutable_denormalizer_spec() = denormalizer_spec_;
+  }
+  out->set_max_sentencepiece_length(trainer_spec_.max_sentencepiece_length());
+  out->set_split_by_whitespace(trainer_spec_.split_by_whitespace());
+  out->set_split_by_unicode_script(trainer_spec_.split_by_unicode_script());
+  out->set_split_by_number(trainer_spec_.split_by_number());
+  out->set_split_digits(trainer_spec_.split_digits());
+  out->set_treat_whitespace_as_suffix(trainer_spec_.treat_whitespace_as_suffix());
+  out->set_allow_whitespace_only_pieces(
+      trainer_spec_.allow_whitespace_only_pieces());
+  out->set_hard_vocab_limit(trainer_spec_.hard_vocab_limit());
+  out->set_input_format(trainer_spec_.input_format());
+  out->set_input_sentence_size(
+      static_cast<int32_t>(trainer_spec_.input_sentence_size()));
+  out->set_character_coverage(trainer_spec_.character_coverage());
+  out->set_corpus_records(static_cast<int64_t>(corpus_.sentences.size()));
+  out->set_corpus_weight(corpus_.weighted_sentence_count);
+  // Special-token ABI is INHERITED, never taken from this run's CLI. If the
+  // base carried none, derive what the piece table actually shows.
+  if (!expansion_spec_.has_contract() ||
+      !expansion_spec_.contract().has_unk_id()) {
+    int unk_id = -1;
+    for (const auto& p : base_pieces_) {
+      if (p.type() == ModelProto::SentencePiece::UNKNOWN) unk_id = p.external_id();
+    }
+    out->set_unk_id(unk_id);
+    out->set_bos_id(-1);
+    out->set_eos_id(-1);
+    out->set_pad_id(-1);
+  }
+  out->set_base_id_map_sha256(BaseIdMapSha256());
+}
+
+// Identity of the inherited ordered piece table: "<id>\t<piece>\t<type>" per
+// line. Two tokenizers with the same size and different meanings differ here.
+std::string ContinuationTrainer::BaseIdMapSha256() const {
+  std::vector<ExpansionPiece> pieces = base_pieces_;
+  pieces.insert(pieces.end(), bootstrap_pieces_.begin(), bootstrap_pieces_.end());
+  std::sort(pieces.begin(), pieces.end(),
+            [](const ExpansionPiece& a, const ExpansionPiece& b) {
+              return a.external_id() < b.external_id();
+            });
+  std::string blob;
+  for (const auto& p : pieces) {
+    absl::StrAppend(&blob, p.external_id(), "\t", p.piece(), "\t",
+                    static_cast<int>(p.type()), "\n");
+  }
+  return continuation::Sha256Hex(blob);
+}
+
 absl::Status ContinuationTrainer::BuildNativeModel(
     const std::vector<ExpansionMerge>& merges, ModelProto* model) const {
   std::vector<ExpansionPiece> pieces = base_pieces_;
@@ -1056,8 +1170,59 @@ absl::Status ContinuationTrainer::BuildNativeModel(
     out->set_score(it == rank_of.end() ? 0.0F
                                        : -static_cast<float>(it->second));
   }
-  *model->mutable_trainer_spec() = trainer_spec_;
-  model->mutable_trainer_spec()->set_vocab_size(model->pieces_size());
+  // SPECIAL-TOKEN METADATA IS INHERITED, NOT COPIED FROM THIS RUN'S CLI.
+  //
+  // Copying trainer_spec_ wholesale wrote the CLI defaults bos_id=1/eos_id=2
+  // into the emitted model. On a music tokenizer those IDs are ordinary
+  // inherited pieces, so the .model would have declared two real pieces to be
+  // BOS and EOS -- a semantically false artifact that loads without complaint.
+  // Derive the ABI from the piece table and the inherited contract instead,
+  // and refuse to emit rather than write something untrue.
+  TrainerSpec spec = trainer_spec_;
+  spec.set_vocab_size(model->pieces_size());
+  int unk_id = -1;
+  for (int i = 0; i < model->pieces_size(); ++i) {
+    if (model->pieces(i).type() == ModelProto::SentencePiece::UNKNOWN) unk_id = i;
+  }
+  if (unk_id < 0) {
+    return absl::FailedPreconditionError(
+        "native model has no UNKNOWN piece; refusing to emit");
+  }
+  spec.set_unk_id(unk_id);
+
+  auto declared = [&](int id, ModelProto::SentencePiece::Type want,
+                      const char* what) -> absl::Status {
+    if (id < 0) return absl::OkStatus();
+    if (id >= model->pieces_size() || model->pieces(id).type() != want) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "inherited contract declares ", what, "=", id,
+          " but that ID is not a CONTROL piece in the inherited table; "
+          "refusing to emit a native model whose special-token metadata "
+          "contradicts its own pieces"));
+    }
+    return absl::OkStatus();
+  };
+  int bos = -1, eos = -1, pad = -1;
+  if (expansion_spec_.has_contract()) {
+    const ContinuationContract& c = expansion_spec_.contract();
+    bos = c.bos_id(); eos = c.eos_id(); pad = c.pad_id();
+    if (c.has_unk_id() && c.unk_id() != unk_id) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "inherited contract declares unk_id=", c.unk_id(),
+          " but the piece table's UNKNOWN is at ", unk_id));
+    }
+    if (c.has_unk_piece()) spec.set_unk_piece(c.unk_piece());
+    if (c.has_unk_surface()) spec.set_unk_surface(c.unk_surface());
+    if (c.has_byte_fallback()) spec.set_byte_fallback(c.byte_fallback());
+  }
+  ABSL_RETURN_IF_ERROR(declared(bos, ModelProto::SentencePiece::CONTROL, "bos_id"));
+  ABSL_RETURN_IF_ERROR(declared(eos, ModelProto::SentencePiece::CONTROL, "eos_id"));
+  ABSL_RETURN_IF_ERROR(declared(pad, ModelProto::SentencePiece::CONTROL, "pad_id"));
+  spec.set_bos_id(bos);
+  spec.set_eos_id(eos);
+  spec.set_pad_id(pad);
+
+  *model->mutable_trainer_spec() = spec;
   *model->mutable_normalizer_spec() = normalizer_spec_;
   if (!denormalizer_spec_.normalization_rule_tsv().empty()) {
     *model->mutable_denormalizer_spec() = denormalizer_spec_;
@@ -1154,8 +1319,20 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
         continuation::WriteExpansionResult(result_path, result));
   }
 
+  FillEffectiveContract(result.mutable_contract());
+
   ModelProto native;
   absl::Status native_status = BuildNativeModel(effective, &native);
+  result.set_native_model_emitted(native_status.ok());
+  if (!native_status.ok()) {
+    result.set_native_model_refusal(std::string(native_status.message()));
+  }
+  if (!result_path.empty()) {
+    // Rewrite the sidecar now that native status is known, so a reader never
+    // sees an artifact that claims nothing about native representability.
+    ABSL_RETURN_IF_ERROR(
+        continuation::WriteExpansionResult(result_path, result));
+  }
   if (native_status.ok()) {
     *native.mutable_expansion_result() = result;
     if (output_model_proto_ != nullptr) {
@@ -1196,6 +1373,7 @@ absl::Status ContinuationTrainer::Train() {
   pending_queue_.clear();
 
   ABSL_RETURN_IF_ERROR(LoadAndValidateSpec());
+  ABSL_RETURN_IF_ERROR(ReconcileContinuationContract());
   ABSL_RETURN_IF_ERROR(continuation::LoadPreparedCorpus(
       trainer_spec_, normalizer_spec_, components_, &corpus_));
   ABSL_RETURN_IF_ERROR(InitializeCorpusSymbols());
