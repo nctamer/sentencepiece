@@ -145,18 +145,19 @@ void ContinuationTrainer::ComputeFreq(Symbol* symbol) const {
 }
 
 int ContinuationTrainer::GetNextIndex(int sid, int index) const {
-  for (size_t i = static_cast<size_t>(index + 1); i < symbols_[sid].size();
-       ++i) {
-    if (symbols_[sid][i] != nullptr) return static_cast<int>(i);
+  if (sid < 0 || sid >= static_cast<int>(next_live_.size()) ||
+      index < 0 || index >= static_cast<int>(next_live_[sid].size())) {
+    return -1;
   }
-  return -1;
+  return next_live_[sid][index];
 }
 
 int ContinuationTrainer::GetPrevIndex(int sid, int index) const {
-  for (int i = index - 1; i >= 0; --i) {
-    if (symbols_[sid][i] != nullptr) return i;
+  if (sid < 0 || sid >= static_cast<int>(prev_live_.size()) ||
+      index < 0 || index >= static_cast<int>(prev_live_[sid].size())) {
+    return -1;
   }
-  return -1;
+  return prev_live_[sid][index];
 }
 
 void ContinuationTrainer::AddNewPair(int sid, int left, int right) {
@@ -201,6 +202,10 @@ absl::Status ContinuationTrainer::AcceptSymbol(Symbol* symbol) {
 
     symbols_[pos.sid][pos.left] = symbol;
     symbols_[pos.sid][pos.right] = nullptr;
+    next_live_[pos.sid][pos.left] = next;
+    if (next != -1) prev_live_[pos.sid][next] = pos.left;
+    prev_live_[pos.sid][pos.right] = -1;
+    next_live_[pos.sid][pos.right] = -1;
     if (!span_end_.empty()) {
       span_end_[pos.sid][pos.left] = span_end_[pos.sid][pos.right];
     }
@@ -1120,6 +1125,8 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
   fence_group_.assign(sentences_.size(), {});
   span_begin_.assign(sentences_.size(), {});
   span_end_.assign(sentences_.size(), {});
+  prev_live_.assign(sentences_.size(), {});
+  next_live_.assign(sentences_.size(), {});
 
   // EncodePos packs the two symbol indexes of a position into 16 bits each.
   // An over-long record is a legitimate input, not a programming error, so it
@@ -1176,8 +1183,12 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
       }
     }
 
-    for (Symbol* symbol : record) {
+    for (size_t ri = 0; ri < record.size(); ++ri) {
+      Symbol* symbol = record[ri];
       symbols_[sid].push_back(symbol);
+      prev_live_[sid].push_back(ri == 0 ? -1 : static_cast<int>(ri - 1));
+      next_live_[sid].push_back(
+          ri + 1 == record.size() ? -1 : static_cast<int>(ri + 1));
       // A frozen USER_DEFINED unit is not addressable by a merge, so it is
       // deliberately absent from live_by_string_.
       if (!symbol->frozen) live_by_string_[symbol->ToString()] = symbol;
@@ -1895,6 +1906,8 @@ absl::Status ContinuationTrainer::Train() {
   allocated_.clear();
   symbols_cache_.clear();
   symbols_.clear();
+  prev_live_.clear();
+  next_live_.clear();
   pq_ = decltype(pq_)();
   pending_queue_.clear();
 
@@ -1926,6 +1939,8 @@ absl::Status ContinuationTrainer::Train() {
   symbols_cache_.clear();
   live_by_string_.clear();
   symbols_.clear();
+  prev_live_.clear();
+  next_live_.clear();
   pq_ = decltype(pq_)();
   pending_queue_.clear();
   return absl::OkStatus();
