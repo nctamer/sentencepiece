@@ -12,6 +12,7 @@
 #include <memory>
 #include <queue>
 #include <set>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,23 @@ class ContinuationTrainer : public TrainerInterface {
     int right;
   };
 
+  // One grammar parent whose direct children partition [begin,end). `cuts`
+  // contains begin, every direct-child boundary, and end. Crossing one of
+  // its internal cuts is legal only when both current tokens start/end on cuts
+  // of this same parent: each side is therefore a whole child or a consecutive
+  // union of whole children.
+  struct HierarchyGate {
+    size_t begin = 0;
+    size_t end = 0;
+    int level = 0;
+    std::vector<size_t> cuts;
+  };
+
+  struct HierarchyRecord {
+    std::vector<HierarchyGate> gates;
+    absl::flat_hash_map<size_t, int> gate_at_boundary;
+  };
+
   struct QueueEntry {
     uint64_t freq;
     Symbol* symbol;
@@ -100,6 +118,14 @@ class ContinuationTrainer : public TrainerInterface {
   absl::Status AcceptSymbol(Symbol* symbol);
   void DrainPendingQueue();
 
+  // Completion-gated hierarchy. Empty bpe_hierarchy_file means ordinary
+  // continuation semantics. The sidecar is keyed by the already-normalized
+  // corpus surface, so it remains aligned after PreparedCorpus aggregation.
+  absl::Status LoadHierarchy();
+  bool CanMerge(int sid, int left, int right) const;
+  int GrammarLevelForPair(int sid, int left, int right) const;
+  int MaxGrammarLevel(const Symbol* symbol) const;
+
   // Segments `text` into the declared reversible atomic alphabet. Exactly one
   // segmentation is required: zero parses means the adapter omitted an atom,
   // and multiple parses mean the alphabet representation is ambiguous.
@@ -108,9 +134,10 @@ class ContinuationTrainer : public TrainerInterface {
   // Segments one record into corpus symbols: USER_DEFINED occurrences first
   // (longest prefix match, the native rule), each one frozen; every run of
   // text between them through SegmentAtoms.
-  absl::Status SegmentRecord(absl::string_view text,
-                             std::vector<Symbol*>* symbols,
-                             std::vector<int>* fence_groups);
+  absl::Status SegmentRecord(
+      absl::string_view text, std::vector<Symbol*>* symbols,
+      std::vector<int>* fence_groups,
+      std::vector<std::pair<size_t, size_t>>* byte_spans);
   // --continuation_fence_strings for BPE: the same G3 semantics as Unigram
   // continuation (logical strings normalized with the effective normalizer,
   // occurrences unioned, no piece may overlap a fenced character).
@@ -174,6 +201,15 @@ class ContinuationTrainer : public TrainerInterface {
   // whose two positions carry different groups is never formed, so no merge
   // starts inside, ends inside, contains or spans a fence occurrence.
   std::vector<std::vector<int>> fence_group_;
+
+  // Optional completion-gated grammar state, one entry per PreparedCorpus row.
+  // span_begin_/span_end_ are indexed like symbols_; a merge keeps the left
+  // slot and extends its end to the consumed right token's end.
+  std::vector<HierarchyRecord> hierarchy_;
+  std::vector<std::vector<size_t>> span_begin_;
+  std::vector<std::vector<size_t>> span_end_;
+  std::string hierarchy_sha256_;
+
   std::vector<std::string> atomic_pieces_ordered_;
   absl::flat_hash_map<std::string, Symbol*> live_by_string_;
 
