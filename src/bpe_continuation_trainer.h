@@ -125,7 +125,7 @@ class ContinuationTrainer : public TrainerInterface {
   // After inherited/base replay, discard the ungated candidate index and
   // rebuild it from the CURRENT segmentation with occurrence-local hierarchy
   // eligibility. Inherited merges themselves are never hierarchy-gated.
-  void RebuildHierarchyCandidateIndex();
+  absl::Status RebuildHierarchyCandidateIndex();
 
   // Completion-gated hierarchy. Empty bpe_hierarchy_file means ordinary
   // continuation semantics. The sidecar is keyed by the already-normalized
