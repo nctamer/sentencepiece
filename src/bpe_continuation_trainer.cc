@@ -165,12 +165,14 @@ void ContinuationTrainer::AddNewPair(int sid, int left, int right) {
   Symbol* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
   if (symbol == nullptr) return;
 
-  // Hierarchy eligibility is occurrence-local. The same surface pair may be
-  // eligible in one record and blocked in another (for example /+12 in /12
-  // versus the prefix /+12 inside /128). Only the eligible occurrence enters
-  // this candidate's count/index; an ineligible occurrence must not poison the
-  // pair globally.
-  if (!CanMerge(sid, left, right) || !symbol->active) return;
+  // Hierarchy eligibility is occurrence-local for NEW continuation merges.
+  // During inherited/base replay hierarchy_gating_enabled_ is false: the
+  // inherited tokenizer is authoritative and its merges must fire exactly as
+  // they did before this continuation grammar existed.
+  if ((hierarchy_gating_enabled_ && !CanMerge(sid, left, right)) ||
+      !symbol->active) {
+    return;
+  }
 
   symbol->positions.insert(EncodePos(sid, left, right));
   if (!symbol->pending) {
@@ -219,6 +221,35 @@ void ContinuationTrainer::DrainPendingQueue() {
     pq_.push({symbol->freq, symbol});
   }
   pending_queue_.clear();
+}
+
+void ContinuationTrainer::RebuildHierarchyCandidateIndex() {
+  // Inherited replay deliberately indexed every live pair occurrence. Those
+  // counts are not the continuation counts: discard them and rebuild exactly
+  // once from the post-replay segmentation with occurrence-local eligibility.
+  pq_ = decltype(pq_)();
+  pending_queue_.clear();
+  for (auto& owned : allocated_) {
+    Symbol* symbol = owned.get();
+    if (!symbol->IsBigram() || !symbol->active) continue;
+    symbol->positions.clear();
+    symbol->freq = 0;
+    symbol->pending = false;
+    symbol->needs_recomputation = false;
+  }
+
+  hierarchy_gating_enabled_ = true;
+  for (size_t sid = 0; sid < symbols_.size(); ++sid) {
+    int left = -1;
+    for (size_t i = 0; i < symbols_[sid].size(); ++i) {
+      if (symbols_[sid][i] == nullptr) continue;
+      if (left != -1) {
+        AddNewPair(static_cast<int>(sid), left, static_cast<int>(i));
+      }
+      left = static_cast<int>(i);
+    }
+  }
+  DrainPendingQueue();
 }
 
 absl::Status ContinuationTrainer::SegmentAtoms(
@@ -1138,8 +1169,9 @@ absl::Status ContinuationTrainer::ReplayMerges(
           "constraints at effective rank ", merge.rank(), ": ", merge.left(),
           " + ", merge.right()));
     }
-    // positions contains only hierarchy-eligible occurrences at this rank.
-    // Replaying a global pair therefore mutates only those occurrences.
+    // During inherited/base replay hierarchy gating is disabled, so this
+    // pair's positions are every live occurrence. The continuation hierarchy
+    // is allowed to constrain only merges learned after this prefix.
     symbol->needs_recomputation = true;
     ComputeFreq(symbol);
     if (symbol->freq == 0) {
@@ -1807,6 +1839,7 @@ absl::Status ContinuationTrainer::Train() {
   span_begin_.clear();
   span_end_.clear();
   hierarchy_sha256_.clear();
+  hierarchy_gating_enabled_ = false;
   live_by_string_.clear();
   base_pieces_.clear();
   bootstrap_pieces_.clear();
@@ -1836,6 +1869,13 @@ absl::Status ContinuationTrainer::Train() {
   const std::vector<ExpansionMerge> effective_prefix = EffectiveMergeTable();
   ABSL_RETURN_IF_ERROR(
       ReplayMerges(effective_prefix, "effective inherited/bootstrap"));
+
+  // Freeze the inherited tokenizer state first; only appended merge learning
+  // sees the continuation hierarchy. This is required for Qwen/base expansion
+  // compatibility as well as for semantic parity with hierarchy-aware runtime.
+  if (!hierarchy_.empty()) {
+    RebuildHierarchyCandidateIndex();
+  }
   ABSL_RETURN_IF_ERROR(LearnExpansion());
   ABSL_RETURN_IF_ERROR(FinalizeArtifacts());
 
