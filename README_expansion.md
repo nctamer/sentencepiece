@@ -170,6 +170,33 @@ unit itself (e.g. an inherited `▁PL:`) is replayed whole. Provenance:
 `▁1/12 | ▁PL: | ▁d3▁F#3 | ▁PR: | ▁a3▁D4 | ▁Vn: | ▁f#4▁D4` and a stage learns only
 inside those units.
 
+### Completion-gated hierarchy (`--bpe_hierarchy_file`)
+
+BPE may optionally receive an adapter-produced
+`sentencepiece-bpe-hierarchy-v1` sidecar. SentencePiece still knows nothing
+about the domain grammar: each normalized corpus row is keyed by exact surface
+bytes and supplies laminar grammar parents as ordered child byte cuts.
+
+For an internal child boundary, a pair is eligible only when the current left
+token begins on a child cut and the current right token ends on a child cut of
+that same parent. Thus a partial child cannot be carried across the boundary;
+once both sides have collapsed to complete children (or consecutive unions of
+complete children), the ordinary weighted pair enters the BPE competition.
+Ungated boundaries retain ordinary BPE behavior. The hierarchy and explicit
+string fences are mutually exclusive.
+
+The exported rank program is context-free, so the trainer applies a second
+safety law: if the same surface pair is ever observed at a hierarchy boundary
+where it is ineligible, that surface pair is permanently ineligible as a
+learned global merge. This is the deeper-hierarchy analogue of BoundlessBPE's
+whole-pretoken condition and prevents training-only contextual eligibility from
+being lost at inference.
+
+Learned `ExpansionMerge` records carry `weighted_count` and
+`grammar_level` for review. The exact sidecar SHA-256 is recorded in the
+effective continuation contract and
+`boundary_policy=bpe_hierarchical_completion_v1:<sha256>`.
+
 ### Shape options are about NEW pieces
 
 `max_sentencepiece_length`, `split_by_whitespace`, `split_by_unicode_script`,
