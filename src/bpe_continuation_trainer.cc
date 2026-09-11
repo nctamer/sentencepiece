@@ -5,6 +5,10 @@
 
 #include "bpe_continuation_trainer.h"
 
+#include "absl/flags/declare.h"
+#include "absl/flags/flag.h"
+#include "absl/strings/str_split.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +30,8 @@
 #include "absl/strings/string_view.h"
 #include "ret_check.h"
 #include "util.h"
+
+ABSL_DECLARE_FLAG(std::string, continuation_fence_strings);
 
 namespace sentencepiece::bpe {
 
@@ -153,6 +159,7 @@ int ContinuationTrainer::GetPrevIndex(int sid, int index) const {
 
 void ContinuationTrainer::AddNewPair(int sid, int left, int right) {
   if (left == -1 || right == -1) return;
+  if (fence_group_[sid][left] != fence_group_[sid][right]) return;
   Symbol* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
   if (symbol == nullptr) return;
   symbol->positions.insert(EncodePos(sid, left, right));
@@ -265,15 +272,59 @@ absl::Status ContinuationTrainer::SegmentAtoms(
 }
 
 absl::Status ContinuationTrainer::SegmentRecord(
-    absl::string_view text, std::vector<Symbol*>* symbols) {
+    absl::string_view text, std::vector<Symbol*>* symbols,
+    std::vector<int>* fence_groups) {
   RET_CHECK(symbols != nullptr);
+  RET_CHECK(fence_groups != nullptr);
   symbols->clear();
+  fence_groups->clear();
+
+  // Fence groups per BYTE, from the explicit fence surfaces: every byte
+  // boundary is probed and overlapping matches are unioned into one
+  // occurrence, exactly as the Unigram fence mask is built.
+  std::vector<int> byte_group(text.size(), 0);
+  if (fence_matcher_ != nullptr) {
+    int group = 0;
+    size_t covered_to = 0;   // exclusive end of the occurrence being extended
+    for (size_t i = 0; i < text.size();) {
+      bool found = false;
+      const int len = fence_matcher_->PrefixMatch(text.substr(i), &found);
+      if (found) {
+        const size_t end = i + static_cast<size_t>(len);
+        if (i >= covered_to) ++group;          // a new occurrence
+        for (size_t b = i; b < end; ++b) byte_group[b] = group;
+        covered_to = std::max(covered_to, end);
+        i += static_cast<size_t>(
+            std::min<int>(string_util::OneCharLen(text.data() + i),
+                          static_cast<int>(text.size() - i)));
+      } else {
+        i += static_cast<size_t>(len);
+      }
+    }
+  }
+
   std::vector<std::string> atoms;
+  size_t cursor = 0;   // byte offset of the next symbol
+  auto push = [&](Symbol* symbol, size_t nbytes) -> absl::Status {
+    const int g = byte_group[cursor];
+    for (size_t b = cursor; b < cursor + nbytes; ++b) {
+      if (byte_group[b] != g) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "a fence boundary falls inside the atomic symbol \"",
+            symbol->ToString(), "\"; fence strings must align with the "
+            "reversible atomic alphabet"));
+      }
+    }
+    symbols->push_back(symbol);
+    fence_groups->push_back(g);
+    cursor += nbytes;
+    return absl::OkStatus();
+  };
   auto flush_run = [&](absl::string_view run) -> absl::Status {
     if (run.empty()) return absl::OkStatus();
     ABSL_RETURN_IF_ERROR(SegmentAtoms(run, &atoms));
     for (const std::string& atom : atoms) {
-      symbols->push_back(GetAtomicSymbol(atom));
+      ABSL_RETURN_IF_ERROR(push(GetAtomicSymbol(atom), atom.size()));
     }
     return absl::OkStatus();
   };
@@ -288,11 +339,46 @@ absl::Status ContinuationTrainer::SegmentRecord(
       continue;
     }
     ABSL_RETURN_IF_ERROR(flush_run(text.substr(run_begin, i - run_begin)));
-    symbols->push_back(GetFrozenSymbol(text.substr(i, len)));
+    ABSL_RETURN_IF_ERROR(
+        push(GetFrozenSymbol(text.substr(i, len)), static_cast<size_t>(len)));
     i += static_cast<size_t>(len);
     run_begin = i;
   }
   return flush_run(text.substr(run_begin));
+}
+
+absl::Status ContinuationTrainer::LoadExplicitFences() {
+  fence_surfaces_.clear();
+  fence_matcher_.reset();
+  const std::string spec = absl::GetFlag(FLAGS_continuation_fence_strings);
+  if (spec.empty()) return absl::OkStatus();
+  // Normalized with the EFFECTIVE (reconciled, inherited) normalizer -- the
+  // regime that produced the corpus records -- so "PL:" becomes the surface
+  // that actually occurs, e.g. U+2581 "PL:" under add_dummy_prefix.
+  normalizer::Normalizer fence_normalizer(normalizer_spec_, trainer_spec_);
+  ABSL_RETURN_IF_ERROR(fence_normalizer.status());
+  for (const auto& logical : absl::StrSplit(spec, ',')) {
+    const std::string one(logical);
+    if (one.empty()) {
+      return absl::InvalidArgumentError(
+          "--continuation_fence_strings contains an empty entry");
+    }
+    const std::string surface = fence_normalizer.Normalize(one);
+    if (surface.empty()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "continuation fence string ", one,
+          " normalizes to the empty string"));
+    }
+    const bool inserted = fence_surfaces_.insert(surface).second;
+    LOG(INFO) << "FENCE logical=\"" << one << "\" normalized=\"" << surface
+              << "\"" << (inserted ? "" : " (duplicate, deduplicated)");
+  }
+  std::set<absl::string_view> views;
+  for (const auto& sfc : fence_surfaces_) views.insert(sfc);
+  fence_matcher_ = std::make_unique<normalizer::PrefixMatcher>(views);
+  LOG(INFO) << "FENCE normalized_unique=" << fence_surfaces_.size()
+            << " matcher=active (BPE continuation)";
+  return absl::OkStatus();
 }
 
 absl::Status ContinuationTrainer::ValidateMergeProgram(
@@ -747,6 +833,7 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
 
   sentences_ = corpus_.sentences;
   symbols_.resize(sentences_.size());
+  fence_group_.assign(sentences_.size(), {});
 
   // EncodePos packs the two symbol indexes of a position into 16 bits each.
   // An over-long record is a legitimate input, not a programming error, so it
@@ -761,7 +848,8 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
 
   for (size_t sid = 0; sid < sentences_.size(); ++sid) {
     std::vector<Symbol*> record;
-    ABSL_RETURN_IF_ERROR(SegmentRecord(sentences_[sid].first, &record));
+    ABSL_RETURN_IF_ERROR(
+        SegmentRecord(sentences_[sid].first, &record, &fence_group_[sid]));
     if (record.size() > kMaxAtomsPerRecord) {
       return absl::OutOfRangeError(absl::StrCat(
           "continuation training unit segments into ", record.size(),
@@ -1363,7 +1451,11 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   result.set_merges_sha256(expansion_spec_.merges_sha256());
   result.set_tokenizer_sha256(expansion_spec_.tokenizer_sha256());
   result.set_pretokenizer_sha256(expansion_spec_.pretokenizer_sha256());
-  result.set_boundary_policy(expansion_spec_.boundary_policy());
+  if (!fence_surfaces_.empty()) {
+    result.set_boundary_policy(EncodeBpeBoundaryPolicy(fence_surfaces_));
+  } else {
+    result.set_boundary_policy(expansion_spec_.boundary_policy());
+  }
 
   std::vector<ExpansionPiece> all_pieces = base_pieces_;
   all_pieces.insert(all_pieces.end(), bootstrap_pieces_.begin(),
@@ -1419,6 +1511,34 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   return absl::OkStatus();
 }
 
+// bpe_explicit_fences_v1:[<e1>,<e2>]  e_i sorted by bytes, %XX-escaped outside
+// [A-Za-z0-9._-]: the same encoding as unigram_explicit_fences_v1, under a
+// prefix that names the trainer, so a reader knows which semantics applied.
+std::string EncodeBpeBoundaryPolicy(
+    const std::set<std::string>& normalized_fence_surfaces) {
+  std::string out = "bpe_explicit_fences_v1:[";
+  bool first = true;
+  for (const auto& surface : normalized_fence_surfaces) {
+    if (!first) out += ",";
+    first = false;
+    for (const unsigned char c : surface) {
+      const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                        c == '-';
+      if (safe) {
+        out += static_cast<char>(c);
+      } else {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        out += '%';
+        out += kHex[c >> 4];
+        out += kHex[c & 0x0F];
+      }
+    }
+  }
+  out += "]";
+  return out;
+}
+
 absl::Status ContinuationTrainer::Train() {
   ABSL_RETURN_IF_ERROR(status());
   RET_CHECK_EQ(TrainerSpec::BPE, trainer_spec_.model_type());
@@ -1428,6 +1548,9 @@ absl::Status ContinuationTrainer::Train() {
   atomic_pieces_ordered_.clear();
   user_defined_matcher_.reset();
   user_defined_piece_strings_.clear();
+  fence_surfaces_.clear();
+  fence_matcher_.reset();
+  fence_group_.clear();
   live_by_string_.clear();
   base_pieces_.clear();
   bootstrap_pieces_.clear();
@@ -1445,6 +1568,7 @@ absl::Status ContinuationTrainer::Train() {
 
   ABSL_RETURN_IF_ERROR(LoadAndValidateSpec());
   ABSL_RETURN_IF_ERROR(ReconcileContinuationContract());
+  ABSL_RETURN_IF_ERROR(LoadExplicitFences());
   ABSL_RETURN_IF_ERROR(continuation::LoadPreparedCorpus(
       trainer_spec_, normalizer_spec_, components_, &corpus_));
   ABSL_RETURN_IF_ERROR(InitializeCorpusSymbols());

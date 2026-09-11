@@ -26,6 +26,7 @@
 #include "absl/strings/str_split.h"
 #include "absl/strings/numbers.h"
 #include "filesystem.h"
+#include "bpe_continuation_trainer.h"
 #include "expansion_processor.h"
 #include "normalizer.h"
 #include "sentencepiece_model.pb.h"
@@ -3305,6 +3306,77 @@ TEST(BPEContinuationContractTest, UserDefinedIsInheritedFrozenAndNeverMerged) {
     ASSERT_TRUE(p.EncodeIds(probe, &explicit_ids).ok());
     EXPECT_EQ(native, explicit_ids) << "disagreement on " << probe;
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// BPE continuation fences (--continuation_fence_strings), the G3 rule:
+// no learned merge overlaps a fenced character. The fence unit itself is
+// inherited whole and stays whole; the text on either side is never joined
+// to it. Same flag, same normalization, same provenance encoding as Unigram.
+// ---------------------------------------------------------------------------
+
+ExpansionSpec FenceSpec() {
+  ExpansionSpec e;
+  e.set_schema_version(1);
+  e.set_model_type(EXPANSION_BPE);
+  e.set_preserve_base_ids(true);
+  e.set_requested_new_pieces(1);
+  AddPiece(&e, 0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false, false);
+  int id = 1;
+  for (const char* c : {"x", "y", "P", ":"}) {
+    AddPiece(&e, id++, c, ModelProto::SentencePiece::NORMAL, true, true);
+  }
+  AddPiece(&e, id++, "P:", ModelProto::SentencePiece::NORMAL, true, false);
+  AddBaseMerge(&e, 0, "P", ":");
+  *e.mutable_contract()->mutable_normalizer_spec() = IdentityNormalizer();
+  return e;
+}
+
+TEST(BPEContinuationContractTest, ExplicitFenceBlocksMergesAcrossTheLabel) {
+  const std::string input = TempPath("bpe_fence_input.txt");
+  const std::string spec_path = TempPath("bpe_fence.pb");
+  std::vector<std::string> lines;
+  // "xP:y" is by far the most frequent adjacency; unfenced, x+P: wins.
+  for (int i = 0; i < 20; ++i) lines.push_back("xP:y");
+  for (int i = 0; i < 3; ++i) lines.push_back("xy");
+  ASSERT_TRUE(WriteLines(input, lines));
+  ASSERT_TRUE(WriteProto(spec_path, FenceSpec()));
+
+  auto run = [&](const std::string& fences, const std::string& tag) {
+    absl::SetFlag(&FLAGS_continuation_fence_strings, fences);
+    const std::string result_path = TempPath("bpe_fence_" + tag + ".result");
+    EXPECT_TRUE(RunTrainer(BpeContinuationSpec(input, spec_path, result_path,
+                                               TempPath("bpe_fence_" + tag), 7),
+                           IdentityNormalizer())
+                    .ok());
+    absl::SetFlag(&FLAGS_continuation_fence_strings, "");
+    ExpansionResult r;
+    EXPECT_TRUE(ReadProto(result_path, &r));
+    return r;
+  };
+
+  const ExpansionResult unfenced = run("", "off");
+  ASSERT_EQ(1, unfenced.learned_pieces_size());
+  // x+P: and P:+y tie at 20; either one crosses the label.
+  EXPECT_NE(std::string::npos, unfenced.learned_pieces(0).piece().find("P:"));
+  EXPECT_EQ("", unfenced.boundary_policy());
+
+  const ExpansionResult fenced = run("P:", "on");
+  ASSERT_EQ(1, fenced.learned_pieces_size());
+  EXPECT_EQ("xy", fenced.learned_pieces(0).piece())
+      << "the only pair that does not overlap the fence";
+  EXPECT_EQ("bpe_explicit_fences_v1:[P%3A]", fenced.boundary_policy());
+  // the inherited fence unit was still replayed whole
+  bool has_label = false;
+  for (const auto& p : fenced.base_pieces()) has_label |= p.piece() == "P:";
+  EXPECT_TRUE(has_label);
+}
+
+TEST(BPEContinuationContractTest, BpeBoundaryPolicyEncodingIsCanonical) {
+  EXPECT_EQ("bpe_explicit_fences_v1:[]", bpe::EncodeBpeBoundaryPolicy({}));
+  EXPECT_EQ("bpe_explicit_fences_v1:[%E2%96%81PL%3A,%E2%96%81Vn%3A]",
+            bpe::EncodeBpeBoundaryPolicy({"\xe2\x96\x81Vn:", "\xe2\x96\x81PL:"}));
 }
 
 }  // namespace

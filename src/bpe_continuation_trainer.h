@@ -30,6 +30,9 @@ namespace sentencepiece::bpe {
 // BPE continuation is intentionally a separate trainer from ordinary BPE.
 // Its starting state is an inherited merge program, not a fresh character
 // corpus with strings protected from pruning.
+std::string EncodeBpeBoundaryPolicy(
+    const std::set<std::string>& normalized_fence_surfaces);
+
 class ContinuationTrainer : public TrainerInterface {
  public:
   ContinuationTrainer(const TrainerSpec& trainer_spec,
@@ -106,7 +109,12 @@ class ContinuationTrainer : public TrainerInterface {
   // (longest prefix match, the native rule), each one frozen; every run of
   // text between them through SegmentAtoms.
   absl::Status SegmentRecord(absl::string_view text,
-                             std::vector<Symbol*>* symbols);
+                             std::vector<Symbol*>* symbols,
+                             std::vector<int>* fence_groups);
+  // --continuation_fence_strings for BPE: the same G3 semantics as Unigram
+  // continuation (logical strings normalized with the effective normalizer,
+  // occurrences unioned, no piece may overlap a fenced character).
+  absl::Status LoadExplicitFences();
 
   absl::Status LoadAndValidateSpec();
   // The inherited text pipeline and special-token ABI are authoritative, the
@@ -160,6 +168,12 @@ class ContinuationTrainer : public TrainerInterface {
   // matcher borrows the strings, so the set must outlive it.
   std::set<std::string> user_defined_piece_strings_;
   std::unique_ptr<normalizer::PrefixMatcher> user_defined_matcher_;
+  std::set<std::string> fence_surfaces_;
+  std::unique_ptr<normalizer::PrefixMatcher> fence_matcher_;
+  // Per position: 0 = open text, k > 0 = inside fence occurrence k. A pair
+  // whose two positions carry different groups is never formed, so no merge
+  // starts inside, ends inside, contains or spans a fence occurrence.
+  std::vector<std::vector<int>> fence_group_;
   std::vector<std::string> atomic_pieces_ordered_;
   absl::flat_hash_map<std::string, Symbol*> live_by_string_;
 

@@ -157,6 +157,19 @@ role, not an approximation of it:
 pruning shield: the listed pieces stay `NORMAL`, keep learned scores, and
 merge/segment like any other piece. The two mechanisms are unrelated.
 
+### Explicit fences (`--continuation_fence_strings`) apply to BPE too
+
+The same flag, normalization and semantics as the Unigram G3 fence: each
+logical string is normalized with the effective (inherited) normalizer, every
+byte boundary of every record is probed, overlapping matches are unioned, and
+**no merge may overlap a fenced character** — nothing starts inside, ends
+inside, contains or spans a fence occurrence, in either direction. The fence
+unit itself (e.g. an inherited `▁PL:`) is replayed whole. Provenance:
+`ExpansionResult.boundary_policy = bpe_explicit_fences_v1:[...]`, sorted and
+%XX-escaped like the Unigram form. With `PL:,PR:,Vn:` a record segments as
+`▁1/12 | ▁PL: | ▁d3▁F#3 | ▁PR: | ▁a3▁D4 | ▁Vn: | ▁f#4▁D4` and a stage learns only
+inside those units.
+
 ### Shape options are about NEW pieces
 
 `max_sentencepiece_length`, `split_by_whitespace`, `split_by_unicode_script`,
