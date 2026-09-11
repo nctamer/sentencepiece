@@ -56,12 +56,9 @@ class ContinuationTrainer : public TrainerInterface {
     // which is exactly what native training achieves by replacing the
     // occurrence with a pretokenization boundary (trainer_interface.cc).
     bool frozen = false;
-    // True only while at least one CURRENT occurrence of this surface pair
-    // violates the completion hierarchy. This is deliberately non-monotone:
-    // an earlier-rank merge may complete a longer child and consume the blocked
-    // occurrence, after which the same pair can become globally safe at a later
-    // BPE rank.
-    bool hierarchy_blocked = false;
+    // Hierarchy eligibility is occurrence-local; pair positions contains only
+    // currently eligible occurrences. There is intentionally no global
+    // "unsafe surface pair" bit.
     bool active = true;
     bool pending = false;
     bool needs_recomputation = true;
