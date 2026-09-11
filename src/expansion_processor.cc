@@ -29,6 +29,7 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
   piece_to_id_.clear(); merge_rule_.clear();
   user_defined_matcher_.reset();
   requires_hierarchy_ = false;
+  has_inherited_merge_program_ = false;
 
   std::vector<ExpansionPiece> pieces;
   for (const auto& p : result.base_pieces()) pieces.push_back(p);
@@ -98,6 +99,8 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
     bool hierarchy_gated = false;
   };
   std::vector<RankedMerge> merges;
+  has_inherited_merge_program_ =
+      result.base_merges_size() != 0 || result.bootstrap_merges_size() != 0;
   for (const auto& m : result.base_merges()) merges.push_back({m, false});
   for (const auto& m : result.bootstrap_merges()) merges.push_back({m, false});
   for (const auto& m : result.learned_merges()) {
@@ -448,6 +451,12 @@ absl::Status ExpansionProcessor::EncodeImpl(
           const bool end_is_cut =
               std::binary_search(gate.cuts.begin(), gate.cuts.end(), sym.end);
           if (!(begin_is_cut && end_is_cut)) {
+            if (!has_inherited_merge_program_) {
+              return absl::FailedPreconditionError(
+                  "fresh hierarchical artifact has an initial token that "
+                  "partially crosses a grammar child boundary; refusing to "
+                  "disable a gate without an inherited tokenizer to preserve");
+            }
             gate_enabled[gi] = false;
             break;
           }
