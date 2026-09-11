@@ -8,6 +8,7 @@
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/numbers.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -28,6 +29,7 @@
 #include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "filesystem.h"
 #include "ret_check.h"
 #include "util.h"
 
@@ -160,6 +162,7 @@ int ContinuationTrainer::GetPrevIndex(int sid, int index) const {
 void ContinuationTrainer::AddNewPair(int sid, int left, int right) {
   if (left == -1 || right == -1) return;
   if (fence_group_[sid][left] != fence_group_[sid][right]) return;
+  if (!CanMerge(sid, left, right)) return;
   Symbol* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
   if (symbol == nullptr) return;
   symbol->positions.insert(EncodePos(sid, left, right));
@@ -189,6 +192,9 @@ absl::Status ContinuationTrainer::AcceptSymbol(Symbol* symbol) {
 
     symbols_[pos.sid][pos.left] = symbol;
     symbols_[pos.sid][pos.right] = nullptr;
+    if (!span_end_.empty()) {
+      span_end_[pos.sid][pos.left] = span_end_[pos.sid][pos.right];
+    }
     AddNewPair(pos.sid, prev, pos.left);
     AddNewPair(pos.sid, pos.left, next);
   }
@@ -273,11 +279,14 @@ absl::Status ContinuationTrainer::SegmentAtoms(
 
 absl::Status ContinuationTrainer::SegmentRecord(
     absl::string_view text, std::vector<Symbol*>* symbols,
-    std::vector<int>* fence_groups) {
+    std::vector<int>* fence_groups,
+    std::vector<std::pair<size_t, size_t>>* byte_spans) {
   RET_CHECK(symbols != nullptr);
   RET_CHECK(fence_groups != nullptr);
+  RET_CHECK(byte_spans != nullptr);
   symbols->clear();
   fence_groups->clear();
+  byte_spans->clear();
 
   // Fence groups per BYTE, from the explicit fence surfaces: every byte
   // boundary is probed and overlapping matches are unioned into one
@@ -317,6 +326,7 @@ absl::Status ContinuationTrainer::SegmentRecord(
     }
     symbols->push_back(symbol);
     fence_groups->push_back(g);
+    byte_spans->push_back({cursor, cursor + nbytes});
     cursor += nbytes;
     return absl::OkStatus();
   };
@@ -345,6 +355,199 @@ absl::Status ContinuationTrainer::SegmentRecord(
     run_begin = i;
   }
   return flush_run(text.substr(run_begin));
+}
+
+bool ContinuationTrainer::CanMerge(int sid, int left, int right) const {
+  if (hierarchy_.empty()) return true;
+  if (sid < 0 || sid >= static_cast<int>(hierarchy_.size()) ||
+      left < 0 || right < 0) {
+    return false;
+  }
+  const size_t boundary = span_end_[sid][left];
+  if (boundary != span_begin_[sid][right]) return false;
+  const HierarchyRecord& record = hierarchy_[sid];
+  const auto it = record.gate_at_boundary.find(boundary);
+  if (it == record.gate_at_boundary.end()) return true;
+
+  const HierarchyGate& gate = record.gates[it->second];
+  const size_t begin = span_begin_[sid][left];
+  const size_t end = span_end_[sid][right];
+  if (begin < gate.begin || end > gate.end) return false;
+  return std::binary_search(gate.cuts.begin(), gate.cuts.end(), begin) &&
+         std::binary_search(gate.cuts.begin(), gate.cuts.end(), end);
+}
+
+int ContinuationTrainer::GrammarLevelForPair(int sid, int left,
+                                             int right) const {
+  if (hierarchy_.empty() || sid < 0 ||
+      sid >= static_cast<int>(hierarchy_.size()) || left < 0 || right < 0) {
+    return 0;
+  }
+  const size_t boundary = span_end_[sid][left];
+  const auto it = hierarchy_[sid].gate_at_boundary.find(boundary);
+  return it == hierarchy_[sid].gate_at_boundary.end()
+             ? 0
+             : hierarchy_[sid].gates[it->second].level;
+}
+
+int ContinuationTrainer::MaxGrammarLevel(const Symbol* symbol) const {
+  if (hierarchy_.empty() || symbol == nullptr) return 0;
+  int level = 0;
+  for (const uint64_t encoded_pos : symbol->positions) {
+    const Position pos = DecodePos(encoded_pos);
+    if (symbol->left != symbols_[pos.sid][pos.left] ||
+        symbol->right != symbols_[pos.sid][pos.right]) {
+      continue;
+    }
+    level = std::max(level,
+                     GrammarLevelForPair(pos.sid, pos.left, pos.right));
+  }
+  return level;
+}
+
+absl::Status ContinuationTrainer::LoadHierarchy() {
+  hierarchy_.clear();
+  hierarchy_sha256_.clear();
+  const std::string& filename = trainer_spec_.bpe_hierarchy_file();
+  if (filename.empty()) return absl::OkStatus();
+  if (fence_matcher_ != nullptr || !fence_surfaces_.empty()) {
+    return absl::InvalidArgumentError(
+        "bpe_hierarchy_file and continuation_fence_strings are mutually "
+        "exclusive boundary policies");
+  }
+
+  auto input = filesystem::NewReadableFile(filename);
+  if (!input->status().ok()) return input->status();
+
+  std::string canonical;
+  std::string line;
+  if (!input->ReadLine(&line) ||
+      line != "# sentencepiece-bpe-hierarchy-v1") {
+    return absl::InvalidArgumentError(
+        "BPE hierarchy sidecar must start with "
+        "'# sentencepiece-bpe-hierarchy-v1'");
+  }
+  absl::StrAppend(&canonical, line, "\n");
+
+  absl::flat_hash_map<std::string, int> sid_of;
+  sid_of.reserve(corpus_.sentences.size());
+  for (size_t sid = 0; sid < corpus_.sentences.size(); ++sid) {
+    sid_of[corpus_.sentences[sid].first] = static_cast<int>(sid);
+  }
+
+  hierarchy_.resize(corpus_.sentences.size());
+  std::vector<bool> seen(corpus_.sentences.size(), false);
+  while (input->ReadLine(&line)) {
+    absl::StrAppend(&canonical, line, "\n");
+    if (line.empty() || line[0] == '#') continue;
+    const std::vector<std::string> fields = absl::StrSplit(line, '\t');
+    if (fields.size() != 2) {
+      return absl::InvalidArgumentError(
+          "BPE hierarchy row must be <normalized-text><tab><gate-spec>");
+    }
+    const auto sid_it = sid_of.find(fields[0]);
+    if (sid_it == sid_of.end()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "BPE hierarchy contains a row absent from the normalized corpus: ",
+          fields[0]));
+    }
+    const int sid = sid_it->second;
+    if (seen[sid]) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("duplicate BPE hierarchy row: ", fields[0]));
+    }
+    seen[sid] = true;
+    HierarchyRecord& record = hierarchy_[sid];
+
+    if (!fields[1].empty()) {
+      for (absl::string_view gate_text : absl::StrSplit(fields[1], ';')) {
+        if (gate_text.empty()) continue;
+        const size_t colon = gate_text.find(':');
+        if (colon == absl::string_view::npos) {
+          return absl::InvalidArgumentError(
+              "hierarchy gate must be <level>:<cut0>,<cut1>,...,<cutN>");
+        }
+        int level = 0;
+        if (!absl::SimpleAtoi(gate_text.substr(0, colon), &level) ||
+            level <= 0) {
+          return absl::InvalidArgumentError(
+              "hierarchy gate level must be a positive integer");
+        }
+        HierarchyGate gate;
+        gate.level = level;
+        for (absl::string_view one :
+             absl::StrSplit(gate_text.substr(colon + 1), ',')) {
+          size_t cut = 0;
+          if (!absl::SimpleAtoi(one, &cut)) {
+            return absl::InvalidArgumentError(
+                absl::StrCat("invalid hierarchy byte cut: ", one));
+          }
+          gate.cuts.push_back(cut);
+        }
+        if (gate.cuts.size() < 3) {
+          return absl::InvalidArgumentError(
+              "hierarchy parent needs at least two children");
+        }
+        if (!std::is_sorted(gate.cuts.begin(), gate.cuts.end()) ||
+            std::adjacent_find(gate.cuts.begin(), gate.cuts.end()) !=
+                gate.cuts.end()) {
+          return absl::InvalidArgumentError(
+              "hierarchy cuts must be strictly increasing");
+        }
+        gate.begin = gate.cuts.front();
+        gate.end = gate.cuts.back();
+        const std::string& text = corpus_.sentences[sid].first;
+        if (gate.end > text.size()) {
+          return absl::InvalidArgumentError(
+              "hierarchy gate extends past normalized text");
+        }
+        for (size_t cut : gate.cuts) {
+          if (cut != 0 && cut != text.size() &&
+              (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) {
+            return absl::InvalidArgumentError(
+                "hierarchy cut falls inside a UTF-8 codepoint");
+          }
+        }
+
+        const int gate_index = static_cast<int>(record.gates.size());
+        for (size_t i = 1; i + 1 < gate.cuts.size(); ++i) {
+          if (!record.gate_at_boundary.emplace(gate.cuts[i], gate_index)
+                   .second) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "two hierarchy parents claim the same child boundary at byte ",
+                gate.cuts[i]));
+          }
+        }
+        record.gates.push_back(std::move(gate));
+      }
+    }
+
+    for (size_t i = 0; i < record.gates.size(); ++i) {
+      for (size_t j = i + 1; j < record.gates.size(); ++j) {
+        const auto& a = record.gates[i];
+        const auto& b = record.gates[j];
+        const bool disjoint = a.end <= b.begin || b.end <= a.begin;
+        const bool a_contains = a.begin <= b.begin && b.end <= a.end;
+        const bool b_contains = b.begin <= a.begin && a.end <= b.end;
+        if (!(disjoint || a_contains || b_contains)) {
+          return absl::InvalidArgumentError(
+              "BPE hierarchy spans are not laminar");
+        }
+      }
+    }
+  }
+  if (!input->status().ok()) return input->status();
+  for (size_t sid = 0; sid < seen.size(); ++sid) {
+    if (!seen[sid]) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "BPE hierarchy is missing normalized corpus row: ",
+          corpus_.sentences[sid].first));
+    }
+  }
+  hierarchy_sha256_ = continuation::Sha256Hex(canonical);
+  LOG(INFO) << "Loaded completion-gated BPE hierarchy for "
+            << hierarchy_.size() << " records, sha256=" << hierarchy_sha256_;
+  return absl::OkStatus();
 }
 
 absl::Status ContinuationTrainer::LoadExplicitFences() {
@@ -834,6 +1037,8 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
   sentences_ = corpus_.sentences;
   symbols_.resize(sentences_.size());
   fence_group_.assign(sentences_.size(), {});
+  span_begin_.assign(sentences_.size(), {});
+  span_end_.assign(sentences_.size(), {});
 
   // EncodePos packs the two symbol indexes of a position into 16 bits each.
   // An over-long record is a legitimate input, not a programming error, so it
@@ -848,8 +1053,9 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
 
   for (size_t sid = 0; sid < sentences_.size(); ++sid) {
     std::vector<Symbol*> record;
-    ABSL_RETURN_IF_ERROR(
-        SegmentRecord(sentences_[sid].first, &record, &fence_group_[sid]));
+    std::vector<std::pair<size_t, size_t>> byte_spans;
+    ABSL_RETURN_IF_ERROR(SegmentRecord(sentences_[sid].first, &record,
+                                       &fence_group_[sid], &byte_spans));
     if (record.size() > kMaxAtomsPerRecord) {
       return absl::OutOfRangeError(absl::StrCat(
           "continuation training unit segments into ", record.size(),
@@ -866,6 +1072,28 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
           "BPE pair frequencies; reduce the TSV counts");
     }
     weighted_positions += static_cast<uint64_t>(record.size()) * weight;
+
+    absl::flat_hash_set<size_t> atomic_boundaries;
+    atomic_boundaries.insert(0);
+    atomic_boundaries.insert(sentences_[sid].first.size());
+    for (const auto& span : byte_spans) {
+      atomic_boundaries.insert(span.first);
+      atomic_boundaries.insert(span.second);
+      span_begin_[sid].push_back(span.first);
+      span_end_[sid].push_back(span.second);
+    }
+    if (!hierarchy_.empty()) {
+      for (const HierarchyGate& gate : hierarchy_[sid].gates) {
+        for (size_t cut : gate.cuts) {
+          if (!atomic_boundaries.contains(cut)) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "hierarchy cut at byte ", cut,
+                " falls inside an atomic/USER_DEFINED symbol in record: ",
+                sentences_[sid].first));
+          }
+        }
+      }
+    }
 
     for (Symbol* symbol : record) {
       symbols_[sid].push_back(symbol);
@@ -966,6 +1194,8 @@ absl::Status ContinuationTrainer::LearnExpansion() {
     merge.set_left(best->left->ToString());
     merge.set_right(best->right->ToString());
     merge.set_external_id(piece.external_id());
+    merge.set_weighted_count(best->freq);
+    merge.set_grammar_level(MaxGrammarLevel(best));
 
     // Exact parent provenance is captured at the acceptance point, before the
     // corpus is mutated. No exporter is ever asked to infer a split later.
@@ -1257,6 +1487,9 @@ void ContinuationTrainer::FillEffectiveContract(ContinuationContract* out) const
     out->set_pad_id(-1);
   }
   out->set_base_id_map_sha256(BaseIdMapSha256());
+  if (!hierarchy_sha256_.empty()) {
+    out->set_bpe_hierarchy_sha256(hierarchy_sha256_);
+  }
 }
 
 // Identity of the inherited ordered piece table: "<id>\t<piece>\t<type>" per
@@ -1451,7 +1684,10 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   result.set_merges_sha256(expansion_spec_.merges_sha256());
   result.set_tokenizer_sha256(expansion_spec_.tokenizer_sha256());
   result.set_pretokenizer_sha256(expansion_spec_.pretokenizer_sha256());
-  if (!fence_surfaces_.empty()) {
+  if (!hierarchy_sha256_.empty()) {
+    result.set_boundary_policy(
+        absl::StrCat("bpe_hierarchical_completion_v1:", hierarchy_sha256_));
+  } else if (!fence_surfaces_.empty()) {
     result.set_boundary_policy(EncodeBpeBoundaryPolicy(fence_surfaces_));
   } else {
     result.set_boundary_policy(expansion_spec_.boundary_policy());
@@ -1551,6 +1787,10 @@ absl::Status ContinuationTrainer::Train() {
   fence_surfaces_.clear();
   fence_matcher_.reset();
   fence_group_.clear();
+  hierarchy_.clear();
+  span_begin_.clear();
+  span_end_.clear();
+  hierarchy_sha256_.clear();
   live_by_string_.clear();
   base_pieces_.clear();
   bootstrap_pieces_.clear();
@@ -1571,6 +1811,7 @@ absl::Status ContinuationTrainer::Train() {
   ABSL_RETURN_IF_ERROR(LoadExplicitFences());
   ABSL_RETURN_IF_ERROR(continuation::LoadPreparedCorpus(
       trainer_spec_, normalizer_spec_, components_, &corpus_));
+  ABSL_RETURN_IF_ERROR(LoadHierarchy());
   ABSL_RETURN_IF_ERROR(InitializeCorpusSymbols());
 
   // Replay the same inherited/bootstrap rank program that will be serialized.
