@@ -369,6 +369,104 @@ TEST(BPETrainerTest, CompletionHierarchyUnlocksOnlyWholeChildren) {
                 std::string("bpe_hierarchical_completion_v1:").size()));
 }
 
+
+TEST(BPETrainerTest, CompletionHierarchyKeepsUserDefinedFrozen) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "hier_ud_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "hier_ud.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "hier_ud.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "hier_ud_model");
+  const std::string result_path = prefix + ".expansion";
+
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("aa<X>bb\t9"));
+  }
+  {
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    // Direct children are "aa", frozen "<X>", and "bb".
+    ASSERT_TRUE(out->WriteLine("aa<X>bb\t1:0,2,5,7"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(4);
+  expansion.set_requested_new_pieces(2);
+  auto add = [&](int id, absl::string_view piece,
+                 ModelProto::SentencePiece::Type type, bool mergeable,
+                 bool atomic) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(type);
+    p->set_mergeable(mergeable);
+    p->set_atomic(atomic);
+  };
+  add(0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false, false);
+  add(1, "<X>", ModelProto::SentencePiece::USER_DEFINED, false, false);
+  add(2, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  add(3, "b", ModelProto::SentencePiece::NORMAL, true, true);
+  {
+    auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString()));
+  }
+
+  TrainerSpec trainer_spec;
+  trainer_spec.set_model_type(TrainerSpec::BPE);
+  trainer_spec.add_input(input);
+  trainer_spec.set_input_format("tsv");
+  trainer_spec.set_model_prefix(prefix);
+  trainer_spec.set_vocab_size(6);
+  trainer_spec.set_expansion_spec(spec_path);
+  trainer_spec.set_expansion_result(result_path);
+  trainer_spec.set_bpe_hierarchy_file(hierarchy);
+  trainer_spec.set_input_sentence_size(0);
+  trainer_spec.set_split_by_whitespace(false);
+  trainer_spec.set_split_by_unicode_script(false);
+  trainer_spec.set_split_by_number(false);
+  trainer_spec.set_split_digits(false);
+  trainer_spec.set_bos_id(-1);
+  trainer_spec.set_eos_id(-1);
+  trainer_spec.set_pad_id(-1);
+  trainer_spec.set_hard_vocab_limit(true);
+
+  NormalizerSpec normalizer_spec;
+  normalizer_spec.set_name("identity");
+  normalizer_spec.set_add_dummy_prefix(false);
+  normalizer_spec.set_remove_extra_whitespaces(false);
+  NormalizerSpec denormalizer_spec;
+
+  ASSERT_TRUE(SentencePieceTrainer::Train(
+                  trainer_spec, normalizer_spec, denormalizer_spec)
+                  .ok());
+
+  std::string bytes;
+  {
+    auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes));
+  }
+  ExpansionResult result;
+  ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(2, result.learned_merges_size());
+  ASSERT_GE(result.base_pieces_size(), 2);
+  EXPECT_EQ(1, result.base_pieces(1).external_id());
+  EXPECT_EQ("<X>", result.base_pieces(1).piece());
+  EXPECT_EQ(ModelProto::SentencePiece::USER_DEFINED,
+            result.base_pieces(1).type());
+
+  for (const auto& merge : result.learned_merges()) {
+    EXPECT_NE("<X>", merge.left());
+    EXPECT_NE("<X>", merge.right());
+    EXPECT_EQ(std::string::npos, merge.piece().find("<X>"));
+  }
+}
+
 TEST(BPETrainerTest, CompletionHierarchyRejectsContextDependentGlobalPair) {
   const std::string input =
       filesystem::JoinPath(::testing::TempDir(), "hier_global_input.tsv");
