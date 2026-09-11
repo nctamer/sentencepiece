@@ -56,11 +56,12 @@ class ContinuationTrainer : public TrainerInterface {
     // which is exactly what native training achieves by replacing the
     // occurrence with a pretokenization boundary (trainer_interface.cc).
     bool frozen = false;
-    // A global BPE merge program has no per-occurrence grammar context at
-    // inference. If this same surface pair is ever seen at a hierarchy boundary
-    // where it is not yet complete, the pair cannot safely become a global
-    // merge. This is monotone for the lifetime of this Symbol instance.
-    bool hierarchy_unsafe = false;
+    // True only while at least one CURRENT occurrence of this surface pair
+    // violates the completion hierarchy. This is deliberately non-monotone:
+    // an earlier-rank merge may complete a longer child and consume the blocked
+    // occurrence, after which the same pair can become globally safe at a later
+    // BPE rank.
+    bool hierarchy_blocked = false;
     bool active = true;
     bool pending = false;
     bool needs_recomputation = true;
