@@ -319,6 +319,8 @@ absl::Status ExpansionProcessor::EncodeImpl(
   }
   if (syms.empty()) return absl::OkStatus();
 
+  std::vector<bool> gate_enabled(gates == nullptr ? 0 : gates->size(), true);
+
   auto occurrence_allowed =
       [&](const Sym& left, const Sym& right, const MergeRule& rule) -> bool {
     if (!rule.hierarchy_gated) return true;
@@ -327,6 +329,7 @@ absl::Status ExpansionProcessor::EncodeImpl(
     if (boundary != right.begin) return false;
     const auto it = gate_at_boundary.find(boundary);
     if (it == gate_at_boundary.end()) return true;
+    if (!gate_enabled[it->second]) return true;
     const CompletionGate& gate = (*gates)[it->second];
     if (left.begin < gate.cuts.front() || right.end > gate.cuts.back()) {
       return false;
@@ -348,61 +351,115 @@ absl::Status ExpansionProcessor::EncodeImpl(
       return a.left > b.left;                        // then leftmost
     }
   };
-  std::priority_queue<Candidate, std::vector<Candidate>, Worse> pq;
 
-  auto push_pair = [&](int left, int right) {
-    if (left < 0 || right < 0) return;
-    const Sym& l = syms[left];
-    const Sym& r = syms[right];
-    if (!l.alive || !r.alive || l.next != right || r.prev != left ||
-        l.frozen || r.frozen) {
-      return;
+  auto run_phase = [&](bool hierarchy_gated_phase) {
+    std::priority_queue<Candidate, std::vector<Candidate>, Worse> pq;
+
+    auto push_pair = [&](int left, int right) {
+      if (left < 0 || right < 0) return;
+      const Sym& l = syms[left];
+      const Sym& r = syms[right];
+      if (!l.alive || !r.alive || l.next != right || r.prev != left ||
+          l.frozen || r.frozen) {
+        return;
+      }
+      const auto it = merge_rule_.find(Key(l.s, r.s));
+      if (it == merge_rule_.end() ||
+          it->second.hierarchy_gated != hierarchy_gated_phase ||
+          !occurrence_allowed(l, r, it->second)) {
+        return;
+      }
+      pq.push({it->second.rank, left, right, l.version, r.version});
+    };
+
+    // Build the phase-local heap from the current live segmentation. Phase 0
+    // is the exact inherited/base tokenizer; phase 1 sees only its result.
+    int cur = 0;
+    while (cur >= 0 && cur < static_cast<int>(syms.size()) &&
+           !syms[cur].alive) {
+      cur = syms[cur].next;
     }
-    const auto it = merge_rule_.find(Key(l.s, r.s));
-    if (it == merge_rule_.end() || !occurrence_allowed(l, r, it->second)) {
-      return;
+    while (cur >= 0) {
+      const int next = syms[cur].next;
+      if (next >= 0) push_pair(cur, next);
+      cur = next;
     }
-    pq.push({it->second.rank, left, right, l.version, r.version});
+
+    while (!pq.empty()) {
+      const Candidate c = pq.top();
+      pq.pop();
+      Sym& left = syms[c.left];
+      Sym& right = syms[c.right];
+      if (!left.alive || !right.alive || left.version != c.left_version ||
+          right.version != c.right_version || left.next != c.right ||
+          right.prev != c.left) {
+        continue;
+      }
+      const auto rule_it = merge_rule_.find(Key(left.s, right.s));
+      if (rule_it == merge_rule_.end() ||
+          rule_it->second.hierarchy_gated != hierarchy_gated_phase ||
+          rule_it->second.rank != c.rank ||
+          !occurrence_allowed(left, right, rule_it->second)) {
+        continue;
+      }
+
+      const int prev = left.prev;
+      const int next = right.next;
+      left.s += right.s;
+      left.end = right.end;
+      ++left.version;
+      left.next = next;
+      if (next >= 0) syms[next].prev = c.left;
+      right.alive = false;
+      ++right.version;
+
+      push_pair(prev, c.left);
+      push_pair(c.left, next);
+    }
   };
 
-  for (int i = 0; i + 1 < static_cast<int>(syms.size()); ++i) {
-    push_pair(i, i + 1);
+  // Phase 0: inherited/base/bootstrap program. Grammar is deliberately absent
+  // here so a Qwen/base tokenizer is reproduced exactly.
+  run_phase(false);
+
+  // An inherited token may already partially straddle a newly introduced
+  // grammar child boundary. Enforcing that parent would require undoing the
+  // inherited token, which continuation is forbidden to do. Disable only that
+  // incompatible gate for this occurrence; all compatible gates remain active.
+  if (requires_hierarchy_ && gates != nullptr) {
+    for (size_t gi = 0; gi < gates->size(); ++gi) {
+      const CompletionGate& gate = (*gates)[gi];
+      int cur = 0;
+      while (cur >= 0 && cur < static_cast<int>(syms.size()) &&
+             !syms[cur].alive) {
+        cur = syms[cur].next;
+      }
+      while (cur >= 0) {
+        const Sym& sym = syms[cur];
+        auto cut = std::upper_bound(gate.cuts.begin(), gate.cuts.end(),
+                                    sym.begin);
+        const bool crosses_internal =
+            cut != gate.cuts.end() && *cut < sym.end &&
+            *cut < gate.cuts.back();
+        if (crosses_internal) {
+          const bool begin_is_cut =
+              std::binary_search(gate.cuts.begin(), gate.cuts.end(),
+                                 sym.begin);
+          const bool end_is_cut =
+              std::binary_search(gate.cuts.begin(), gate.cuts.end(), sym.end);
+          if (!(begin_is_cut && end_is_cut)) {
+            gate_enabled[gi] = false;
+            break;
+          }
+        }
+        cur = sym.next;
+      }
+    }
   }
 
-  while (!pq.empty()) {
-    const Candidate c = pq.top();
-    pq.pop();
-    Sym& left = syms[c.left];
-    Sym& right = syms[c.right];
-    if (!left.alive || !right.alive || left.version != c.left_version ||
-        right.version != c.right_version || left.next != c.right ||
-        right.prev != c.left) {
-      continue;
-    }
-    const auto rule_it = merge_rule_.find(Key(left.s, right.s));
-    if (rule_it == merge_rule_.end() || rule_it->second.rank != c.rank ||
-        !occurrence_allowed(left, right, rule_it->second)) {
-      continue;
-    }
-
-    const int prev = left.prev;
-    const int next = right.next;
-    left.s += right.s;
-    left.end = right.end;
-    ++left.version;
-    left.next = next;
-    if (next >= 0) {
-      // Changing only the predecessor does not change next as the LEFT
-      // operand of an existing (next,next.next) candidate, so do not bump its
-      // content version and accidentally discard that still-valid candidate.
-      syms[next].prev = c.left;
-    }
-    right.alive = false;
-    ++right.version;
-
-    push_pair(prev, c.left);
-    push_pair(c.left, next);
-  }
+  // Phase 1: appended continuation rules. Candidate applicability is
+  // occurrence-local and uses the same child-completion predicate as training.
+  run_phase(true);
 
   int at = 0;
   while (at >= 0 && at < static_cast<int>(syms.size()) &&
