@@ -392,8 +392,10 @@ absl::Status ExpansionProcessor::EncodeImpl(
     ++left.version;
     left.next = next;
     if (next >= 0) {
+      // Changing only the predecessor does not change next as the LEFT
+      // operand of an existing (next,next.next) candidate, so do not bump its
+      // content version and accidentally discard that still-valid candidate.
       syms[next].prev = c.left;
-      ++syms[next].version;
     }
     right.alive = false;
     ++right.version;
