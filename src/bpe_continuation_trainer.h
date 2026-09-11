@@ -6,6 +6,7 @@
 #ifndef BPE_CONTINUATION_TRAINER_H_
 #define BPE_CONTINUATION_TRAINER_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -55,6 +56,11 @@ class ContinuationTrainer : public TrainerInterface {
     // which is exactly what native training achieves by replacing the
     // occurrence with a pretokenization boundary (trainer_interface.cc).
     bool frozen = false;
+    // A global BPE merge program has no per-occurrence grammar context at
+    // inference. If this same surface pair is ever seen at a hierarchy boundary
+    // where it is not yet complete, the pair cannot safely become a global
+    // merge. This is monotone for the lifetime of this Symbol instance.
+    bool hierarchy_unsafe = false;
     bool active = true;
     bool pending = false;
     bool needs_recomputation = true;
