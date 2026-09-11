@@ -85,6 +85,7 @@ class ContinuationTrainer : public TrainerInterface {
     size_t begin = 0;
     size_t end = 0;
     int level = 0;
+    bool enabled = true;
     std::vector<size_t> cuts;
   };
 
