@@ -75,6 +75,7 @@ class ContinuationTrainer : public TrainerInterface {
     std::string left_text;
     std::string right_text;
     uint64_t freq = 0;
+    uint64_t last_application_weight = 0;
     bool active = true;
     bool pending = false;
     bool needs_recomputation = true;
