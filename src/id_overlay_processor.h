@@ -59,6 +59,7 @@ class IdOverlayProcessor {
   int open_fence_id() const { return open_fence_id_; }
   int close_fence_id() const { return close_fence_id_; }
   int rule_count() const { return static_cast<int>(rules_.size()); }
+  const std::vector<int>& overlay_ids() const { return overlay_ids_; }
   int max_input_ids() const { return max_input_ids_; }
   int max_expansion_ids() const { return max_expansion_ids_; }
   const std::string& base_identity_sha256() const {
@@ -83,6 +84,7 @@ class IdOverlayProcessor {
   absl::flat_hash_map<uint64_t, Rule> rules_;
   absl::flat_hash_set<int> protected_ids_;
   std::vector<std::vector<int>> expansion_by_id_;
+  std::vector<int> overlay_ids_;
 
   int base_vocab_size_ = 0;
   int model_vocab_size_ = 0;
