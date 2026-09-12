@@ -129,6 +129,13 @@ message TrainerSpec {
   // occurrence-weighted corpus counts.
   optional string bpe_hierarchy_file = 58 [default = ""];
 
+  // TEST/DEBUG ONLY. When nonempty, hierarchical BPE writes one TSV row after
+  // every accepted learned operation containing the operation identity,
+  // selected count, allocation/ID decision, and an exact full-corpus
+  // segmentation SHA-256. It is intentionally O(MN) and must never be enabled
+  // for production training; it exists solely for differential oracle tests.
+  optional string bpe_reference_trace_file = 59 [default = ""];
+
   reserved 6;
   reserved 12;
   reserved 13;
