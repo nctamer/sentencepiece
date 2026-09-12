@@ -127,35 +127,34 @@ ContinuationTrainer::Symbol* ContinuationTrainer::GetPairSymbol(
 }
 
 ContinuationTrainer::Candidate* ContinuationTrainer::GetCandidate(
-    Symbol* left, Symbol* right, int scope_level) {
+    Symbol* left, Symbol* right) {
   if (left == nullptr || right == nullptr) return nullptr;
   const std::string left_text = left->ToString();
   const std::string right_text = right->ToString();
-  const auto key = std::make_tuple(left_text, right_text, scope_level);
+  const auto key = std::make_pair(left_text, right_text);
   const auto it = candidate_cache_.find(key);
   if (it != candidate_cache_.end()) return it->second;
 
   Symbol* result = GetPairSymbol(left, right);
   if (result == nullptr) return nullptr;
 
-  auto c = std::make_unique<Candidate>();
-  c->left = left;
-  c->right = right;
-  c->result = result;
-  c->left_text = left_text;
-  c->right_text = right_text;
-  c->scope_level = scope_level;
-  Candidate* out = c.get();
+  auto candidate = std::make_unique<Candidate>();
+  candidate->left = left;
+  candidate->right = right;
+  candidate->result = result;
+  candidate->left_text = left_text;
+  candidate->right_text = right_text;
+  Candidate* out = candidate.get();
   candidate_cache_.emplace(key, out);
-  allocated_candidates_.push_back(std::move(c));
+  allocated_candidates_.push_back(std::move(candidate));
   return out;
 }
 
 ContinuationTrainer::Candidate* ContinuationTrainer::FindCandidate(
-    const Symbol* left, const Symbol* right, int scope_level) const {
+    const Symbol* left, const Symbol* right) const {
   if (left == nullptr || right == nullptr) return nullptr;
-  const auto it = candidate_cache_.find(
-      std::make_tuple(left->ToString(), right->ToString(), scope_level));
+  const auto it =
+      candidate_cache_.find(std::make_pair(left->ToString(), right->ToString()));
   return it == candidate_cache_.end() ? nullptr : it->second;
 }
 
@@ -168,7 +167,7 @@ void ContinuationTrainer::ComputeFreq(Candidate* candidate) const {
   for (auto it = candidate->positions.begin();
        it != candidate->positions.end();) {
     const Position pos = DecodePos(*it);
-    bool live =
+    const bool live =
         pos.sid >= 0 && pos.sid < static_cast<int>(symbols_.size()) &&
         pos.left >= 0 && pos.right >= 0 &&
         pos.left < static_cast<int>(symbols_[pos.sid].size()) &&
@@ -176,26 +175,27 @@ void ContinuationTrainer::ComputeFreq(Candidate* candidate) const {
         candidate->left == symbols_[pos.sid][pos.left] &&
         candidate->right == symbols_[pos.sid][pos.right] &&
         GetNextIndex(pos.sid, pos.left) == pos.right;
-    if (live && hierarchy_gating_enabled_) {
-      live = CanMerge(pos.sid, pos.left, pos.right) &&
-             GrammarLevelForPair(pos.sid, pos.left, pos.right) ==
-                 candidate->scope_level;
-    }
     if (!live) {
       it = candidate->positions.erase(it);
       continue;
     }
 
-    // The same pair can overlap itself only when left==right, e.g. aaa has
-    // adjacent aa positions (0,1) and (1,2). BPE replacement is necessarily
-    // non-overlapping and left-to-right, so count exactly the replacements the
-    // accept step can actually perform. This is the Boundless/reference rule.
+    // This is the exact deterministic replacement set ordinary flat BPE would
+    // use if the pair were selected now. In particular, aaa exposes positions
+    // (0,1) and (1,2), but only the leftmost one is an actual replacement.
+    // Hierarchy support is evaluated only on those actual replacements.
     const bool overlaps_previous =
         candidate->left == candidate->right &&
         pos.sid == last_counted_sid && pos.left == last_counted_right;
     if (!overlaps_previous) {
-      candidate->freq +=
-          static_cast<uint64_t>(sentences_[pos.sid].second);
+      if (!hierarchy_support_enabled_ ||
+          HierarchySupportsMerge(pos.sid, pos.left, pos.right)) {
+        candidate->freq +=
+            static_cast<uint64_t>(sentences_[pos.sid].second);
+      }
+      // Update even when the occurrence has zero hierarchy support: a flat
+      // application there still consumes the overlapping occurrence to its
+      // right, so that right occurrence cannot contribute support.
       last_counted_sid = pos.sid;
       last_counted_right = pos.right;
     }
@@ -223,14 +223,10 @@ int ContinuationTrainer::GetPrevIndex(int sid, int index) const {
 void ContinuationTrainer::AddNewPair(int sid, int left, int right) {
   if (left == -1 || right == -1) return;
   if (fence_group_[sid][left] != fence_group_[sid][right]) return;
-  if (hierarchy_gating_enabled_ && !CanMerge(sid, left, right)) return;
 
   Symbol* left_symbol = symbols_[sid][left];
   Symbol* right_symbol = symbols_[sid][right];
-  const int scope_level =
-      hierarchy_gating_enabled_ ? GrammarLevelForPair(sid, left, right) : 0;
-  Candidate* candidate =
-      GetCandidate(left_symbol, right_symbol, scope_level);
+  Candidate* candidate = GetCandidate(left_symbol, right_symbol);
   if (candidate == nullptr || !candidate->active) return;
 
   candidate->positions.insert(EncodePos(sid, left, right));
@@ -245,11 +241,8 @@ void ContinuationTrainer::ResetFreq(int sid, int left, int right,
                                     const Candidate* best) {
   if (left == -1 || right == -1) return;
   if (fence_group_[sid][left] != fence_group_[sid][right]) return;
-  if (hierarchy_gating_enabled_ && !CanMerge(sid, left, right)) return;
-  const int scope_level =
-      hierarchy_gating_enabled_ ? GrammarLevelForPair(sid, left, right) : 0;
   Candidate* candidate =
-      FindCandidate(symbols_[sid][left], symbols_[sid][right], scope_level);
+      FindCandidate(symbols_[sid][left], symbols_[sid][right]);
   if (candidate != nullptr && candidate != best) {
     candidate->needs_recomputation = true;
   }
@@ -258,7 +251,7 @@ void ContinuationTrainer::ResetFreq(int sid, int left, int right,
 absl::Status ContinuationTrainer::AcceptCandidate(Candidate* candidate) {
   RET_CHECK(candidate != nullptr);
   RET_CHECK(candidate->result != nullptr);
-  const uint64_t expected_weight = candidate->freq;
+  const uint64_t support_weight = candidate->freq;
   uint64_t applied_weight = 0;
 
   for (const uint64_t encoded_pos : candidate->positions) {
@@ -273,12 +266,6 @@ absl::Status ContinuationTrainer::AcceptCandidate(Candidate* candidate) {
         candidate->right != symbols_[pos.sid][pos.right] ||
         GetNextIndex(pos.sid, pos.left) != pos.right) {
       continue;  // stale or overlapping occurrence
-    }
-    if (hierarchy_gating_enabled_ &&
-        (!CanMerge(pos.sid, pos.left, pos.right) ||
-         GrammarLevelForPair(pos.sid, pos.left, pos.right) !=
-             candidate->scope_level)) {
-      continue;
     }
 
     const int next = GetNextIndex(pos.sid, pos.right);
@@ -302,174 +289,19 @@ absl::Status ContinuationTrainer::AcceptCandidate(Candidate* candidate) {
     AddNewPair(pos.sid, pos.left, next);
   }
 
-  // Strong accounting invariant: the count that won the competition must be
-  // exactly the weighted number of replacements performed. This catches both
-  // overlapping identical-pair overcounting and stale occurrence indexes.
-  if (applied_weight != expected_weight) {
+  // Hierarchy support is a selection score, not an application count. The
+  // selected ordinary rule applies globally, so application weight may exceed
+  // support. It may never be smaller: support was summed over this exact
+  // deterministic non-overlapping flat replacement set.
+  if (applied_weight < support_weight) {
     return absl::InternalError(absl::StrCat(
-        "BPE candidate count/application mismatch for ",
-        candidate->left_text, " + ", candidate->right_text,
-        " scope=", candidate->scope_level, ": counted ", expected_weight,
-        " but applied ", applied_weight));
+        "BPE hierarchy support exceeds flat application weight for ",
+        candidate->left_text, " + ", candidate->right_text, ": support ",
+        support_weight, " applied ", applied_weight));
   }
 
   candidate->active = false;
   candidate->pending = false;
-  candidate->positions.clear();
-  return absl::OkStatus();
-}
-
-
-void ContinuationTrainer::ScheduleKnownOrAddCandidate(
-    int sid, int left, int right, ReplayQueue* replay) {
-  if (left == -1 || right == -1) return;
-  if (sid < 0 || sid >= static_cast<int>(symbols_.size())) return;
-  if (symbols_[sid][left] == nullptr || symbols_[sid][right] == nullptr) return;
-  if (GetNextIndex(sid, left) != right) return;
-  if (fence_group_[sid][left] != fence_group_[sid][right]) return;
-  if (hierarchy_gating_enabled_ && !CanMerge(sid, left, right)) return;
-
-  const int scope =
-      hierarchy_gating_enabled_ ? GrammarLevelForPair(sid, left, right) : 0;
-  const auto key = std::make_tuple(symbols_[sid][left]->ToString(),
-                                   symbols_[sid][right]->ToString(), scope);
-  const auto learned = learned_rule_rank_.find(key);
-  if (learned != learned_rule_rank_.end()) {
-    replay->push({learned->second, sid, left, right});
-    return;
-  }
-  AddNewPair(sid, left, right);
-}
-
-bool ContinuationTrainer::ReplayEntryStillMatches(
-    const ReplayEntry& entry) const {
-  if (entry.learned_rank < 0 ||
-      entry.learned_rank >= static_cast<int>(learned_merges_.size()) ||
-      entry.sid < 0 || entry.sid >= static_cast<int>(symbols_.size()) ||
-      entry.left < 0 || entry.right < 0 ||
-      entry.left >= static_cast<int>(symbols_[entry.sid].size()) ||
-      entry.right >= static_cast<int>(symbols_[entry.sid].size())) {
-    return false;
-  }
-  const Symbol* left = symbols_[entry.sid][entry.left];
-  const Symbol* right = symbols_[entry.sid][entry.right];
-  if (left == nullptr || right == nullptr ||
-      GetNextIndex(entry.sid, entry.left) != entry.right ||
-      fence_group_[entry.sid][entry.left] !=
-          fence_group_[entry.sid][entry.right]) {
-    return false;
-  }
-  const ExpansionMerge& rule = learned_merges_[entry.learned_rank];
-  if (left->ToString() != rule.left() || right->ToString() != rule.right()) {
-    return false;
-  }
-  if (hierarchy_gating_enabled_) {
-    if (!CanMerge(entry.sid, entry.left, entry.right)) return false;
-    const int scope =
-        GrammarLevelForPair(entry.sid, entry.left, entry.right);
-    if (!rule.has_scope_level() || rule.scope_level() != scope) return false;
-  }
-  return true;
-}
-
-absl::Status ContinuationTrainer::AcceptCandidateWithClosure(
-    Candidate* candidate, int selected_learned_rank) {
-  RET_CHECK(candidate != nullptr);
-  RET_CHECK(candidate->result != nullptr);
-  RET_CHECK_GE(selected_learned_rank, 0);
-  RET_CHECK_LT(selected_learned_rank,
-               static_cast<int>(learned_merges_.size()));
-
-  const uint64_t expected_weight = candidate->freq;
-  uint64_t selected_applied_weight = 0;
-
-  // The selected operation is now part of the permanent ranked program.
-  // Candidate::active only means "eligible to become a NEW operation"; it must
-  // not suppress future replay of this operation at newly-created locations.
-  candidate->active = false;
-  candidate->pending = false;
-
-  // candidate->positions is ordered by (sid,left,right). Process each selected
-  // occurrence left-to-right. After each replacement, close only its affected
-  // neighborhood under the already-learned prefix. This is the missing
-  // monotonicity repair for scoped aliases: a later alias may create operands
-  // for an earlier rank, and that earlier rank must fire immediately just as
-  // the serialized runtime would.
-  for (const uint64_t encoded_pos : candidate->positions) {
-    const Position pos = DecodePos(encoded_pos);
-    if (pos.sid < 0 || pos.sid >= static_cast<int>(symbols_.size()) ||
-        pos.left < 0 || pos.right < 0 ||
-        pos.left >= static_cast<int>(symbols_[pos.sid].size()) ||
-        pos.right >= static_cast<int>(symbols_[pos.sid].size()) ||
-        symbols_[pos.sid][pos.left] != candidate->left ||
-        symbols_[pos.sid][pos.right] != candidate->right ||
-        GetNextIndex(pos.sid, pos.left) != pos.right) {
-      continue;
-    }
-    if (hierarchy_gating_enabled_ &&
-        (!CanMerge(pos.sid, pos.left, pos.right) ||
-         GrammarLevelForPair(pos.sid, pos.left, pos.right) !=
-             candidate->scope_level)) {
-      continue;
-    }
-
-    ReplayQueue replay;
-    replay.push({selected_learned_rank, pos.sid, pos.left, pos.right});
-
-    while (!replay.empty()) {
-      const ReplayEntry entry = replay.top();
-      replay.pop();
-      if (!ReplayEntryStillMatches(entry)) continue;
-
-      const ExpansionMerge& rule = learned_merges_[entry.learned_rank];
-      Symbol* left_symbol = symbols_[entry.sid][entry.left];
-      Symbol* right_symbol = symbols_[entry.sid][entry.right];
-      Symbol* result = GetPairSymbol(left_symbol, right_symbol);
-      if (result == nullptr || result->ToString() != rule.left() + rule.right()) {
-        return absl::InternalError(absl::StrCat(
-            "learned BPE replay rule became unconstructible at rank ",
-            entry.learned_rank, ": ", rule.left(), " + ", rule.right()));
-      }
-
-      const int prev = GetPrevIndex(entry.sid, entry.left);
-      const int next = GetNextIndex(entry.sid, entry.right);
-      ResetFreq(entry.sid, prev, entry.left, nullptr);
-      ResetFreq(entry.sid, entry.right, next, nullptr);
-
-      symbols_[entry.sid][entry.left] = result;
-      symbols_[entry.sid][entry.right] = nullptr;
-      next_live_[entry.sid][entry.left] = next;
-      if (next != -1) prev_live_[entry.sid][next] = entry.left;
-      prev_live_[entry.sid][entry.right] = -1;
-      next_live_[entry.sid][entry.right] = -1;
-      if (!span_end_.empty()) {
-        span_end_[entry.sid][entry.left] =
-            span_end_[entry.sid][entry.right];
-      }
-
-      if (entry.learned_rank == selected_learned_rank) {
-        selected_applied_weight +=
-            static_cast<uint64_t>(sentences_[entry.sid].second);
-      }
-
-      // These are the only adjacencies whose applicability can have changed.
-      // A known rule is queued even though its Candidate was retired when it
-      // was learned. An unknown rule is exposed to the normal candidate table.
-      ScheduleKnownOrAddCandidate(entry.sid, prev, entry.left, &replay);
-      ScheduleKnownOrAddCandidate(entry.sid, entry.left, next, &replay);
-    }
-  }
-
-  if (selected_applied_weight != expected_weight) {
-    return absl::InternalError(absl::StrCat(
-        "scoped BPE selection/replay mismatch for ", candidate->left_text,
-        " + ", candidate->right_text, " scope=", candidate->scope_level,
-        ": selected weighted count ", expected_weight,
-        " but ranked-prefix replay applied ", selected_applied_weight,
-        ". This indicates a deeper alias-overlap interaction that the "
-        "incremental candidate count did not model."));
-  }
-
   candidate->positions.clear();
   return absl::OkStatus();
 }
@@ -484,56 +316,16 @@ void ContinuationTrainer::DrainPendingQueue() {
   pending_queue_.clear();
 }
 
-absl::Status ContinuationTrainer::RebuildHierarchyCandidateIndex() {
-  // An inherited tokenizer is authoritative. If one of its already-produced
-  // tokens partially straddles a NEW grammar parent's child boundary, that
-  // parent cannot be enforced without changing inherited segmentation. Disable
-  // only that gate for that record; compatible gates remain active.
-  size_t disabled = 0;
-  for (size_t sid = 0; sid < hierarchy_.size(); ++sid) {
-    HierarchyRecord& record = hierarchy_[sid];
-    for (HierarchyGate& gate : record.gates) {
-      gate.enabled = true;
-      for (size_t i = 0; i < symbols_[sid].size(); ++i) {
-        if (symbols_[sid][i] == nullptr) continue;
-        const size_t begin = span_begin_[sid][i];
-        const size_t end = span_end_[sid][i];
-        auto cut = std::upper_bound(gate.cuts.begin(), gate.cuts.end(), begin);
-        const bool crosses_internal =
-            cut != gate.cuts.end() && *cut < end && *cut < gate.end;
-        if (!crosses_internal) continue;
-        const bool begin_is_cut =
-            std::binary_search(gate.cuts.begin(), gate.cuts.end(), begin);
-        const bool end_is_cut =
-            std::binary_search(gate.cuts.begin(), gate.cuts.end(), end);
-        if (!(begin_is_cut && end_is_cut)) {
-          gate.enabled = false;
-          ++disabled;
-          break;
-        }
-      }
-    }
-  }
-  if (disabled != 0) {
-    if (base_merges_.empty() && bootstrap_merges_.empty()) {
-      return absl::FailedPreconditionError(absl::StrCat(
-          "fresh hierarchical BPE found ", disabled,
-          " grammar gates already crossed by its initial segmentation; "
-          "fresh training has no inherited tokenizer to preserve, so disabling "
-          "a gate would hide a hierarchy/atomization bug"));
-    }
-    LOG(INFO) << "Hierarchy disabled " << disabled
-              << " gates incompatible with inherited/base segmentation";
-  }
-
-  // Inherited replay candidates were unscoped. Drop that candidate index and
-  // rebuild from the post-replay segmentation with exact occurrence scopes.
+absl::Status ContinuationTrainer::RebuildHierarchySupportIndex() {
+  // The inherited tokenizer is authoritative and has already been replayed.
+  // The hierarchy never vetoes or rewrites that state. It only scores NEW flat
+  // pair candidates from the exact current segmentation.
   pq_ = decltype(pq_)();
   pending_queue_.clear();
   candidate_cache_.clear();
   allocated_candidates_.clear();
 
-  hierarchy_gating_enabled_ = true;
+  hierarchy_support_enabled_ = true;
   for (size_t sid = 0; sid < symbols_.size(); ++sid) {
     int left = -1;
     for (size_t i = 0; i < symbols_[sid].size(); ++i) {
@@ -691,38 +483,46 @@ absl::Status ContinuationTrainer::SegmentRecord(
   return flush_run(text.substr(run_begin));
 }
 
-bool ContinuationTrainer::CanMerge(int sid, int left, int right) const {
+bool ContinuationTrainer::HierarchySupportsMerge(int sid, int left,
+                                                   int right) const {
   if (hierarchy_.empty()) return true;
   if (sid < 0 || sid >= static_cast<int>(hierarchy_.size()) ||
-      left < 0 || right < 0) {
+      left < 0 || right < 0 ||
+      left >= static_cast<int>(span_begin_[sid].size()) ||
+      right >= static_cast<int>(span_end_[sid].size())) {
     return false;
   }
-  const size_t boundary = span_end_[sid][left];
-  if (boundary != span_begin_[sid][right]) return false;
-  const HierarchyRecord& record = hierarchy_[sid];
-  const auto it = record.gate_at_boundary.find(boundary);
-  if (it == record.gate_at_boundary.end()) return true;
+  if (span_end_[sid][left] != span_begin_[sid][right]) return false;
 
-  const HierarchyGate& gate = record.gates[it->second];
-  if (!gate.enabled) return true;
   const size_t begin = span_begin_[sid][left];
   const size_t end = span_end_[sid][right];
-  if (begin < gate.begin || end > gate.end) return false;
-  return std::binary_search(gate.cuts.begin(), gate.cuts.end(), begin) &&
-         std::binary_search(gate.cuts.begin(), gate.cuts.end(), end);
-}
+  if (begin >= end) return false;
 
-int ContinuationTrainer::GrammarLevelForPair(int sid, int left,
-                                             int right) const {
-  if (hierarchy_.empty() || sid < 0 ||
-      sid >= static_cast<int>(hierarchy_.size()) || left < 0 || right < 0) {
-    return 0;
+  // A resulting span is hierarchy-supported iff, for every enabled parent it
+  // partially traverses, it is a consecutive union of complete children.
+  // Fully containing a nested parent is fine: at an ancestor level that whole
+  // parent is one completed child. This also permits a flat rule to repair a
+  // temporarily partial token, e.g. Vn:d5 + C5 -> Vn:d5C5.
+  for (const HierarchyGate& gate : hierarchy_[sid].gates) {
+    if (!gate.enabled || end <= gate.begin || begin >= gate.end) continue;
+    if (begin <= gate.begin && end >= gate.end) continue;  // whole parent
+
+    bool crosses_internal_cut = false;
+    for (size_t i = 1; i + 1 < gate.cuts.size(); ++i) {
+      if (begin < gate.cuts[i] && gate.cuts[i] < end) {
+        crosses_internal_cut = true;
+        break;
+      }
+    }
+    if (!crosses_internal_cut) continue;
+
+    if (begin < gate.begin || end > gate.end ||
+        !std::binary_search(gate.cuts.begin(), gate.cuts.end(), begin) ||
+        !std::binary_search(gate.cuts.begin(), gate.cuts.end(), end)) {
+      return false;
+    }
   }
-  const size_t boundary = span_end_[sid][left];
-  const auto it = hierarchy_[sid].gate_at_boundary.find(boundary);
-  if (it == hierarchy_[sid].gate_at_boundary.end()) return 0;
-  const HierarchyGate& gate = hierarchy_[sid].gates[it->second];
-  return gate.enabled ? gate.level : 0;
+  return true;
 }
 
 absl::Status ContinuationTrainer::LoadHierarchy() {
@@ -865,7 +665,7 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
     }
   }
   hierarchy_sha256_ = continuation::Sha256Hex(canonical);
-  LOG(INFO) << "Loaded completion-gated BPE hierarchy for "
+  LOG(INFO) << "Loaded training-only BPE hierarchy for "
             << hierarchy_.size() << " records, sha256=" << hierarchy_sha256_;
   return absl::OkStatus();
 }
@@ -909,7 +709,7 @@ absl::Status ContinuationTrainer::ValidateMergeProgram(
     bool require_all_declared_pieces) const {
   std::set<std::string> constructible(atomic_pieces_ordered_.begin(),
                                       atomic_pieces_ordered_.end());
-  std::set<std::tuple<std::string, std::string, int>> seen_operations;
+  std::set<std::pair<std::string, std::string>> seen_operations;
   std::map<std::string, std::pair<std::string, std::string>>
       constructed_children;
   std::map<std::string, std::pair<int, bool>> pieces;
@@ -941,17 +741,14 @@ absl::Status ContinuationTrainer::ValidateMergeProgram(
     if (merge.left().empty() || merge.right().empty()) {
       return absl::InvalidArgumentError("merge parents must be nonempty");
     }
-    const int scope = merge.has_scope_level() ? merge.scope_level() : -1;
-    if (scope < -1) {
+    if (merge.has_scope_level() && merge.scope_level() >= 0) {
       return absl::InvalidArgumentError(
-          "merge scope_level must be -1 (unscoped) or nonnegative");
+          "scoped merge operations are not valid in a flat BPE program");
     }
-    if (!seen_operations
-             .insert(std::make_tuple(merge.left(), merge.right(), scope))
-             .second) {
+    if (!seen_operations.insert({merge.left(), merge.right()}).second) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "duplicate merge operation in effective program: ", merge.left(),
-          " + ", merge.right(), " scope=", scope));
+          "duplicate merge pair in effective flat program: ", merge.left(),
+          " + ", merge.right()));
     }
     if (!constructible.count(merge.left()) ||
         !constructible.count(merge.right())) {
@@ -985,8 +782,6 @@ absl::Status ContinuationTrainer::ValidateMergeProgram(
           child_seen->second.second, " later=", merge.left(), "+",
           merge.right()));
     }
-    // Repeating the SAME ancestry at another scope is intentional: it is one
-    // token ID with multiple scoped operations.
     constructible.insert(child);
   }
 
@@ -1489,7 +1284,7 @@ absl::Status ContinuationTrainer::ReplayMerges(
       ++absent;
       continue;
     }
-    Candidate* candidate = GetCandidate(left->second, right->second, 0);
+    Candidate* candidate = GetCandidate(left->second, right->second);
     if (candidate == nullptr) {
       return absl::InvalidArgumentError(absl::StrCat(
           label, " merge is incompatible with current trainer piece-shape "
@@ -1498,7 +1293,7 @@ absl::Status ContinuationTrainer::ReplayMerges(
     }
 
     // Inherited/bootstrap replay is authoritative and hierarchy-blind. The
-    // candidate index is unscoped until RebuildHierarchyCandidateIndex().
+    // candidate index is unscoped until RebuildHierarchySupportIndex().
     candidate->needs_recomputation = true;
     ComputeFreq(candidate);
     if (candidate->freq == 0) {
@@ -1543,78 +1338,64 @@ absl::Status ContinuationTrainer::LearnExpansion() {
     const std::pair<std::string, std::string> pair = {
         best->left_text, best->right_text};
 
-    int external_id = -1;
-    bool allocates_piece = false;
-    const auto child_it = piece_external_id_by_string_.find(child);
-    if (child_it != piece_external_id_by_string_.end()) {
-      // A second SCOPE for the SAME pair is a real operation and must survive
-      // into the artifact/runtime, but it constructs the same token ID.
-      const auto pair_it = pair_external_id_.find(pair);
-      if (pair_it == pair_external_id_.end() ||
-          pair_it->second != child_it->second) {
-        // Existing child through a different ancestry is redundant rather than
-        // a new vocabulary item. Preserve the existing construction policy.
-        best->active = false;
-        best->positions.clear();
-        continue;
-      }
-      external_id = child_it->second;
-    } else {
-      if (next_external_id_ == std::numeric_limits<int>::max()) {
-        return absl::OutOfRangeError(
-            "BPE continuation exhausted the external ID range");
-      }
-      external_id = next_external_id_++;
-      allocates_piece = true;
+    // Flat ranked BPE has one rule per pair and every learned rule creates a
+    // fresh child identity. Reusing an existing child (even through the same
+    // textual ancestry at a former hierarchy scope) would let a later rank
+    // manufacture an operand of an older rank and destroy monotonic replay.
+    if (pair_external_id_.count(pair) ||
+        piece_external_id_by_string_.count(child)) {
+      best->active = false;
+      best->pending = false;
+      best->positions.clear();
+      continue;
     }
+
+    if (next_external_id_ == std::numeric_limits<int>::max()) {
+      return absl::OutOfRangeError(
+          "BPE continuation exhausted the external ID range");
+    }
+    const int external_id = next_external_id_++;
 
     ExpansionMerge merge;
     merge.set_left(best->left_text);
     merge.set_right(best->right_text);
     merge.set_external_id(external_id);
+    // weighted_count is the hierarchy-supported selection weight. The flat
+    // application weight can be larger because the selected rule is global.
     merge.set_weighted_count(best->freq);
-    merge.set_grammar_level(best->scope_level);
-    // For a hierarchical artifact scope 0 is meaningful (ordinary/internal),
-    // so presence matters. Flat continuation stays unscoped for compatibility.
-    if (!hierarchy_.empty()) {
-      merge.set_scope_level(best->scope_level);
-    }
+    merge.set_grammar_level(0);
 
-    if (allocates_piece) {
-      ExpansionPiece piece;
-      piece.set_external_id(external_id);
-      piece.set_piece(child);
-      piece.set_type(ModelProto::SentencePiece::NORMAL);
-      piece.set_mergeable(true);
-      piece.set_atomic(false);
-      piece.set_score(-static_cast<float>(
-          base_merges_.size() + bootstrap_merges_.size() +
-          learned_merges_.size()));
+    ExpansionPiece piece;
+    piece.set_external_id(external_id);
+    piece.set_piece(child);
+    piece.set_type(ModelProto::SentencePiece::NORMAL);
+    piece.set_mergeable(true);
+    piece.set_atomic(false);
+    piece.set_score(-static_cast<float>(
+        base_merges_.size() + bootstrap_merges_.size() +
+        learned_merges_.size()));
 
-      learned_pieces_.push_back(piece);
-      existing_piece_strings_.insert(child);
-      piece_external_id_by_string_[child] = external_id;
-    }
+    learned_pieces_.push_back(piece);
+    existing_piece_strings_.insert(child);
+    piece_external_id_by_string_[child] = external_id;
 
-    // The operation spends a rank even when its token already exists from the
-    // same pair at another scope. Scope belongs to the operation, not the ID.
     const int selected_learned_rank =
         static_cast<int>(learned_merges_.size());
     learned_merges_.push_back(merge);
     pair_external_id_[pair] = external_id;
-    learned_rule_rank_[std::make_tuple(
-        best->left_text, best->right_text, best->scope_level)] =
-        selected_learned_rank;
 
-    ABSL_RETURN_IF_ERROR(
-        AcceptCandidateWithClosure(best, selected_learned_rank));
+    // State transition is ordinary global flat BPE. Because the child is
+    // fresh, this later rank cannot enable an older rule; therefore sequential
+    // training application equals ranked replay of the serialized prefix.
+    ABSL_RETURN_IF_ERROR(AcceptCandidate(best));
     live_by_string_[child] = best->result;
 
     if (!trainer_spec_.bpe_reference_trace_file().empty()) {
+      // Keep the historical trace column count: the former scope column is
+      // always zero for the flat program.
       reference_trace_lines_.push_back(absl::StrCat(
           selected_learned_rank, "\t", merge.left(), "\t", merge.right(),
-          "\t", best->scope_level, "\t", merge.weighted_count(), "\t",
-          allocates_piece ? 1 : 0, "\t", external_id, "\t",
+          "\t0\t", merge.weighted_count(), "\t1\t", external_id, "\t",
           FinalSegmentationSha256()));
     }
 
@@ -1973,13 +1754,6 @@ std::string ContinuationTrainer::BaseIdMapSha256() const {
 
 absl::Status ContinuationTrainer::BuildNativeModel(
     const std::vector<ExpansionMerge>& merges, ModelProto* model) const {
-  if (!hierarchy_sha256_.empty()) {
-    return absl::FailedPreconditionError(
-        "hierarchical completion is part of BPE inference semantics; native "
-        "SentencePiece has no per-occurrence hierarchy gate, so emitting a "
-        "native .model would be semantically false");
-  }
-
   std::vector<ExpansionPiece> pieces = base_pieces_;
   pieces.insert(pieces.end(), bootstrap_pieces_.begin(), bootstrap_pieces_.end());
   pieces.insert(pieces.end(), learned_pieces_.begin(), learned_pieces_.end());
@@ -2098,28 +1872,22 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   ABSL_RETURN_IF_ERROR(
       ValidateMergeProgram(effective, /*require_all_declared_pieces=*/true));
 
-  // Flat replay is a valid reachability oracle only for a flat BPE program.
-  // In a hierarchical program it is actively wrong: after /+12 is learned
-  // from /12, flat replay would fire that earlier rule inside /128 and falsely
-  // declare a later /+128 construction unreachable. Every hierarchical learned
-  // merge already has a stronger witness: it was accepted from at least one
-  // positive-weight, hierarchy-eligible live occurrence, and
-  // ValidateMergeProgram above proves its parents are rank-constructible.
-  if (hierarchy_.empty()) {
-    int unreachable = 0;
-    const PairRanks pair_rank = BuildPairRanks(effective);
-    for (const auto& piece : learned_pieces_) {
-      if (!IsReachable(piece.piece(), pair_rank)) {
-        ++unreachable;
-        LOG(ERROR) << "unreachable learned BPE piece id=" << piece.external_id()
-                   << " piece=" << piece.piece();
-      }
+  // The serialized artifact is always a flat ranked BPE program, even when
+  // hierarchy guided merge selection. Every learned piece must therefore be
+  // reachable under ordinary flat replay.
+  int unreachable = 0;
+  const PairRanks pair_rank = BuildPairRanks(effective);
+  for (const auto& piece : learned_pieces_) {
+    if (!IsReachable(piece.piece(), pair_rank)) {
+      ++unreachable;
+      LOG(ERROR) << "unreachable learned BPE piece id=" << piece.external_id()
+                 << " piece=" << piece.piece();
     }
-    if (unreachable != 0) {
-      return absl::FailedPreconditionError(absl::StrCat(
-          "BPE expansion failed reachability verification: ", unreachable,
-          " learned pieces are unreachable in the serialized final merge table"));
-    }
+  }
+  if (unreachable != 0) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "BPE expansion failed reachability verification: ", unreachable,
+        " learned pieces are unreachable in the serialized final merge table"));
   }
 
   ExpansionResult result;
@@ -2184,7 +1952,7 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   result.set_pretokenizer_sha256(expansion_spec_.pretokenizer_sha256());
   if (!hierarchy_sha256_.empty()) {
     result.set_boundary_policy(
-        absl::StrCat("bpe_hierarchical_completion_v1:", hierarchy_sha256_));
+        absl::StrCat("bpe_hierarchy_guided_training_v1:", hierarchy_sha256_));
   } else if (!fence_surfaces_.empty()) {
     result.set_boundary_policy(EncodeBpeBoundaryPolicy(fence_surfaces_));
   } else {
@@ -2294,7 +2062,6 @@ absl::Status ContinuationTrainer::Train() {
   atomic_piece_strings_.clear();
   piece_external_id_by_string_.clear();
   pair_external_id_.clear();
-  learned_rule_rank_.clear();
   atomic_pieces_ordered_.clear();
   user_defined_matcher_.reset();
   user_defined_piece_strings_.clear();
@@ -2305,7 +2072,7 @@ absl::Status ContinuationTrainer::Train() {
   span_begin_.clear();
   span_end_.clear();
   hierarchy_sha256_.clear();
-  hierarchy_gating_enabled_ = false;
+  hierarchy_support_enabled_ = false;
   live_by_string_.clear();
   base_pieces_.clear();
   bootstrap_pieces_.clear();
@@ -2345,7 +2112,7 @@ absl::Status ContinuationTrainer::Train() {
   // sees the continuation hierarchy. This is required for Qwen/base expansion
   // compatibility as well as for semantic parity with hierarchy-aware runtime.
   if (!hierarchy_.empty()) {
-    ABSL_RETURN_IF_ERROR(RebuildHierarchyCandidateIndex());
+    ABSL_RETURN_IF_ERROR(RebuildHierarchySupportIndex());
   }
   ABSL_RETURN_IF_ERROR(LearnExpansion());
   ABSL_RETURN_IF_ERROR(FinalizeArtifacts());
