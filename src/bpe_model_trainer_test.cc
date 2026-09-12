@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <random>
 #include <set>
@@ -1437,7 +1438,7 @@ TEST(BPETrainerTest, RandomLaminarHierarchyMatchesIndependentReplayOracle) {
       filesystem::JoinPath(::testing::TempDir(), "oracle_random_model");
   const std::string result_path = prefix + ".expansion";
 
-  constexpr int kRows = 512;
+  constexpr int kRows = 2048;
   constexpr int kLength = 6;
   constexpr int kRequested = 24;
   std::mt19937 rng(0x1A2B3C4Du);
