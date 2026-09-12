@@ -232,38 +232,71 @@ absl::Status ExpansionProcessor::SegmentAtoms(
   atoms->clear();
   if (text.empty()) return absl::OkStatus();
 
-  // Mirror ContinuationTrainer::SegmentAtoms exactly: zero parses means the
-  // artifact omitted a required atom; multiple parses mean its declared
-  // reversible representation is ambiguous. Byte offsets are intentional.
+  // Training requires one exact all-atom parse. Runtime additionally preserves
+  // SentencePiece's UNKNOWN contract: uncovered Unicode scalars become UNKNOWN
+  // units. Choose the parse with the FEWEST unknown scalars and reject ties.
+  // Thus a valid declared atom always beats spelling the same bytes as UNKNOWN,
+  // while genuinely ambiguous covered representations still fail closed.
   const size_t n = text.size();
+  const int kInf = static_cast<int>(n) + 1;
+  std::vector<int> best_unknowns(n + 1, kInf);
   std::vector<unsigned char> ways(n + 1, 0);
-  std::vector<int> choice(n + 1, -1);
+  std::vector<int> choice(n + 1, -1);       // atom index; -2 = UNKNOWN scalar
+  std::vector<size_t> choice_len(n + 1, 0); // consumed UTF-8 bytes
+  best_unknowns[n] = 0;
   ways[n] = 1;
+
   for (size_t reverse = 0; reverse < n; ++reverse) {
     const size_t pos = n - reverse - 1;
-    int total = 0;
-    int unique_choice = -1;
+    int best = kInf;
+    int count = 0;
+    int best_choice = -1;
+    size_t best_len = 0;
+
+    auto consider = [&](int cost, int multiplicity, int candidate_choice,
+                        size_t candidate_len) {
+      if (multiplicity <= 0) return;
+      if (cost < best) {
+        best = cost;
+        count = std::min(2, multiplicity);
+        best_choice = count == 1 ? candidate_choice : -1;
+        best_len = count == 1 ? candidate_len : 0;
+      } else if (cost == best) {
+        count = std::min(2, count + multiplicity);
+        best_choice = -1;
+        best_len = 0;
+      }
+    };
+
     for (size_t i = 0; i < atomic_pieces_ordered_.size(); ++i) {
       const std::string& atom = atomic_pieces_ordered_[i];
-      if (atom.size() > n - pos || ways[pos + atom.size()] == 0) continue;
+      const size_t next = pos + atom.size();
+      if (next > n || ways[next] == 0) continue;
       if (text.substr(pos, atom.size()) != atom) continue;
-      if (total == 0 && ways[pos + atom.size()] == 1) {
-        unique_choice = static_cast<int>(i);
-      } else {
-        unique_choice = -1;
-      }
-      total = std::min(2, total + static_cast<int>(ways[pos + atom.size()]));
-      if (total == 2) unique_choice = -1;
+      consider(best_unknowns[next], ways[next], static_cast<int>(i),
+               atom.size());
     }
-    ways[pos] = static_cast<unsigned char>(total);
-    if (total == 1) choice[pos] = unique_choice;
+
+    // UNKNOWN fallback consumes one complete Unicode scalar, never a partial
+    // UTF-8 byte sequence.
+    const unsigned char lead = static_cast<unsigned char>(text[pos]);
+    if ((lead & 0xC0) != 0x80) {
+      const size_t len = std::min<size_t>(
+          string_util::OneCharLen(text.data() + pos), n - pos);
+      const size_t next = pos + len;
+      if (len > 0 && next <= n && ways[next] != 0) {
+        consider(1 + best_unknowns[next], ways[next], -2, len);
+      }
+    }
+
+    best_unknowns[pos] = best;
+    ways[pos] = static_cast<unsigned char>(count);
+    if (count == 1) {
+      choice[pos] = best_choice;
+      choice_len[pos] = best_len;
+    }
   }
 
-  if (ways[0] == 0) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "text cannot be segmented by the declared reversible atomic alphabet: ",
-        text));
-  }
   if (ways[0] != 1) {
     return absl::InvalidArgumentError(absl::StrCat(
         "declared BPE atomic alphabet is ambiguous for text: ", text));
@@ -271,15 +304,22 @@ absl::Status ExpansionProcessor::SegmentAtoms(
 
   size_t pos = 0;
   while (pos < n) {
-    const int index = choice[pos];
-    if (index < 0 ||
-        index >= static_cast<int>(atomic_pieces_ordered_.size())) {
+    const int selected = choice[pos];
+    const size_t len = choice_len[pos];
+    if (len == 0 || pos + len > n) {
       return absl::InternalError(
-          "unique atomic segmentation lost its reconstruction choice");
+          "unique atomic/UNKNOWN segmentation lost reconstruction");
     }
-    const std::string& atom = atomic_pieces_ordered_[index];
-    atoms->push_back(atom);
-    pos += atom.size();
+    if (selected == -2) {
+      atoms->push_back(std::string(text.substr(pos, len)));
+    } else if (selected >= 0 &&
+               selected < static_cast<int>(atomic_pieces_ordered_.size())) {
+      atoms->push_back(atomic_pieces_ordered_[selected]);
+    } else {
+      return absl::InternalError(
+          "unique atomic/UNKNOWN segmentation has invalid choice");
+    }
+    pos += len;
   }
   return absl::OkStatus();
 }
