@@ -1654,6 +1654,30 @@ std::vector<ExpansionMerge> ContinuationTrainer::EffectiveMergeTable() const {
   return out;
 }
 
+
+std::string ContinuationTrainer::FinalSegmentationSha256() const {
+  // PreparedCorpus is already normalized, duplicate-folded and byte-sorted.
+  // Length prefixes make the representation unambiguous even when a token
+  // contains the whitespace marker or other punctuation.
+  std::string canonical;
+  for (size_t sid = 0; sid < symbols_.size(); ++sid) {
+    const std::string& row = sentences_[sid].first;
+    uint64_t live = 0;
+    for (const Symbol* symbol : symbols_[sid]) {
+      if (symbol != nullptr) ++live;
+    }
+    absl::StrAppend(&canonical, row.size(), ":", row, "\t",
+                    sentences_[sid].second, "\t", live);
+    for (const Symbol* symbol : symbols_[sid]) {
+      if (symbol == nullptr) continue;
+      const std::string piece = symbol->ToString();
+      absl::StrAppend(&canonical, "\t", piece.size(), ":", piece);
+    }
+    canonical.push_back('\n');
+  }
+  return continuation::Sha256Hex(canonical);
+}
+
 ContinuationTrainer::PairRanks ContinuationTrainer::BuildPairRanks(
     const std::vector<ExpansionMerge>& merges) {
   PairRanks pair_rank;
@@ -2123,6 +2147,8 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   }
   result.set_training_final_tokens(final_tokens);
   result.set_training_final_weighted_tokens(final_weighted_tokens);
+  result.set_training_final_segmentation_sha256(
+      FinalSegmentationSha256());
 
   result.set_rank_prepend(expansion_spec_.allow_rank_prepend());
   result.set_vocab_sha256(expansion_spec_.vocab_sha256());
