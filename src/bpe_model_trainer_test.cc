@@ -1425,6 +1425,170 @@ TEST(BPETrainerTest, SamePairAtTwoScopesSharesOneTokenId) {
 }
 
 
+
+TEST(BPETrainerTest, RandomLaminarHierarchyMatchesIndependentReplayOracle) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "oracle_random_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "oracle_random.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "oracle_random.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "oracle_random_model");
+  const std::string result_path = prefix + ".expansion";
+
+  constexpr int kRows = 512;
+  constexpr int kLength = 6;
+  constexpr int kRequested = 24;
+  std::mt19937 rng(0x1A2B3C4Du);
+  std::uniform_int_distribution<int> weight_dist(1, 5);
+
+  std::vector<RefRow> rows;
+  rows.reserve(kRows);
+  for (int n = 0; n < kRows; ++n) {
+    int x = n;
+    std::string text(kLength, 'a');
+    for (int i = kLength - 1; i >= 0; --i) {
+      text[i] = "abcd"[x & 3];
+      x >>= 2;
+    }
+    RefRow row;
+    row.text = text;
+    row.weight = weight_dist(rng);
+    BuildRandomLaminarGates(0, kLength, 0, &rng, &row.gates);
+    rows.push_back(std::move(row));
+  }
+
+  {
+    auto out = filesystem::NewWritableFile(input);
+    for (const RefRow& row : rows) {
+      ASSERT_TRUE(out->WriteLine(
+          absl::StrCat(row.text, "\t", row.weight)));
+    }
+  }
+  {
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    for (const RefRow& row : rows) {
+      std::vector<std::string> encoded;
+      for (const RefGate& gate : row.gates) {
+        encoded.push_back(absl::StrCat(
+            gate.level, ":", absl::StrJoin(gate.cuts, ",")));
+      }
+      ASSERT_TRUE(out->WriteLine(
+          absl::StrCat(row.text, "\t", absl::StrJoin(encoded, ";"))));
+    }
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(5);
+  expansion.set_requested_new_pieces(kRequested);
+  auto add = [&](int id, absl::string_view piece, bool atomic) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(id == 0 ? ModelProto::SentencePiece::UNKNOWN
+                        : ModelProto::SentencePiece::NORMAL);
+    p->set_mergeable(id != 0);
+    p->set_atomic(atomic);
+  };
+  add(0, "<unk>", false);
+  add(1, "a", true); add(2, "b", true);
+  add(3, "c", true); add(4, "d", true);
+  {
+    auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString()));
+  }
+
+  // Run the deliberately slow oracle BEFORE reading trainer output. It starts
+  // from atoms and full-replays the complete scoped prefix after every rank.
+  const RefRun reference =
+      RunScopedReference(rows, /*first_new_external_id=*/5, kRequested);
+  ASSERT_EQ(kRequested,
+            std::count_if(reference.rules.begin(), reference.rules.end(),
+                          [](const RefRule& r) { return r.allocated; }));
+
+  TrainerSpec ts;
+  ts.set_model_type(TrainerSpec::BPE);
+  ts.add_input(input);
+  ts.set_input_format("tsv");
+  ts.set_model_prefix(prefix);
+  ts.set_vocab_size(5 + kRequested);
+  ts.set_expansion_spec(spec_path);
+  ts.set_expansion_result(result_path);
+  ts.set_bpe_hierarchy_file(hierarchy);
+  ts.set_input_sentence_size(0);
+  ts.set_split_by_whitespace(false);
+  ts.set_split_by_unicode_script(false);
+  ts.set_split_by_number(false);
+  ts.set_split_digits(false);
+  ts.set_max_sentencepiece_length(50);
+  ts.set_bos_id(-1); ts.set_eos_id(-1); ts.set_pad_id(-1);
+  ts.set_hard_vocab_limit(true);
+  NormalizerSpec ns;
+  ns.set_name("identity");
+  ns.set_add_dummy_prefix(false);
+  ns.set_remove_extra_whitespaces(false);
+  NormalizerSpec dns;
+
+  ASSERT_TRUE(SentencePieceTrainer::Train(ts, ns, dns).ok());
+
+  std::string bytes;
+  {
+    auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes));
+  }
+  ExpansionResult result;
+  ASSERT_TRUE(result.ParseFromString(bytes));
+
+  ASSERT_EQ(reference.rules.size(),
+            static_cast<size_t>(result.learned_merges_size()));
+  for (size_t rank = 0; rank < reference.rules.size(); ++rank) {
+    const RefRule& want = reference.rules[rank];
+    const ExpansionMerge& got =
+        result.learned_merges(static_cast<int>(rank));
+    EXPECT_EQ(static_cast<int>(rank), got.rank()) << "rank " << rank;
+    EXPECT_EQ(want.left, got.left()) << "rank " << rank;
+    EXPECT_EQ(want.right, got.right()) << "rank " << rank;
+    EXPECT_EQ(want.scope, got.scope_level()) << "rank " << rank;
+    EXPECT_EQ(want.count, got.weighted_count()) << "rank " << rank;
+    EXPECT_EQ(want.external_id, got.external_id()) << "rank " << rank;
+  }
+  ASSERT_EQ(kRequested, result.learned_pieces_size());
+
+  ASSERT_TRUE(result.has_training_final_segmentation_sha256());
+  EXPECT_EQ(reference.final_sha256,
+            result.training_final_segmentation_sha256())
+      << "optimized trainer final state differs from restart-and-replay oracle";
+
+  // Runtime is a third implementation. Check every generated tree, not only
+  // the final aggregate token count.
+  expansion::ExpansionProcessor runtime;
+  ASSERT_TRUE(runtime.Load(result).ok());
+  for (size_t sid = 0; sid < rows.size(); ++sid) {
+    std::vector<expansion::CompletionGate> gates;
+    for (const RefGate& g : rows[sid].gates) {
+      expansion::CompletionGate gate;
+      gate.level = g.level;
+      gate.cuts = g.cuts;
+      gates.push_back(std::move(gate));
+    }
+    std::vector<expansion::TokenSpan> got;
+    ASSERT_TRUE(runtime.EncodeWithHierarchy(
+        rows[sid].text, gates, &got).ok()) << "sid=" << sid;
+    std::vector<std::string> pieces;
+    for (const auto& token : got) pieces.push_back(token.piece);
+    std::vector<std::string> want;
+    for (const RefToken& token : reference.final_rows[sid]) {
+      want.push_back(token.piece);
+    }
+    EXPECT_EQ(want, pieces) << "sid=" << sid << " text=" << rows[sid].text;
+  }
+}
+
 TEST(BPETrainerTest, ScopedAliasReplaysEarlierRanksToFixedPoint) {
   const std::string input =
       filesystem::JoinPath(::testing::TempDir(), "alias_cascade_input.tsv");
