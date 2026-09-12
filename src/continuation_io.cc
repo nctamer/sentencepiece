@@ -56,6 +56,7 @@ absl::Status LoadPreparedCorpus(const TrainerSpec& trainer_spec,
     return absl::InvalidArgumentError("PreparedCorpus must not be null");
   }
   corpus->sentences.clear();
+  corpus->metadata_keys.clear();
   corpus->weighted_sentence_count = 0;
 
   if (trainer_spec.input_sentence_size() != 0) {
@@ -71,9 +72,10 @@ absl::Status LoadPreparedCorpus(const TrainerSpec& trainer_spec,
   }
   if (!(trainer_spec.input_format().empty() ||
         trainer_spec.input_format() == "text" ||
-        trainer_spec.input_format() == "tsv")) {
+        trainer_spec.input_format() == "tsv" ||
+        trainer_spec.input_format() == "tsv_meta")) {
     return absl::InvalidArgumentError(
-        "continuation input_format must be text or tsv");
+        "continuation input_format must be text, tsv, or tsv_meta");
   }
 
   const bool has_iterator = components.sentence_iterator != nullptr;
@@ -96,21 +98,34 @@ absl::Status LoadPreparedCorpus(const TrainerSpec& trainer_spec,
   if (!normalizer.status().ok()) return normalizer.status();
 
   const bool is_tsv = trainer_spec.input_format() == "tsv";
-  // Ordered, so the canonical corpus order does not depend on a hash seed.
-  std::map<std::string, int64_t> aggregated;
+  const bool is_tsv_meta = trainer_spec.input_format() == "tsv_meta";
+  // The metadata key participates only in training-row identity. It is not
+  // tokenized and can never become a deployed piece.
+  std::map<std::pair<std::string, std::string>, int64_t> aggregated;
   for (; !iterator->done(); iterator->Next()) {
     std::string sentence = iterator->value();
+    std::string metadata_key;
     int64_t freq = 1;
-    if (is_tsv) {
+    if (is_tsv || is_tsv_meta) {
       const std::vector<std::string> fields = absl::StrSplit(sentence, '\t');
-      if (fields.size() != 2) {
+      const size_t want = is_tsv_meta ? 3 : 2;
+      if (fields.size() != want) {
         return absl::InvalidArgumentError(absl::StrCat(
-            "continuation TSV must be <unit><tab><count>: ", sentence));
+            "continuation ", is_tsv_meta ? "tsv_meta" : "TSV",
+            " must be <unit><tab><count>",
+            is_tsv_meta ? "<tab><metadata-key>: " : ": ", sentence));
       }
       sentence = fields[0];
       if (!absl::SimpleAtoi(fields[1], &freq) || freq < 1) {
         return absl::InvalidArgumentError(
             absl::StrCat("invalid continuation TSV count: ", fields[1]));
+      }
+      if (is_tsv_meta) {
+        metadata_key = fields[2];
+        if (metadata_key.empty()) {
+          return absl::InvalidArgumentError(
+              "tsv_meta metadata key must not be empty");
+        }
       }
     }
     if (sentence.empty()) continue;
@@ -130,20 +145,8 @@ absl::Status LoadPreparedCorpus(const TrainerSpec& trainer_spec,
     }
     corpus->weighted_sentence_count += freq;
 
-    // Continuation reads its corpus as a MULTISET of weighted records, not as
-    // a sequence of lines. Identical records are folded together and the
-    // result is kept in one canonical order.
-    //
-    // That is what makes "a weighted TSV equals physical repetition" true by
-    // construction rather than approximately. Otherwise the two spellings of
-    // the same corpus take different summation paths - n*p once against p
-    // added n times - and float addition is not associative, so they disagree
-    // in the last bits. Those bits then decide which of two equally scored
-    // extension pieces gets the lower external ID, and an ID is an ABI.
-    //
-    // It also makes a run independent of the order lines happen to sit in the
-    // input file, which is the same reproducibility promise stated once more.
-    auto inserted = aggregated.emplace(std::move(normalized), freq);
+    auto key = std::make_pair(std::move(normalized), std::move(metadata_key));
+    auto inserted = aggregated.emplace(std::move(key), freq);
     if (!inserted.second) {
       int64_t& total = inserted.first->second;
       if (freq > std::numeric_limits<int64_t>::max() - total) {
@@ -158,8 +161,10 @@ absl::Status LoadPreparedCorpus(const TrainerSpec& trainer_spec,
     return absl::InvalidArgumentError("continuation corpus is empty");
   }
   corpus->sentences.reserve(aggregated.size());
+  corpus->metadata_keys.reserve(aggregated.size());
   for (auto& entry : aggregated) {
-    corpus->sentences.emplace_back(entry.first, entry.second);
+    corpus->sentences.emplace_back(entry.first.first, entry.second);
+    corpus->metadata_keys.emplace_back(entry.first.second);
   }
   return absl::OkStatus();
 }
