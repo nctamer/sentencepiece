@@ -130,6 +130,12 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
       }
       merges.push_back({m, m.scope_level()});
     } else {
+      if (m.has_scope_level() && m.scope_level() >= 0) {
+        status_ = absl::FailedPreconditionError(
+            "scoped learned merge appears without a hierarchical "
+            "boundary_policy");
+        return status_;
+      }
       merges.push_back({m, -1});
     }
   }
