@@ -2928,8 +2928,10 @@ TEST(ExpansionProcessorTest, HierarchyEligibilityIsOccurrenceLocalAtRuntime) {
   }
   auto* m0 = r.add_learned_merges();
   m0->set_rank(0); m0->set_left("1"); m0->set_right("2");
+  m0->set_scope_level(0);
   auto* m1 = r.add_learned_merges();
   m1->set_rank(1); m1->set_left("/"); m1->set_right("12");
+  m1->set_scope_level(1);
   *r.mutable_contract()->mutable_normalizer_spec() = MusicNormalizer();
   r.set_boundary_policy("bpe_hierarchical_completion_v1:test");
 
@@ -2963,6 +2965,63 @@ TEST(ExpansionProcessorTest, HierarchyEligibilityIsOccurrenceLocalAtRuntime) {
             got)
       << "the SAME global /+12 rule must be blocked only in the /128 "
          "occurrence; /128 must not poison /12 globally";
+}
+
+
+TEST(ExpansionProcessorTest, SamePairCanHaveDistinctExactScopeRules) {
+  ExpansionResult r;
+  r.set_schema_version(1);
+  r.set_model_type(EXPANSION_BPE);
+  int id = 0;
+  for (const auto& [piece, type] :
+       std::vector<std::pair<std::string, int>>{
+           {"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL},
+           {"a", kNORMAL}, {"b", kNORMAL}}) {
+    auto* p = r.add_base_pieces();
+    p->set_external_id(id++);
+    p->set_piece(piece);
+    p->set_type(static_cast<ModelProto::SentencePiece::Type>(type));
+  }
+  auto* ab = r.add_learned_pieces();
+  ab->set_external_id(id);
+  ab->set_piece("ab");
+  ab->set_type(ModelProto::SentencePiece::NORMAL);
+
+  auto* ordinary = r.add_learned_merges();
+  ordinary->set_rank(0);
+  ordinary->set_left("a");
+  ordinary->set_right("b");
+  ordinary->set_external_id(id);
+  ordinary->set_scope_level(0);
+
+  auto* level1 = r.add_learned_merges();
+  level1->set_rank(1);
+  level1->set_left("a");
+  level1->set_right("b");
+  level1->set_external_id(id);
+  level1->set_scope_level(1);
+
+  *r.mutable_contract()->mutable_normalizer_spec() = MusicNormalizer();
+  r.set_boundary_policy("bpe_hierarchical_completion_v1:test");
+
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+
+  // No completion boundary at a|b -> exact scope 0.
+  std::vector<expansion::TokenSpan> ordinary_out;
+  ASSERT_TRUE(p.EncodeWithHierarchy("ab", {}, &ordinary_out).ok());
+  ASSERT_EQ(2u, ordinary_out.size());
+  EXPECT_EQ("ab", ordinary_out[1].piece);
+
+  // The same surface pair at a level-1 completion boundary must select the
+  // scope-1 operation, not the earlier scope-0 operation.
+  expansion::CompletionGate gate;
+  gate.level = 1;
+  gate.cuts = {3, 4, 5};  // normalized "▁ab": "a" | "b"
+  std::vector<expansion::TokenSpan> scoped_out;
+  ASSERT_TRUE(p.EncodeWithHierarchy("ab", {gate}, &scoped_out).ok());
+  ASSERT_EQ(2u, scoped_out.size());
+  EXPECT_EQ("ab", scoped_out[1].piece);
 }
 
 TEST(ExpansionProcessorTest, InheritedMergesAreNeverVetoedByNewHierarchy) {
