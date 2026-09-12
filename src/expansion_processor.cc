@@ -28,6 +28,7 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
   id_to_piece_.clear(); id_to_type_.clear();
   piece_to_id_.clear(); merge_rules_.clear();
   user_defined_matcher_.reset();
+  atomic_pieces_ordered_.clear();
   requires_hierarchy_ = false;
   has_inherited_merge_program_ = false;
 
@@ -56,6 +57,12 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
     id_to_piece_[i] = pieces[i].piece();
     id_to_type_[i] = static_cast<int>(pieces[i].type());
     piece_to_id_[pieces[i].piece()] = static_cast<int>(i);
+    if (pieces[i].type() == ModelProto::SentencePiece::NORMAL &&
+        (pieces[i].atomic() ||
+         (pieces[i].mergeable() &&
+          string_util::UTF8Len(pieces[i].piece()) == 1))) {
+      atomic_pieces_ordered_.push_back(pieces[i].piece());
+    }
     if (pieces[i].type() == ModelProto::SentencePiece::UNKNOWN) {
       ++unknown_count;
       unk_id_ = static_cast<int>(i);
@@ -65,6 +72,15 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
   if (unknown_count != 1) {
     status_ = absl::FailedPreconditionError(absl::StrCat(
         "expected exactly one UNKNOWN piece, found ", unknown_count));
+    return status_;
+  }
+  std::sort(atomic_pieces_ordered_.begin(), atomic_pieces_ordered_.end());
+  atomic_pieces_ordered_.erase(
+      std::unique(atomic_pieces_ordered_.begin(), atomic_pieces_ordered_.end()),
+      atomic_pieces_ordered_.end());
+  if (atomic_pieces_ordered_.empty()) {
+    status_ = absl::FailedPreconditionError(
+        "ExpansionResult has no reversible atomic BPE alphabet");
     return status_;
   }
 
@@ -208,6 +224,66 @@ std::string ExpansionProcessor::Normalize(absl::string_view text) const {
   return normalizer_->Normalize(text);
 }
 
+absl::Status ExpansionProcessor::SegmentAtoms(
+    absl::string_view text, std::vector<std::string>* atoms) const {
+  if (atoms == nullptr) {
+    return absl::InvalidArgumentError("atomic segmentation output is null");
+  }
+  atoms->clear();
+  if (text.empty()) return absl::OkStatus();
+
+  // Mirror ContinuationTrainer::SegmentAtoms exactly: zero parses means the
+  // artifact omitted a required atom; multiple parses mean its declared
+  // reversible representation is ambiguous. Byte offsets are intentional.
+  const size_t n = text.size();
+  std::vector<unsigned char> ways(n + 1, 0);
+  std::vector<int> choice(n + 1, -1);
+  ways[n] = 1;
+  for (size_t reverse = 0; reverse < n; ++reverse) {
+    const size_t pos = n - reverse - 1;
+    int total = 0;
+    int unique_choice = -1;
+    for (size_t i = 0; i < atomic_pieces_ordered_.size(); ++i) {
+      const std::string& atom = atomic_pieces_ordered_[i];
+      if (atom.size() > n - pos || ways[pos + atom.size()] == 0) continue;
+      if (text.substr(pos, atom.size()) != atom) continue;
+      if (total == 0 && ways[pos + atom.size()] == 1) {
+        unique_choice = static_cast<int>(i);
+      } else {
+        unique_choice = -1;
+      }
+      total = std::min(2, total + static_cast<int>(ways[pos + atom.size()]));
+      if (total == 2) unique_choice = -1;
+    }
+    ways[pos] = static_cast<unsigned char>(total);
+    if (total == 1) choice[pos] = unique_choice;
+  }
+
+  if (ways[0] == 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "text cannot be segmented by the declared reversible atomic alphabet: ",
+        text));
+  }
+  if (ways[0] != 1) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "declared BPE atomic alphabet is ambiguous for text: ", text));
+  }
+
+  size_t pos = 0;
+  while (pos < n) {
+    const int index = choice[pos];
+    if (index < 0 ||
+        index >= static_cast<int>(atomic_pieces_ordered_.size())) {
+      return absl::InternalError(
+          "unique atomic segmentation lost its reconstruction choice");
+    }
+    const std::string& atom = atomic_pieces_ordered_[index];
+    atoms->push_back(atom);
+    pos += atom.size();
+  }
+  return absl::OkStatus();
+}
+
 const std::string& ExpansionProcessor::IdToPiece(int id) const {
   static const std::string kEmpty;
   if (id < 0 || id >= static_cast<int>(id_to_piece_.size())) return kEmpty;
@@ -339,24 +415,49 @@ absl::Status ExpansionProcessor::EncodeImpl(
     bool alive = true;
   };
   std::vector<Sym> syms;
-  for (size_t i = 0; i < norm.size();) {
-    const absl::string_view rest(norm.data() + i, norm.size() - i);
-    bool found = false;
-    size_t len = 0;
-    if (user_defined_matcher_ != nullptr) {
-      len = static_cast<size_t>(
-          user_defined_matcher_->PrefixMatch(rest, &found));
-    }
-    if (!found) {
-      len = std::min<size_t>(string_util::OneCharLen(norm.data() + i),
-                             norm.size() - i);
-    }
+  auto push_symbol = [&](absl::string_view piece, size_t begin, size_t end,
+                         bool frozen) {
     const int idx = static_cast<int>(syms.size());
-    syms.push_back(
-        {norm.substr(i, len), static_cast<int>(i),
-         static_cast<int>(i + len), idx - 1, -1, 0, found, true});
+    syms.push_back({std::string(piece), static_cast<int>(begin),
+                    static_cast<int>(end), idx - 1, -1, 0, frozen, true});
     if (idx > 0) syms[idx - 1].next = idx;
-    i += len;
+  };
+
+  std::vector<std::string> atoms;
+  auto flush_run = [&](absl::string_view run, size_t begin) -> absl::Status {
+    if (run.empty()) return absl::OkStatus();
+    ABSL_RETURN_IF_ERROR(SegmentAtoms(run, &atoms));
+    size_t cursor = begin;
+    for (const std::string& atom : atoms) {
+      push_symbol(atom, cursor, cursor + atom.size(), false);
+      cursor += atom.size();
+    }
+    return absl::OkStatus();
+  };
+
+  if (user_defined_matcher_ == nullptr) {
+    ABSL_RETURN_IF_ERROR(flush_run(norm, 0));
+  } else {
+    size_t run_begin = 0;
+    for (size_t i = 0; i < norm.size();) {
+      bool found = false;
+      const int matched =
+          user_defined_matcher_->PrefixMatch(
+              absl::string_view(norm).substr(i), &found);
+      if (!found) {
+        i += static_cast<size_t>(matched);
+        continue;
+      }
+      ABSL_RETURN_IF_ERROR(
+          flush_run(absl::string_view(norm).substr(run_begin, i - run_begin),
+                    run_begin));
+      const size_t len = static_cast<size_t>(matched);
+      push_symbol(absl::string_view(norm).substr(i, len), i, i + len, true);
+      i += len;
+      run_begin = i;
+    }
+    ABSL_RETURN_IF_ERROR(
+        flush_run(absl::string_view(norm).substr(run_begin), run_begin));
   }
   if (syms.empty()) return absl::OkStatus();
 
