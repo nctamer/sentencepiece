@@ -437,6 +437,25 @@ absl::Status ExpansionProcessor::EncodeImpl(
           return absl::InvalidArgumentError(
               "completion hierarchy spans are not laminar");
         }
+        auto child_compatible = [](const std::vector<int>& outer,
+                                   const std::vector<int>& inner) {
+          bool crosses_outer_child_boundary = false;
+          for (size_t k = 1; k + 1 < outer.size(); ++k) {
+            if (inner.front() < outer[k] && outer[k] < inner.back()) {
+              crosses_outer_child_boundary = true;
+              break;
+            }
+          }
+          if (!crosses_outer_child_boundary) return true;
+          return std::binary_search(outer.begin(), outer.end(), inner.front()) &&
+                 std::binary_search(outer.begin(), outer.end(), inner.back());
+        };
+        if ((a_contains && !child_compatible(a, b)) ||
+            (b_contains && !child_compatible(b, a))) {
+          return absl::InvalidArgumentError(
+              "nested completion parent crosses an outer direct-child "
+              "boundary");
+        }
       }
     }
   } else if (requires_hierarchy_) {
