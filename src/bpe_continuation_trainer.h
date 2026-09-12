@@ -251,9 +251,9 @@ class ContinuationTrainer : public TrainerInterface {
   // starts inside, ends inside, contains or spans a fence occurrence.
   std::vector<std::vector<int>> fence_group_;
 
-  // Optional completion-gated grammar state, one entry per PreparedCorpus row.
-  // span_begin_/span_end_ are indexed like symbols_; a merge keeps the left
-  // slot and extends its end to the consumed right token's end.
+  // Optional training-only hierarchy state, one entry per PreparedCorpus row.
+  // span_begin_/span_end_ are indexed like symbols_; a flat merge keeps the
+  // left slot and extends its end to the consumed right token's end.
   std::vector<HierarchyRecord> hierarchy_;
   std::vector<std::vector<size_t>> span_begin_;
   std::vector<std::vector<size_t>> span_end_;
