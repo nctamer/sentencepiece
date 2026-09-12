@@ -664,6 +664,27 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
           return absl::InvalidArgumentError(
               "BPE hierarchy spans are not laminar");
         }
+        auto child_compatible = [](const HierarchyGate& outer,
+                                   const HierarchyGate& inner) {
+          bool crosses_outer_child_boundary = false;
+          for (size_t k = 1; k + 1 < outer.cuts.size(); ++k) {
+            if (inner.begin < outer.cuts[k] && outer.cuts[k] < inner.end) {
+              crosses_outer_child_boundary = true;
+              break;
+            }
+          }
+          if (!crosses_outer_child_boundary) return true;
+          return std::binary_search(outer.cuts.begin(), outer.cuts.end(),
+                                    inner.begin) &&
+                 std::binary_search(outer.cuts.begin(), outer.cuts.end(),
+                                    inner.end);
+        };
+        if ((a_contains && !child_compatible(a, b)) ||
+            (b_contains && !child_compatible(b, a))) {
+          return absl::InvalidArgumentError(
+              "nested BPE hierarchy parent crosses an outer direct-child "
+              "boundary");
+        }
       }
     }
   }
