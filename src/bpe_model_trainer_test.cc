@@ -777,6 +777,16 @@ TEST(BPETrainerTest, ExpansionRuntimeUsesDeclaredMultiCodepointAtoms) {
   EXPECT_EQ("abc", out[0].piece);
   EXPECT_EQ(0, out[0].begin);
   EXPECT_EQ(3, out[0].end);
+
+  // The multi-codepoint atom must coexist with ordinary SentencePiece OOV
+  // behavior: keep "ab" atomic and emit UNKNOWN for only the uncovered Z.
+  out.clear();
+  ASSERT_TRUE(runtime.Encode("abZ", &out).ok());
+  ASSERT_EQ(2u, out.size());
+  EXPECT_EQ(1, out[0].id);
+  EXPECT_EQ("ab", out[0].piece);
+  EXPECT_EQ(runtime.unk_id(), out[1].id);
+  EXPECT_EQ("Z", out[1].piece);
 }
 
 TEST(BPETrainerTest, RandomLaminarHierarchyMatchesFlatReferenceOracle) {
