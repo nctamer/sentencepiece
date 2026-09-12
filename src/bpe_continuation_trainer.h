@@ -164,6 +164,9 @@ class ContinuationTrainer : public TrainerInterface {
   int GetPrevIndex(int sid, int index) const;
   void AddNewPair(int sid, int left, int right);
   void ResetFreq(int sid, int left, int right, const Candidate* best);
+  // Plain one-operation application used only for inherited/bootstrap replay
+  // before hierarchy-aware learned ranks exist.
+  absl::Status AcceptCandidate(Candidate* candidate);
   // Schedule an already-learned exact-scope rule when one matches this
   // adjacency; otherwise expose it to the NEW-candidate table.
   void ScheduleKnownOrAddCandidate(int sid, int left, int right,
