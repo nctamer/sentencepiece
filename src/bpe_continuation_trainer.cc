@@ -1078,6 +1078,20 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
   };
   ABSL_RETURN_IF_ERROR(validate_local_ranks(base_merges_, "base"));
   ABSL_RETURN_IF_ERROR(validate_local_ranks(bootstrap_merges_, "bootstrap"));
+  for (const auto& merge : base_merges_) {
+    if (merge.has_scope_level() && merge.scope_level() >= 0) {
+      return absl::InvalidArgumentError(
+          "scoped inherited base merges are unsupported without the inherited "
+          "hierarchy provider");
+    }
+  }
+  for (const auto& merge : bootstrap_merges_) {
+    if (merge.has_scope_level() && merge.scope_level() >= 0) {
+      return absl::InvalidArgumentError(
+          "scoped bootstrap merges are unsupported without their hierarchy "
+          "provider");
+    }
+  }
 
   // First prove the inherited base tokenizer is a valid program on its own.
   // Rank-prepending bootstrap state is not allowed to retroactively make a
