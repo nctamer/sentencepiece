@@ -11,6 +11,7 @@ SNAP = glob.glob(os.path.expanduser(
     "~/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/*"))[0]
 OUT = sys.argv[1]
 SPM = os.path.expanduser("~/repos/sentencepiece/build/src/spm_train")
+HIERARCHY = os.environ.get("HIERARCHY", "0") == "1"
 
 def bytes_to_unicode():
     bs = (list(range(ord("!"), ord("~") + 1)) +
@@ -110,13 +111,32 @@ prose = ["The quick brown fox jumps over the lazy dog.",
 
 # Weighted TSV, so the run also exercises repetition-equivalence at scale.
 corpus_path = os.path.join(OUT, "qwen_corpus.tsv")
+encoded_rows = []
 with open(corpus_path, "w", encoding="utf-8") as f:
     for unit, count in weighted:
-        f.write(f"{encode_bytelevel(unit)}\t{count}\n")
+        encoded = encode_bytelevel(unit)
+        encoded_rows.append(encoded)
+        f.write(f"{encoded}\t{count}\n")
     for line in prose:
-        f.write(f"{encode_bytelevel(line)}\t10\n")
+        encoded = encode_bytelevel(line)
+        encoded_rows.append(encoded)
+        f.write(f"{encoded}\t10\n")
 
-prefix = os.path.join(OUT, "qwen_cont")
+# Optional hierarchy-enabled large-base acceptance. Empty gates are deliberate:
+# this run tests the Qwen-sized inherited replay/ID/performance path through the
+# hierarchy machinery without conflating it with the focused semantic gate
+# regressions. Every learned continuation merge remains on the hierarchical
+# runtime path, but no occurrence is restricted by a grammar boundary.
+hierarchy_path = None
+if HIERARCHY:
+    hierarchy_path = os.path.join(OUT, "qwen_hierarchy.tsv")
+    with open(hierarchy_path, "w", encoding="utf-8") as f:
+        f.write("# sentencepiece-bpe-hierarchy-v1\n")
+        for surface in sorted(set(encoded_rows)):
+            f.write(surface + "\t\n")
+    print(f"hierarchy mode: ON ({len(set(encoded_rows))} normalized rows, empty gates)")
+
+prefix = os.path.join(OUT, "qwen_cont_hier" if HIERARCHY else "qwen_cont")
 cmd = [SPM, f"--input={corpus_path}", f"--model_prefix={prefix}",
        "--model_type=bpe", f"--expansion_spec={spec_path}",
        f"--vocab_size={max_id + 1 + spec.requested_new_pieces}",
@@ -126,7 +146,10 @@ cmd = [SPM, f"--input={corpus_path}", f"--model_prefix={prefix}",
        "--split_by_number=false", "--shuffle_input_sentence=false",
        "--max_sentencepiece_length=512", "--max_sentence_length=100000",
        "--input_format=tsv", "--hard_vocab_limit=false"]
-print("running:", " ".join(cmd[:4]), "...")
+if hierarchy_path:
+    cmd.append(f"--bpe_hierarchy_file={hierarchy_path}")
+print("running:", " ".join(cmd[:4]), "...",
+      "hierarchy=on" if HIERARCHY else "hierarchy=off")
 r = subprocess.run(cmd, capture_output=True, text=True)
 if r.returncode != 0:
     print("TRAIN FAILED")
@@ -155,6 +178,12 @@ check(types_ok, "every inherited token type is unchanged")
 check([ (m.left, m.right) for m in result.base_merges ] == merges,
       "inherited merge order is preserved exactly")
 check(result.rank_prepend is False, "no bootstrap merges were rank-prepended")
+if HIERARCHY:
+    check(result.boundary_policy.startswith("bpe_hierarchical_completion_v1:"),
+          "hierarchy-enabled Qwen expansion records hierarchical runtime policy")
+else:
+    check(not result.boundary_policy.startswith("bpe_hierarchical_completion_v1:"),
+          "ordinary Qwen expansion remains on the flat runtime policy")
 
 learned = list(result.learned_pieces)
 check(len(learned) > 0, f"learned {len(learned)} new pieces")
