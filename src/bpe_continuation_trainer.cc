@@ -570,21 +570,6 @@ int ContinuationTrainer::GrammarLevelForPair(int sid, int left,
   return gate.enabled ? gate.level : 0;
 }
 
-int ContinuationTrainer::MaxGrammarLevel(const Symbol* symbol) const {
-  if (hierarchy_.empty() || symbol == nullptr) return 0;
-  int level = 0;
-  for (const uint64_t encoded_pos : symbol->positions) {
-    const Position pos = DecodePos(encoded_pos);
-    if (symbol->left != symbols_[pos.sid][pos.left] ||
-        symbol->right != symbols_[pos.sid][pos.right]) {
-      continue;
-    }
-    level = std::max(level,
-                     GrammarLevelForPair(pos.sid, pos.left, pos.right));
-  }
-  return level;
-}
-
 absl::Status ContinuationTrainer::LoadHierarchy() {
   hierarchy_.clear();
   hierarchy_sha256_.clear();
@@ -945,6 +930,7 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
     }
     max_id = std::max(max_id, piece.external_id());
     existing_piece_strings_.insert(piece.piece());
+    piece_external_id_by_string_[piece.piece()] = piece.external_id();
     if (piece.atomic() ||
         (piece.mergeable() && string_util::UTF8Len(piece.piece()) == 1)) {
       piece.set_atomic(true);
@@ -1008,6 +994,7 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
           absl::StrCat("bootstrap external ID collision: ", piece.external_id()));
     }
     bootstrap_ids[piece.piece()] = piece.external_id();
+    piece_external_id_by_string_[piece.piece()] = piece.external_id();
   }
 
   // Budget is the number of pieces the run may LEARN. Base and bootstrap
@@ -1119,6 +1106,8 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
           " but the piece table gives it ", child_it->second.external_id()));
     }
     merge.set_external_id(child_it->second.external_id());
+    pair_external_id_[{merge.left(), merge.right()}] =
+        child_it->second.external_id();
     base_constructible.insert(child);
   }
   for (const auto& piece : base_pieces_) {
@@ -1155,6 +1144,7 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
           " but the bootstrap piece was allocated ", child_it->second));
     }
     merge.set_external_id(child_it->second);
+    pair_external_id_[{merge.left(), merge.right()}] = child_it->second;
   }
 
   // Shape options (max_sentencepiece_length, split_by_whitespace,
@@ -1209,7 +1199,9 @@ absl::Status ContinuationTrainer::LoadAndValidateSpec() {
 absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
   symbols_.clear();
   allocated_.clear();
+  allocated_candidates_.clear();
   symbols_cache_.clear();
+  candidate_cache_.clear();
   live_by_string_.clear();
   pq_ = decltype(pq_)();
   pending_queue_.clear();
@@ -2023,6 +2015,8 @@ absl::Status ContinuationTrainer::Train() {
 
   existing_piece_strings_.clear();
   atomic_piece_strings_.clear();
+  piece_external_id_by_string_.clear();
+  pair_external_id_.clear();
   atomic_pieces_ordered_.clear();
   user_defined_matcher_.reset();
   user_defined_piece_strings_.clear();
@@ -2044,7 +2038,9 @@ absl::Status ContinuationTrainer::Train() {
   sentences_.clear();
   final_pieces_.clear();
   allocated_.clear();
+  allocated_candidates_.clear();
   symbols_cache_.clear();
+  candidate_cache_.clear();
   symbols_.clear();
   prev_live_.clear();
   next_live_.clear();
@@ -2076,7 +2072,9 @@ absl::Status ContinuationTrainer::Train() {
   ABSL_RETURN_IF_ERROR(FinalizeArtifacts());
 
   allocated_.clear();
+  allocated_candidates_.clear();
   symbols_cache_.clear();
+  candidate_cache_.clear();
   live_by_string_.clear();
   symbols_.clear();
   prev_live_.clear();
