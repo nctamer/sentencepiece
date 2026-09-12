@@ -1302,6 +1302,20 @@ TEST(BPETrainerTest, ScopedAliasReplaysEarlierRanksToFixedPoint) {
   // weighted final token count is 28 rather than 26.
   ASSERT_TRUE(result.has_training_final_weighted_tokens());
   EXPECT_EQ(26u, result.training_final_weighted_tokens());
+
+  // The serialized runtime must execute the same backward cascade.
+  expansion::ExpansionProcessor runtime;
+  ASSERT_TRUE(runtime.Load(result).ok());
+  expansion::CompletionGate y_l1;
+  y_l1.level = 1; y_l1.cuts = {0, 1, 2};
+  expansion::CompletionGate y_l2;
+  y_l2.level = 2; y_l2.cuts = {0, 2, 3};
+  std::vector<expansion::TokenSpan> y_out;
+  ASSERT_TRUE(runtime.EncodeWithHierarchy(
+      "abcY", {y_l1, y_l2}, &y_out).ok());
+  std::vector<std::string> y_pieces;
+  for (const auto& x : y_out) y_pieces.push_back(x.piece);
+  EXPECT_EQ(std::vector<std::string>({"abc", "Y"}), y_pieces);
 }
 
 TEST(BPETrainerTest, HierarchyNeverVetoesInheritedMergeReplay) {
