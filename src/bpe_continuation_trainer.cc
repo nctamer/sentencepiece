@@ -2108,9 +2108,9 @@ absl::Status ContinuationTrainer::Train() {
   ABSL_RETURN_IF_ERROR(
       ReplayMerges(effective_prefix, "effective inherited/bootstrap"));
 
-  // Freeze the inherited tokenizer state first; only appended merge learning
-  // sees the continuation hierarchy. This is required for Qwen/base expansion
-  // compatibility as well as for semantic parity with hierarchy-aware runtime.
+  // Freeze the inherited tokenizer state first. The continuation hierarchy
+  // then scores selection of appended ranks only; every state transition and
+  // the serialized runtime remain ordinary flat BPE.
   if (!hierarchy_.empty()) {
     ABSL_RETURN_IF_ERROR(RebuildHierarchySupportIndex());
   }
