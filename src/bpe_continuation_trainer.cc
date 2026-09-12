@@ -70,7 +70,6 @@ ContinuationTrainer::Symbol* ContinuationTrainer::GetAtomicSymbol(
   s->fp = fp;
   s->chars = string_util::UTF8ToUnicodeText(atom);
   s->is_unk = (s->chars.size() == 1 && s->chars.front() == kUNKChar);
-  s->freq = 1;
   Symbol* out = s.get();
   symbols_cache_.emplace(fp, out);
   allocated_.push_back(std::move(s));
@@ -90,7 +89,6 @@ ContinuationTrainer::Symbol* ContinuationTrainer::GetFrozenSymbol(
   s->fp = fp;
   s->chars = string_util::UTF8ToUnicodeText(piece);
   s->frozen = true;
-  s->freq = 1;
   Symbol* out = s.get();
   symbols_cache_.emplace(fp, out);
   allocated_.push_back(std::move(s));
@@ -128,20 +126,82 @@ ContinuationTrainer::Symbol* ContinuationTrainer::GetPairSymbol(
   return out;
 }
 
-void ContinuationTrainer::ComputeFreq(Symbol* symbol) const {
-  if (!symbol->needs_recomputation) return;
-  symbol->freq = 0;
-  for (auto it = symbol->positions.begin(); it != symbol->positions.end();) {
+ContinuationTrainer::Candidate* ContinuationTrainer::GetCandidate(
+    Symbol* left, Symbol* right, int scope_level) {
+  if (left == nullptr || right == nullptr) return nullptr;
+  const std::string left_text = left->ToString();
+  const std::string right_text = right->ToString();
+  const auto key = std::make_tuple(left_text, right_text, scope_level);
+  const auto it = candidate_cache_.find(key);
+  if (it != candidate_cache_.end()) return it->second;
+
+  Symbol* result = GetPairSymbol(left, right);
+  if (result == nullptr) return nullptr;
+
+  auto c = std::make_unique<Candidate>();
+  c->left = left;
+  c->right = right;
+  c->result = result;
+  c->left_text = left_text;
+  c->right_text = right_text;
+  c->scope_level = scope_level;
+  Candidate* out = c.get();
+  candidate_cache_.emplace(key, out);
+  allocated_candidates_.push_back(std::move(c));
+  return out;
+}
+
+ContinuationTrainer::Candidate* ContinuationTrainer::FindCandidate(
+    const Symbol* left, const Symbol* right, int scope_level) const {
+  if (left == nullptr || right == nullptr) return nullptr;
+  const auto it = candidate_cache_.find(
+      std::make_tuple(left->ToString(), right->ToString(), scope_level));
+  return it == candidate_cache_.end() ? nullptr : it->second;
+}
+
+void ContinuationTrainer::ComputeFreq(Candidate* candidate) const {
+  if (!candidate->needs_recomputation) return;
+  candidate->freq = 0;
+
+  int last_counted_sid = -1;
+  int last_counted_right = -1;
+  for (auto it = candidate->positions.begin();
+       it != candidate->positions.end();) {
     const Position pos = DecodePos(*it);
-    if (symbol->left != symbols_[pos.sid][pos.left] ||
-        symbol->right != symbols_[pos.sid][pos.right]) {
-      it = symbol->positions.erase(it);
-    } else {
-      symbol->freq += static_cast<uint64_t>(sentences_[pos.sid].second);
-      ++it;
+    bool live =
+        pos.sid >= 0 && pos.sid < static_cast<int>(symbols_.size()) &&
+        pos.left >= 0 && pos.right >= 0 &&
+        pos.left < static_cast<int>(symbols_[pos.sid].size()) &&
+        pos.right < static_cast<int>(symbols_[pos.sid].size()) &&
+        candidate->left == symbols_[pos.sid][pos.left] &&
+        candidate->right == symbols_[pos.sid][pos.right] &&
+        GetNextIndex(pos.sid, pos.left) == pos.right;
+    if (live && hierarchy_gating_enabled_) {
+      live = CanMerge(pos.sid, pos.left, pos.right) &&
+             GrammarLevelForPair(pos.sid, pos.left, pos.right) ==
+                 candidate->scope_level;
     }
+    if (!live) {
+      it = candidate->positions.erase(it);
+      continue;
+    }
+
+    // The same pair can overlap itself only when left==right, e.g. aaa has
+    // adjacent aa positions (0,1) and (1,2). BPE replacement is necessarily
+    // non-overlapping and left-to-right, so count exactly the replacements the
+    // accept step can actually perform. This is the Boundless/reference rule.
+    const bool overlaps_previous =
+        candidate->left == candidate->right &&
+        pos.sid == last_counted_sid && pos.left == last_counted_right;
+    if (!overlaps_previous) {
+      candidate->freq +=
+          static_cast<uint64_t>(sentences_[pos.sid].second);
+      last_counted_sid = pos.sid;
+      last_counted_right = pos.right;
+    }
+    ++it;
   }
-  symbol->needs_recomputation = false;
+  candidate->needs_recomputation = false;
 }
 
 int ContinuationTrainer::GetNextIndex(int sid, int index) const {
@@ -163,44 +223,70 @@ int ContinuationTrainer::GetPrevIndex(int sid, int index) const {
 void ContinuationTrainer::AddNewPair(int sid, int left, int right) {
   if (left == -1 || right == -1) return;
   if (fence_group_[sid][left] != fence_group_[sid][right]) return;
-  Symbol* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
-  if (symbol == nullptr) return;
+  if (hierarchy_gating_enabled_ && !CanMerge(sid, left, right)) return;
 
-  // Hierarchy eligibility is occurrence-local for NEW continuation merges.
-  // During inherited/base replay hierarchy_gating_enabled_ is false: the
-  // inherited tokenizer is authoritative and its merges must fire exactly as
-  // they did before this continuation grammar existed.
-  if ((hierarchy_gating_enabled_ && !CanMerge(sid, left, right)) ||
-      !symbol->active) {
-    return;
-  }
+  Symbol* left_symbol = symbols_[sid][left];
+  Symbol* right_symbol = symbols_[sid][right];
+  const int scope_level =
+      hierarchy_gating_enabled_ ? GrammarLevelForPair(sid, left, right) : 0;
+  Candidate* candidate =
+      GetCandidate(left_symbol, right_symbol, scope_level);
+  if (candidate == nullptr || !candidate->active) return;
 
-  symbol->positions.insert(EncodePos(sid, left, right));
-  if (!symbol->pending) {
-    symbol->pending = true;
-    pending_queue_.push_back(symbol);
+  candidate->positions.insert(EncodePos(sid, left, right));
+  candidate->needs_recomputation = true;
+  if (!candidate->pending) {
+    candidate->pending = true;
+    pending_queue_.push_back(candidate);
   }
 }
 
 void ContinuationTrainer::ResetFreq(int sid, int left, int right,
-                                    const Symbol* best) {
+                                    const Candidate* best) {
   if (left == -1 || right == -1) return;
-  Symbol* symbol = GetPairSymbol(symbols_[sid][left], symbols_[sid][right]);
-  if (symbol != nullptr && symbol != best) symbol->needs_recomputation = true;
+  if (fence_group_[sid][left] != fence_group_[sid][right]) return;
+  if (hierarchy_gating_enabled_ && !CanMerge(sid, left, right)) return;
+  const int scope_level =
+      hierarchy_gating_enabled_ ? GrammarLevelForPair(sid, left, right) : 0;
+  Candidate* candidate =
+      FindCandidate(symbols_[sid][left], symbols_[sid][right], scope_level);
+  if (candidate != nullptr && candidate != best) {
+    candidate->needs_recomputation = true;
+  }
 }
 
-absl::Status ContinuationTrainer::AcceptSymbol(Symbol* symbol) {
-  for (const uint64_t encoded_pos : symbol->positions) {
+absl::Status ContinuationTrainer::AcceptCandidate(Candidate* candidate) {
+  RET_CHECK(candidate != nullptr);
+  RET_CHECK(candidate->result != nullptr);
+  const uint64_t expected_weight = candidate->freq;
+  uint64_t applied_weight = 0;
+
+  for (const uint64_t encoded_pos : candidate->positions) {
     const Position pos = DecodePos(encoded_pos);
-    if (symbols_[pos.sid][pos.left] == nullptr) continue;
-    RET_CHECK(symbols_[pos.sid][pos.right] != nullptr);
+    if (pos.sid < 0 || pos.sid >= static_cast<int>(symbols_.size()) ||
+        pos.left < 0 || pos.right < 0 ||
+        pos.left >= static_cast<int>(symbols_[pos.sid].size()) ||
+        pos.right >= static_cast<int>(symbols_[pos.sid].size())) {
+      continue;
+    }
+    if (candidate->left != symbols_[pos.sid][pos.left] ||
+        candidate->right != symbols_[pos.sid][pos.right] ||
+        GetNextIndex(pos.sid, pos.left) != pos.right) {
+      continue;  // stale or overlapping occurrence
+    }
+    if (hierarchy_gating_enabled_ &&
+        (!CanMerge(pos.sid, pos.left, pos.right) ||
+         GrammarLevelForPair(pos.sid, pos.left, pos.right) !=
+             candidate->scope_level)) {
+      continue;
+    }
 
     const int next = GetNextIndex(pos.sid, pos.right);
     const int prev = GetPrevIndex(pos.sid, pos.left);
-    ResetFreq(pos.sid, prev, pos.left, symbol);
-    ResetFreq(pos.sid, pos.right, next, symbol);
+    ResetFreq(pos.sid, prev, pos.left, candidate);
+    ResetFreq(pos.sid, pos.right, next, candidate);
 
-    symbols_[pos.sid][pos.left] = symbol;
+    symbols_[pos.sid][pos.left] = candidate->result;
     symbols_[pos.sid][pos.right] = nullptr;
     next_live_[pos.sid][pos.left] = next;
     if (next != -1) prev_live_[pos.sid][next] = pos.left;
@@ -209,21 +295,36 @@ absl::Status ContinuationTrainer::AcceptSymbol(Symbol* symbol) {
     if (!span_end_.empty()) {
       span_end_[pos.sid][pos.left] = span_end_[pos.sid][pos.right];
     }
+    applied_weight +=
+        static_cast<uint64_t>(sentences_[pos.sid].second);
+
     AddNewPair(pos.sid, prev, pos.left);
     AddNewPair(pos.sid, pos.left, next);
   }
 
-  symbols_cache_.erase(symbol->fp);
-  symbol->active = false;
+  // Strong accounting invariant: the count that won the competition must be
+  // exactly the weighted number of replacements performed. This catches both
+  // overlapping identical-pair overcounting and stale occurrence indexes.
+  if (applied_weight != expected_weight) {
+    return absl::InternalError(absl::StrCat(
+        "BPE candidate count/application mismatch for ",
+        candidate->left_text, " + ", candidate->right_text,
+        " scope=", candidate->scope_level, ": counted ", expected_weight,
+        " but applied ", applied_weight));
+  }
+
+  candidate->active = false;
+  candidate->pending = false;
+  candidate->positions.clear();
   return absl::OkStatus();
 }
 
 void ContinuationTrainer::DrainPendingQueue() {
-  for (Symbol* symbol : pending_queue_) {
-    symbol->pending = false;
-    if (!symbol->active) continue;
-    ComputeFreq(symbol);
-    pq_.push({symbol->freq, symbol});
+  for (Candidate* candidate : pending_queue_) {
+    candidate->pending = false;
+    if (!candidate->active) continue;
+    ComputeFreq(candidate);
+    pq_.push({candidate->freq, candidate});
   }
   pending_queue_.clear();
 }
@@ -270,19 +371,12 @@ absl::Status ContinuationTrainer::RebuildHierarchyCandidateIndex() {
               << " gates incompatible with inherited/base segmentation";
   }
 
-  // Inherited replay deliberately indexed every live pair occurrence. Those
-  // counts are not the continuation counts: discard them and rebuild exactly
-  // once from the post-replay segmentation with occurrence-local eligibility.
+  // Inherited replay candidates were unscoped. Drop that candidate index and
+  // rebuild from the post-replay segmentation with exact occurrence scopes.
   pq_ = decltype(pq_)();
   pending_queue_.clear();
-  for (auto& owned : allocated_) {
-    Symbol* symbol = owned.get();
-    if (!symbol->IsBigram() || !symbol->active) continue;
-    symbol->positions.clear();
-    symbol->freq = 0;
-    symbol->pending = false;
-    symbol->needs_recomputation = false;
-  }
+  candidate_cache_.clear();
+  allocated_candidates_.clear();
 
   hierarchy_gating_enabled_ = true;
   for (size_t sid = 0; sid < symbols_.size(); ++sid) {
