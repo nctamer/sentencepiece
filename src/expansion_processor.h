@@ -21,7 +21,8 @@
 //   2. USER_DEFINED pieces are recognized FIRST by longest prefix match,
 //      exactly as native SentencePiece does (bpe_model.cc, PrefixMatcher):
 //      each occurrence is one frozen unit that no merge may enter or cross;
-//   3. everything else starts from single characters;
+//   3. every open run is uniquely segmented by the artifact's declared
+//      reversible atomic alphabet (atoms may span multiple Unicode scalars);
 //   4. among adjacent non-frozen pairs present in the program, LOWEST
 //      effective rank wins, leftmost occurrence first;
 //   5. external IDs are preserved exactly.
@@ -108,12 +109,18 @@ class ExpansionProcessor {
   // Longest-prefix matcher over the USER_DEFINED piece strings. Owns nothing;
   // the strings live in id_to_piece_.
   std::unique_ptr<normalizer::PrefixMatcher> user_defined_matcher_;
+  // Reversible starting alphabet for ordinary (non-USER_DEFINED) runs.
+  // Sorted only for deterministic diagnostics/reconstruction; segmentation
+  // requires exactly one parse, so ordering cannot choose between parses.
+  std::vector<std::string> atomic_pieces_ordered_;
   NormalizerSpec normalizer_spec_;
   int unk_id_ = 0;
   std::string unk_piece_ = "<unk>";
   bool requires_hierarchy_ = false;
   bool has_inherited_merge_program_ = false;
 
+  absl::Status SegmentAtoms(absl::string_view text,
+                            std::vector<std::string>* atoms) const;
   absl::Status EncodeImpl(absl::string_view text,
                           const std::vector<CompletionGate>* gates,
                           std::vector<TokenSpan>* out) const;
