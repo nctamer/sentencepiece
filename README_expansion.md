@@ -112,8 +112,11 @@ stays distinguishable from "unset", which falls back to filling
 `trainer_spec.vocab_size`. An inherited merge that never fires on the
 continuation corpus is still exported and still costs nothing.
 
-A learned candidate whose string already exists allocates no ID and spends no
-budget; it is retired rather than re-derived through some other ancestry.
+A learned candidate whose string already exists allocates no ID. If the same
+`(left,right)` construction was already selected at another hierarchy scope,
+the new scoped operation is still serialized and points at the same external
+token ID. A genuinely different ancestry for the same child string is retired
+rather than silently giving one token two constructions.
 
 ---
 
@@ -185,19 +188,45 @@ complete children), the ordinary weighted pair enters the BPE competition.
 Ungated boundaries retain ordinary BPE behavior. The hierarchy and explicit
 string fences are mutually exclusive.
 
-Hierarchy eligibility is **occurrence-local**. A surface pair can be a valid
-candidate in one occurrence and blocked in another. Only eligible occurrences
-contribute their TSV weights to the candidate count, and accepting the pair
-rewrites only those eligible occurrences. An ineligible occurrence never
-poisons the pair globally. For example, after `1+2 -> 12`, `/+12` may be
-eligible in `/12` while remaining blocked as a proper prefix in `/128`.
+Hierarchy eligibility is **occurrence-local and scope-typed**. Candidate
+identity is `(left,right,scope_level)`, not merely `(left,right)`:
+
+- scope 0 is an ordinary/internal merge that crosses no completion boundary;
+- positive scope N is a merge across complete children of hierarchy level N.
+
+Counts never pool across scopes. If `a+b` occurs five times internally and five
+times as a level-1 completion crossing, those are two candidates of count 5,
+not one candidate of count 10. This is the recursive analogue of BoundlessBPE's
+separate ordinary and supermerge populations.
+
+Within one scoped candidate, only hierarchy-eligible, **non-overlapping**
+occurrences contribute. Repeated identical pairs follow the replacements that
+can actually be performed: `aaa` contains one applicable `a+a` replacement,
+not two. At acceptance the trainer asserts that the selected weighted count is
+exactly the weighted number of replacements it performed.
+
+An ineligible occurrence never poisons another occurrence globally. After
+`1+2 -> 12`, for example, `/+12` may be a level-1 candidate in `/12`
+while remaining blocked as a proper prefix in `/128`.
+
+Tie order is part of the deterministic contract: larger weighted count first,
+then **lower scope first** (ordinary wins an exact tie with a higher-level
+crossing), then `left` bytes and `right` bytes. The pair itself is the final
+key; concatenated child text is insufficient because `a+bc` and `ab+c`
+both produce `abc`.
+
+Scope survives serialization. `ExpansionMerge.scope_level` is the exact
+operation scope; `grammar_level` is retained as compatible audit metadata.
+The same pair may therefore appear at multiple scopes while all such operations
+construct the same external token ID.
 
 That semantic condition survives into inference. A hierarchical
 `ExpansionResult` is not a standalone context-free merge table:
 `ExpansionProcessor::Encode` fails closed, and the caller must use
-`EncodeWithHierarchy(text, gates, ...)`. The runtime uses an intrusive
-live-neighbour sequence plus a rank heap; after each merge only the two adjacent
-pairs are reconsidered.
+`EncodeWithHierarchy(text, gates, ...)`. The runtime computes the exact
+current occurrence scope and applies a learned rule only when it equals the
+serialized `scope_level`. It uses an intrusive live-neighbour sequence plus a
+rank heap; after each merge only the two adjacent pairs are reconsidered.
 
 Continuation is explicitly two-phase:
 
@@ -211,8 +240,9 @@ tokenizer. That gate alone is disabled for that input occurrence. Fresh
 hierarchical training has no inherited tokenizer to preserve, so the same
 condition is a hard error rather than permission to disable a gate.
 
-Learned `ExpansionMerge` records carry `weighted_count` and
-`grammar_level` for review. The exact sidecar SHA-256 is recorded in the
+Learned `ExpansionMerge` records carry `weighted_count`,
+`scope_level` and compatible `grammar_level` audit data. The exact sidecar
+SHA-256 is recorded in the
 effective continuation contract and
 `boundary_policy=bpe_hierarchical_completion_v1:<sha256>`.
 
@@ -329,10 +359,11 @@ sets every normalization field on every run, so presence would report
 exactly equivalent to physical repetition of each record `count` times — this
 is a tested contract for both model types.
 
-Frequency arithmetic is checked, not wrapped. A pair accumulates its record's
-weight once per position, so the bound that matters is the weighted *position*
-mass; it is proven to fit in `uint64_t` before any of it is summed, and an
-over-large corpus fails with `OutOfRange`.
+Frequency arithmetic is checked, not wrapped. The corpus's weighted position
+mass is proven to fit in `uint64_t` before any candidate is summed. Candidate
+frequency is the weighted number of **non-overlapping replacements that can
+actually be applied** at that exact scope. Acceptance checks count == applied
+weight and fails with an internal error on any discrepancy.
 
 ---
 
@@ -378,12 +409,14 @@ reachability proof. `--expansion_spec` supersedes it.
 | File | Contents |
 |---|---|
 | `<prefix>.expansion` | `ExpansionResult` — authoritative |
-| `<prefix>.merges` | effective merge table, `left<TAB>right` in rank order |
+| `<prefix>.merges` | effective merge table in rank order; flat rows are `left<TAB>right`, scoped rows add `<TAB>scope_level` |
 | `<prefix>.vocab` | pieces in external ID order |
 | `<prefix>.model` | native `ModelProto` — **only when proven exact** |
 
 Tab-separated merges, because a piece may contain the whitespace marker, which
-a space-separated `merges.txt` cannot express.
+a space-separated `merges.txt` cannot express. `ExpansionResult` remains
+authoritative; the optional third column exists so the human-readable table does
+not erase scoped-operation identity.
 
 
 ## Self-describing continuation artifacts and the explicit BPE runtime
