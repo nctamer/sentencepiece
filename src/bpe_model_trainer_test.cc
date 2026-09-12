@@ -16,7 +16,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include <random>
+#include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "absl/flags/flag.h"
@@ -24,6 +30,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_join.h"
+#include "continuation_io.h"
 #include "filesystem.h"
 #include "expansion_processor.h"
 #include "sentencepiece_model.pb.h"
@@ -38,6 +45,246 @@ namespace {
 
 // Space symbol
 #define WS "\xe2\x96\x81"
+
+
+struct RefGate {
+  int level = 0;
+  std::vector<int> cuts;
+};
+struct RefToken {
+  std::string piece;
+  int begin = 0;
+  int end = 0;
+};
+struct RefRow {
+  std::string text;
+  int64_t weight = 1;
+  std::vector<RefGate> gates;
+};
+struct RefRule {
+  std::string left;
+  std::string right;
+  int scope = 0;
+  uint64_t count = 0;
+  int external_id = -1;
+  bool allocated = false;
+};
+struct RefRun {
+  std::vector<RefRule> rules;
+  std::vector<std::vector<RefToken>> final_rows;
+  std::string final_sha256;
+};
+
+using RefKey = std::tuple<std::string, std::string, int>;
+
+int RefScope(const RefRow& row, const RefToken& left, const RefToken& right) {
+  if (left.end != right.begin) return -1;
+  for (const RefGate& gate : row.gates) {
+    bool boundary = false;
+    for (size_t i = 1; i + 1 < gate.cuts.size(); ++i) {
+      if (gate.cuts[i] == left.end) {
+        boundary = true;
+        break;
+      }
+    }
+    if (!boundary) continue;
+    const bool left_begin =
+        std::find(gate.cuts.begin(), gate.cuts.end(), left.begin) !=
+        gate.cuts.end();
+    const bool right_end =
+        std::find(gate.cuts.begin(), gate.cuts.end(), right.end) !=
+        gate.cuts.end();
+    if (!left_begin || !right_end || left.begin < gate.cuts.front() ||
+        right.end > gate.cuts.back()) {
+      return -1;
+    }
+    return gate.level;
+  }
+  return 0;
+}
+
+std::vector<RefToken> RefAtoms(const RefRow& row) {
+  std::vector<RefToken> out;
+  for (int i = 0; i < static_cast<int>(row.text.size()); ++i) {
+    out.push_back({row.text.substr(i, 1), i, i + 1});
+  }
+  return out;
+}
+
+std::vector<RefToken> RefReplayRow(const RefRow& row,
+                                   const std::vector<RefRule>& rules) {
+  std::vector<RefToken> tokens = RefAtoms(row);
+  while (true) {
+    int best_rank = -1;
+    int best_left = -1;
+    for (int i = 0; i + 1 < static_cast<int>(tokens.size()); ++i) {
+      const int scope = RefScope(row, tokens[i], tokens[i + 1]);
+      if (scope < 0) continue;
+      for (int rank = 0; rank < static_cast<int>(rules.size()); ++rank) {
+        const RefRule& rule = rules[rank];
+        if (rule.scope == scope && rule.left == tokens[i].piece &&
+            rule.right == tokens[i + 1].piece) {
+          if (best_rank == -1 || rank < best_rank ||
+              (rank == best_rank && i < best_left)) {
+            best_rank = rank;
+            best_left = i;
+          }
+          break;
+        }
+      }
+    }
+    if (best_rank == -1) break;
+    RefToken merged;
+    merged.piece = tokens[best_left].piece + tokens[best_left + 1].piece;
+    merged.begin = tokens[best_left].begin;
+    merged.end = tokens[best_left + 1].end;
+    tokens[best_left] = std::move(merged);
+    tokens.erase(tokens.begin() + best_left + 1);
+  }
+  return tokens;
+}
+
+std::string RefFinalSha256(const std::vector<RefRow>& rows,
+                           const std::vector<std::vector<RefToken>>& tokens) {
+  std::vector<size_t> order(rows.size());
+  for (size_t i = 0; i < rows.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return rows[a].text < rows[b].text;  // generated oracle rows are ASCII.
+  });
+  std::string canonical;
+  for (size_t sid : order) {
+    absl::StrAppend(&canonical, rows[sid].text.size(), ":", rows[sid].text,
+                    "\t", rows[sid].weight, "\t", tokens[sid].size());
+    for (const RefToken& token : tokens[sid]) {
+      absl::StrAppend(&canonical, "\t", token.piece.size(), ":", token.piece);
+    }
+    canonical.push_back('\n');
+  }
+  return continuation::Sha256Hex(canonical);
+}
+
+RefRun RunScopedReference(const std::vector<RefRow>& rows,
+                          int first_new_external_id,
+                          int requested_new_pieces) {
+  // Intentionally dumb correctness oracle:
+  //   * restart every row from atoms after every learned operation;
+  //   * replay the ENTIRE scoped program by repeated full scans;
+  //   * rescan every adjacent occurrence to count the next candidates.
+  // It shares no live links, occurrence indexes, candidate heap or incremental
+  // state with ContinuationTrainer.
+  std::map<std::string, int> piece_id;
+  std::map<std::string, std::pair<std::string, std::string>> ancestry;
+  int next_id = first_new_external_id;
+  for (const RefRow& row : rows) {
+    for (char c : row.text) {
+      const std::string atom(1, c);
+      if (!piece_id.count(atom)) {
+        // Test specs assign atom IDs separately; only existence matters until
+        // a learned child is allocated below.
+        piece_id[atom] = -1;
+      }
+    }
+  }
+
+  std::vector<RefRule> rules;
+  int allocated = 0;
+  while (allocated < requested_new_pieces) {
+    std::vector<std::vector<RefToken>> current;
+    current.reserve(rows.size());
+    for (const RefRow& row : rows) current.push_back(RefReplayRow(row, rules));
+
+    std::map<RefKey, uint64_t> counts;
+    std::set<RefKey> learned;
+    for (const RefRule& rule : rules) {
+      learned.emplace(rule.left, rule.right, rule.scope);
+    }
+
+    for (size_t sid = 0; sid < rows.size(); ++sid) {
+      const auto& toks = current[sid];
+      std::map<RefKey, int> last_counted_right;
+      for (int i = 0; i + 1 < static_cast<int>(toks.size()); ++i) {
+        const int scope = RefScope(rows[sid], toks[i], toks[i + 1]);
+        if (scope < 0) continue;
+        const RefKey key{toks[i].piece, toks[i + 1].piece, scope};
+        if (learned.count(key)) continue;
+        const std::string child = toks[i].piece + toks[i + 1].piece;
+        const auto existing = piece_id.find(child);
+        if (existing != piece_id.end()) {
+          const auto a = ancestry.find(child);
+          if (a == ancestry.end() ||
+              a->second != std::make_pair(toks[i].piece, toks[i + 1].piece)) {
+            continue;
+          }
+        }
+        if (toks[i].piece == toks[i + 1].piece) {
+          const auto prev = last_counted_right.find(key);
+          if (prev != last_counted_right.end() && prev->second == i) {
+            continue;
+          }
+          last_counted_right[key] = i + 1;
+        }
+        counts[key] += static_cast<uint64_t>(rows[sid].weight);
+      }
+    }
+    if (counts.empty()) break;
+
+    auto better = [](const auto& a, const auto& b) {
+      if (a.second != b.second) return a.second > b.second;
+      if (std::get<2>(a.first) != std::get<2>(b.first)) {
+        return std::get<2>(a.first) < std::get<2>(b.first);
+      }
+      if (std::get<0>(a.first) != std::get<0>(b.first)) {
+        return std::get<0>(a.first) < std::get<0>(b.first);
+      }
+      return std::get<1>(a.first) < std::get<1>(b.first);
+    };
+    auto best = counts.begin();
+    for (auto it = std::next(counts.begin()); it != counts.end(); ++it) {
+      if (better(*it, *best)) best = it;
+    }
+
+    RefRule rule;
+    rule.left = std::get<0>(best->first);
+    rule.right = std::get<1>(best->first);
+    rule.scope = std::get<2>(best->first);
+    rule.count = best->second;
+    const std::string child = rule.left + rule.right;
+    auto id = piece_id.find(child);
+    if (id == piece_id.end()) {
+      rule.external_id = next_id++;
+      rule.allocated = true;
+      piece_id[child] = rule.external_id;
+      ancestry[child] = {rule.left, rule.right};
+      ++allocated;
+    } else {
+      rule.external_id = id->second;
+      rule.allocated = false;
+    }
+    rules.push_back(std::move(rule));
+  }
+
+  RefRun out;
+  out.rules = rules;
+  for (const RefRow& row : rows) {
+    out.final_rows.push_back(RefReplayRow(row, rules));
+  }
+  out.final_sha256 = RefFinalSha256(rows, out.final_rows);
+  return out;
+}
+
+int BuildRandomLaminarGates(int begin, int end, int depth,
+                            std::mt19937* rng,
+                            std::vector<RefGate>* gates) {
+  if (end - begin < 2) return 0;
+  std::uniform_int_distribution<int> split_dist(begin + 1, end - 1);
+  const int split = split_dist(*rng);
+  const int lh = BuildRandomLaminarGates(begin, split, depth + 1, rng, gates);
+  const int rh = BuildRandomLaminarGates(split, end, depth + 1, rng, gates);
+  const int level = std::max(lh, rh) + 1;
+  std::bernoulli_distribution keep(depth == 0 ? 0.9 : 0.6);
+  if (keep(*rng)) gates->push_back({level, {begin, split, end}});
+  return level;
+}
 
 std::string RunTrainer(
     const std::vector<std::string>& input, int size,
