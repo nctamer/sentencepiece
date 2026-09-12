@@ -1177,6 +1177,133 @@ TEST(BPETrainerTest, SamePairAtTwoScopesSharesOneTokenId) {
       << "scope belongs to the operation; ab remains one token ID";
 }
 
+
+TEST(BPETrainerTest, ScopedAliasReplaysEarlierRanksToFixedPoint) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "alias_cascade_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "alias_cascade.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "alias_cascade.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "alias_cascade_model");
+  const std::string result_path = prefix + ".expansion";
+
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("abcX\t10"));
+    ASSERT_TRUE(out->WriteLine("abcY\t2"));
+    ASSERT_TRUE(out->WriteLine("deZ\t1"));
+  }
+  {
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    // X row: a+b is ordinary inside child "ab"; ab+c is a level-2 crossing.
+    ASSERT_TRUE(out->WriteLine("abcX\t2:0,2,3"));
+    // Y row: a+b is a level-1 crossing; once it fires, ab+c is level 2.
+    ASSERT_TRUE(out->WriteLine("abcY\t1:0,1,2;2:0,2,3"));
+    ASSERT_TRUE(out->WriteLine("deZ\t"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(9);
+  expansion.set_requested_new_pieces(3);
+
+  auto atom = [&](int id, absl::string_view piece) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(id == 0 ? ModelProto::SentencePiece::UNKNOWN
+                        : ModelProto::SentencePiece::NORMAL);
+    p->set_mergeable(id != 0);
+    p->set_atomic(id != 0);
+  };
+  atom(0, "<unk>");
+  atom(1, "a"); atom(2, "b"); atom(3, "c");
+  atom(4, "d"); atom(5, "e");
+
+  for (const auto& [id, piece] :
+       std::vector<std::pair<int, std::string>>{
+           {6, "X"}, {7, "Y"}, {8, "Z"}}) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(piece);
+    p->set_type(ModelProto::SentencePiece::USER_DEFINED);
+    p->set_mergeable(false);
+    p->set_atomic(false);
+  }
+  {
+    auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString()));
+  }
+
+  TrainerSpec ts;
+  ts.set_model_type(TrainerSpec::BPE);
+  ts.add_input(input);
+  ts.set_input_format("tsv");
+  ts.set_model_prefix(prefix);
+  ts.set_vocab_size(12);
+  ts.set_expansion_spec(spec_path);
+  ts.set_expansion_result(result_path);
+  ts.set_bpe_hierarchy_file(hierarchy);
+  ts.set_input_sentence_size(0);
+  ts.set_split_by_whitespace(false);
+  ts.set_split_by_unicode_script(false);
+  ts.set_split_by_number(false);
+  ts.set_split_digits(false);
+  ts.set_bos_id(-1); ts.set_eos_id(-1); ts.set_pad_id(-1);
+  ts.set_hard_vocab_limit(true);
+  NormalizerSpec ns;
+  ns.set_name("identity");
+  ns.set_add_dummy_prefix(false);
+  ns.set_remove_extra_whitespaces(false);
+  NormalizerSpec dns;
+
+  ASSERT_TRUE(SentencePieceTrainer::Train(ts, ns, dns).ok());
+
+  std::string bytes;
+  {
+    auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes));
+  }
+  ExpansionResult result;
+  ASSERT_TRUE(result.ParseFromString(bytes));
+
+  // Three new token IDs, but four operations: rank 2 is the scoped alias.
+  ASSERT_EQ(3, result.learned_pieces_size());
+  ASSERT_EQ(4, result.learned_merges_size());
+
+  EXPECT_EQ("a", result.learned_merges(0).left());
+  EXPECT_EQ("b", result.learned_merges(0).right());
+  EXPECT_EQ(0, result.learned_merges(0).scope_level());
+  EXPECT_EQ(10, result.learned_merges(0).weighted_count());
+
+  EXPECT_EQ("ab", result.learned_merges(1).left());
+  EXPECT_EQ("c", result.learned_merges(1).right());
+  EXPECT_EQ(2, result.learned_merges(1).scope_level());
+  EXPECT_EQ(10, result.learned_merges(1).weighted_count());
+
+  EXPECT_EQ("a", result.learned_merges(2).left());
+  EXPECT_EQ("b", result.learned_merges(2).right());
+  EXPECT_EQ(1, result.learned_merges(2).scope_level());
+  EXPECT_EQ(2, result.learned_merges(2).weighted_count());
+  EXPECT_EQ(result.learned_merges(0).external_id(),
+            result.learned_merges(2).external_id());
+
+  EXPECT_EQ("d", result.learned_merges(3).left());
+  EXPECT_EQ("e", result.learned_merges(3).right());
+  EXPECT_EQ(1, result.learned_merges(3).weighted_count());
+
+  // The critical assertion: after rank 2 creates "ab" in abcY, rank 1 must
+  // replay there. Without alias closure the Y row remains ab|c|Y and the
+  // weighted final token count is 28 rather than 26.
+  ASSERT_TRUE(result.has_training_final_weighted_tokens());
+  EXPECT_EQ(26u, result.training_final_weighted_tokens());
+}
+
 TEST(BPETrainerTest, HierarchyNeverVetoesInheritedMergeReplay) {
   const std::string input =
       filesystem::JoinPath(::testing::TempDir(), "hier_inherited_input.tsv");
