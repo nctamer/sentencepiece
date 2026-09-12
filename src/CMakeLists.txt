@@ -182,6 +182,7 @@ set(SPM_TEST_SRCS
   char_model_test.cc
   char_model_trainer_test.cc
   continuation_contract_test.cc
+  continuation_metadata_test.cc
   id_overlay_processor_test.cc
   continuation_workingmodel_test.cc
   unigram_refit_test.cc
