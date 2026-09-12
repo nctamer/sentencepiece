@@ -25,6 +25,7 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_join.h"
 #include "filesystem.h"
+#include "expansion_processor.h"
 #include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
 #include "sentencepiece_trainer.h"
@@ -775,6 +776,27 @@ TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
   EXPECT_EQ("12", result.learned_merges(1).right());
   EXPECT_EQ(20, result.learned_merges(1).weighted_count());
   EXPECT_EQ(1, result.learned_merges(1).grammar_level());
+
+  // The artifact produced by training must replay with the same occurrence-
+  // local decision. This is the regression the first flat runtime was missing.
+  expansion::ExpansionProcessor runtime;
+  ASSERT_TRUE(runtime.Load(result).ok());
+  expansion::CompletionGate short_gate;
+  short_gate.level = 1;
+  short_gate.cuts = {0, 1, 3};
+  std::vector<expansion::TokenSpan> short_out;
+  ASSERT_TRUE(runtime.EncodeWithHierarchy("/12", {short_gate}, &short_out).ok());
+  ASSERT_EQ(1u, short_out.size());
+  EXPECT_EQ("/12", short_out[0].piece);
+
+  expansion::CompletionGate long_gate;
+  long_gate.level = 1;
+  long_gate.cuts = {0, 1, 4};
+  std::vector<expansion::TokenSpan> long_out;
+  ASSERT_TRUE(runtime.EncodeWithHierarchy("/128", {long_gate}, &long_out).ok());
+  std::vector<std::string> replayed;
+  for (const auto& x : long_out) replayed.push_back(x.piece);
+  EXPECT_EQ(std::vector<std::string>({"/", "12", "8"}), replayed);
 }
 
 TEST(BPETrainerTest, HierarchyNeverVetoesInheritedMergeReplay) {
