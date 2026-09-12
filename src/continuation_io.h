@@ -22,6 +22,10 @@ using Sentence = std::pair<std::string, int64_t>;
 
 struct PreparedCorpus {
   std::vector<Sentence> sentences;
+  // Empty for legacy text/tsv input. For tsv_meta, one stable training-only
+  // metadata key per sentence keeps equal token surfaces with different
+  // grammar-support facts as distinct weighted rows.
+  std::vector<std::string> metadata_keys;
   int64_t weighted_sentence_count = 0;
 };
 
