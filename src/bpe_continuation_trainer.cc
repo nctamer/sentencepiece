@@ -319,6 +319,161 @@ absl::Status ContinuationTrainer::AcceptCandidate(Candidate* candidate) {
   return absl::OkStatus();
 }
 
+
+void ContinuationTrainer::ScheduleKnownOrAddCandidate(
+    int sid, int left, int right, ReplayQueue* replay) {
+  if (left == -1 || right == -1) return;
+  if (sid < 0 || sid >= static_cast<int>(symbols_.size())) return;
+  if (symbols_[sid][left] == nullptr || symbols_[sid][right] == nullptr) return;
+  if (GetNextIndex(sid, left) != right) return;
+  if (fence_group_[sid][left] != fence_group_[sid][right]) return;
+  if (hierarchy_gating_enabled_ && !CanMerge(sid, left, right)) return;
+
+  const int scope =
+      hierarchy_gating_enabled_ ? GrammarLevelForPair(sid, left, right) : 0;
+  const auto key = std::make_tuple(symbols_[sid][left]->ToString(),
+                                   symbols_[sid][right]->ToString(), scope);
+  const auto learned = learned_rule_rank_.find(key);
+  if (learned != learned_rule_rank_.end()) {
+    replay->push({learned->second, sid, left, right});
+    return;
+  }
+  AddNewPair(sid, left, right);
+}
+
+bool ContinuationTrainer::ReplayEntryStillMatches(
+    const ReplayEntry& entry) const {
+  if (entry.learned_rank < 0 ||
+      entry.learned_rank >= static_cast<int>(learned_merges_.size()) ||
+      entry.sid < 0 || entry.sid >= static_cast<int>(symbols_.size()) ||
+      entry.left < 0 || entry.right < 0 ||
+      entry.left >= static_cast<int>(symbols_[entry.sid].size()) ||
+      entry.right >= static_cast<int>(symbols_[entry.sid].size())) {
+    return false;
+  }
+  const Symbol* left = symbols_[entry.sid][entry.left];
+  const Symbol* right = symbols_[entry.sid][entry.right];
+  if (left == nullptr || right == nullptr ||
+      GetNextIndex(entry.sid, entry.left) != entry.right ||
+      fence_group_[entry.sid][entry.left] !=
+          fence_group_[entry.sid][entry.right]) {
+    return false;
+  }
+  const ExpansionMerge& rule = learned_merges_[entry.learned_rank];
+  if (left->ToString() != rule.left() || right->ToString() != rule.right()) {
+    return false;
+  }
+  if (hierarchy_gating_enabled_) {
+    if (!CanMerge(entry.sid, entry.left, entry.right)) return false;
+    const int scope =
+        GrammarLevelForPair(entry.sid, entry.left, entry.right);
+    if (!rule.has_scope_level() || rule.scope_level() != scope) return false;
+  }
+  return true;
+}
+
+absl::Status ContinuationTrainer::AcceptCandidateWithClosure(
+    Candidate* candidate, int selected_learned_rank) {
+  RET_CHECK(candidate != nullptr);
+  RET_CHECK(candidate->result != nullptr);
+  RET_CHECK_GE(selected_learned_rank, 0);
+  RET_CHECK_LT(selected_learned_rank,
+               static_cast<int>(learned_merges_.size()));
+
+  const uint64_t expected_weight = candidate->freq;
+  uint64_t selected_applied_weight = 0;
+
+  // The selected operation is now part of the permanent ranked program.
+  // Candidate::active only means "eligible to become a NEW operation"; it must
+  // not suppress future replay of this operation at newly-created locations.
+  candidate->active = false;
+  candidate->pending = false;
+
+  // candidate->positions is ordered by (sid,left,right). Process each selected
+  // occurrence left-to-right. After each replacement, close only its affected
+  // neighborhood under the already-learned prefix. This is the missing
+  // monotonicity repair for scoped aliases: a later alias may create operands
+  // for an earlier rank, and that earlier rank must fire immediately just as
+  // the serialized runtime would.
+  for (const uint64_t encoded_pos : candidate->positions) {
+    const Position pos = DecodePos(encoded_pos);
+    if (pos.sid < 0 || pos.sid >= static_cast<int>(symbols_.size()) ||
+        pos.left < 0 || pos.right < 0 ||
+        pos.left >= static_cast<int>(symbols_[pos.sid].size()) ||
+        pos.right >= static_cast<int>(symbols_[pos.sid].size()) ||
+        symbols_[pos.sid][pos.left] != candidate->left ||
+        symbols_[pos.sid][pos.right] != candidate->right ||
+        GetNextIndex(pos.sid, pos.left) != pos.right) {
+      continue;
+    }
+    if (hierarchy_gating_enabled_ &&
+        (!CanMerge(pos.sid, pos.left, pos.right) ||
+         GrammarLevelForPair(pos.sid, pos.left, pos.right) !=
+             candidate->scope_level)) {
+      continue;
+    }
+
+    ReplayQueue replay;
+    replay.push({selected_learned_rank, pos.sid, pos.left, pos.right});
+
+    while (!replay.empty()) {
+      const ReplayEntry entry = replay.top();
+      replay.pop();
+      if (!ReplayEntryStillMatches(entry)) continue;
+
+      const ExpansionMerge& rule = learned_merges_[entry.learned_rank];
+      Symbol* left_symbol = symbols_[entry.sid][entry.left];
+      Symbol* right_symbol = symbols_[entry.sid][entry.right];
+      Symbol* result = GetPairSymbol(left_symbol, right_symbol);
+      if (result == nullptr || result->ToString() != rule.left() + rule.right()) {
+        return absl::InternalError(absl::StrCat(
+            "learned BPE replay rule became unconstructible at rank ",
+            entry.learned_rank, ": ", rule.left(), " + ", rule.right()));
+      }
+
+      const int prev = GetPrevIndex(entry.sid, entry.left);
+      const int next = GetNextIndex(entry.sid, entry.right);
+      ResetFreq(entry.sid, prev, entry.left, nullptr);
+      ResetFreq(entry.sid, entry.right, next, nullptr);
+
+      symbols_[entry.sid][entry.left] = result;
+      symbols_[entry.sid][entry.right] = nullptr;
+      next_live_[entry.sid][entry.left] = next;
+      if (next != -1) prev_live_[entry.sid][next] = entry.left;
+      prev_live_[entry.sid][entry.right] = -1;
+      next_live_[entry.sid][entry.right] = -1;
+      if (!span_end_.empty()) {
+        span_end_[entry.sid][entry.left] =
+            span_end_[entry.sid][entry.right];
+      }
+
+      if (entry.learned_rank == selected_learned_rank) {
+        selected_applied_weight +=
+            static_cast<uint64_t>(sentences_[entry.sid].second);
+      }
+
+      // These are the only adjacencies whose applicability can have changed.
+      // A known rule is queued even though its Candidate was retired when it
+      // was learned. An unknown rule is exposed to the normal candidate table.
+      ScheduleKnownOrAddCandidate(entry.sid, prev, entry.left, &replay);
+      ScheduleKnownOrAddCandidate(entry.sid, entry.left, next, &replay);
+    }
+  }
+
+  if (selected_applied_weight != expected_weight) {
+    return absl::InternalError(absl::StrCat(
+        "scoped BPE selection/replay mismatch for ", candidate->left_text,
+        " + ", candidate->right_text, " scope=", candidate->scope_level,
+        ": selected weighted count ", expected_weight,
+        " but ranked-prefix replay applied ", selected_applied_weight,
+        ". This indicates a deeper alias-overlap interaction that the "
+        "incremental candidate count did not model."));
+  }
+
+  candidate->positions.clear();
+  return absl::OkStatus();
+}
+
 void ContinuationTrainer::DrainPendingQueue() {
   for (Candidate* candidate : pending_queue_) {
     candidate->pending = false;
@@ -1442,11 +1597,17 @@ absl::Status ContinuationTrainer::LearnExpansion() {
     }
 
     // The operation spends a rank even when its token already exists from the
-    // same pair at another scope. This is the required ordinary/super split.
+    // same pair at another scope. Scope belongs to the operation, not the ID.
+    const int selected_learned_rank =
+        static_cast<int>(learned_merges_.size());
     learned_merges_.push_back(merge);
     pair_external_id_[pair] = external_id;
+    learned_rule_rank_[std::make_tuple(
+        best->left_text, best->right_text, best->scope_level)] =
+        selected_learned_rank;
 
-    ABSL_RETURN_IF_ERROR(AcceptCandidate(best));
+    ABSL_RETURN_IF_ERROR(
+        AcceptCandidateWithClosure(best, selected_learned_rank));
     live_by_string_[child] = best->result;
     DrainPendingQueue();
   }
@@ -2067,6 +2228,7 @@ absl::Status ContinuationTrainer::Train() {
   atomic_piece_strings_.clear();
   piece_external_id_by_string_.clear();
   pair_external_id_.clear();
+  learned_rule_rank_.clear();
   atomic_pieces_ordered_.clear();
   user_defined_matcher_.reset();
   user_defined_piece_strings_.clear();
