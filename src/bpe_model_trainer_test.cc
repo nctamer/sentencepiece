@@ -382,7 +382,7 @@ HierarchyTrainerRun TrainHierarchyFixture(const std::string& name,
   return out;
 }
 
-std::string RunTrainer(std::string RunTrainer(
+std::string RunTrainer(
     const std::vector<std::string>& input, int size,
     const std::vector<std::string>& user_defined_symbols = {}) {
   const std::string input_file =
@@ -728,7 +728,7 @@ TEST(BPETrainerTest, RandomLaminarHierarchyMatchesFlatReferenceOracle) {
   EXPECT_EQ(0, run.result.unreachable_pieces());
 }
 
-TEST(BPETrainerTest, HierarchyNeverVetoesInheritedMergeReplay)TEST(BPETrainerTest, HierarchyNeverVetoesInheritedMergeReplay) {
+TEST(BPETrainerTest, HierarchyNeverVetoesInheritedMergeReplay) {
   const std::string input =
       filesystem::JoinPath(::testing::TempDir(), "hier_inherited_input.tsv");
   const std::string spec_path =
