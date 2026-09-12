@@ -112,6 +112,12 @@ unk.piece = "<|intervalpiece_expansion_unk|>"
 unk.type = pb.ModelProto.SentencePiece.UNKNOWN
 unk.mergeable = False
 unk.atomic = False
+spec.contract.unk_id = unknown_id
+spec.contract.bos_id = -1
+spec.contract.eos_id = -1
+spec.contract.pad_id = -1
+spec.contract.unk_piece = unk.piece
+spec.contract.unk_surface = ""
 
 for rank, (left, right) in enumerate(merges):
     m = spec.base_merges.add()
