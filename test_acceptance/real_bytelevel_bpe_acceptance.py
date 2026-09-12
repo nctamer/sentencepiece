@@ -4,6 +4,7 @@ Uses a genuine Qwen3 tokenizer (151k pieces, 151k merges) as the inherited
 state and checks the contract on it, not on a fixture.
 """
 import json, os, subprocess, sys, glob
+from collections import Counter
 sys.path.insert(0, os.path.expanduser("~/repos/sentencepiece/python/src/sentencepiece"))
 import sentencepiece_model_pb2 as pb
 
@@ -12,6 +13,20 @@ SNAP = glob.glob(os.path.expanduser(
 OUT = sys.argv[1]
 SPM = os.path.expanduser("~/repos/sentencepiece/build/src/spm_train")
 HIERARCHY = os.environ.get("HIERARCHY", "0") == "1"
+TOKENIZER_JSON = os.path.join(SNAP, "tokenizer.json")
+try:
+    from tokenizers import Tokenizer
+except ImportError as e:
+    raise SystemExit(
+        "real Qwen acceptance requires the 'tokenizers' package so the "
+        "original tokenizer.json can be the pretokenization/inference oracle") from e
+oracle = Tokenizer.from_file(TOKENIZER_JSON)
+tok_config = json.load(open(TOKENIZER_JSON, encoding="utf-8"))
+added_tokens = {
+    int(x["id"]): x for x in tok_config.get("added_tokens", [])
+    if "id" in x and "content" in x
+}
+added_ids = set(added_tokens)
 
 def bytes_to_unicode():
     bs = (list(range(ord("!"), ord("~") + 1)) +
@@ -29,6 +44,17 @@ ALPHABET = set(B2U.values())
 
 def encode_bytelevel(text):
     return "".join(B2U[b] for b in text.encode("utf-8"))
+
+def pretoken_surfaces(text):
+    """Actual Qwen tokenizer.json normalization + pretokenization surfaces."""
+    normalized = (oracle.normalizer.normalize_str(text)
+                  if oracle.normalizer is not None else text)
+    units = ([u for u, _ in oracle.pre_tokenizer.pre_tokenize_str(normalized)]
+             if oracle.pre_tokenizer is not None else [encode_bytelevel(normalized)])
+    if any(any(ch not in ALPHABET for ch in unit) for unit in units):
+        raise RuntimeError(
+            f"Qwen pretokenizer emitted a surface outside byte alphabet: {units[:4]!r}")
+    return units
 
 vocab = json.load(open(os.path.join(SNAP, "vocab.json")))
 merges = []
@@ -56,17 +82,36 @@ for piece, pid in vocab.items():
     p.external_id = pid
     p.piece = piece
     in_alphabet = all(ch in ALPHABET for ch in piece)
-    if in_alphabet:
+    if pid in added_ids:
+        # tokenizer.json, not spelling heuristics, is authoritative for frozen
+        # added/special tokens.
+        if added_tokens[pid]["content"] != piece:
+            raise SystemExit(
+                f"tokenizer.json added-token id {pid} disagrees with vocab.json")
+        p.type = pb.ModelProto.SentencePiece.USER_DEFINED
+        p.mergeable = False
+        p.atomic = False
+    elif in_alphabet:
         p.type = pb.ModelProto.SentencePiece.NORMAL
         p.mergeable = True
         p.atomic = len(piece) == 1
     else:
-        # Special/added tokens are addressable but never merge participants.
-        p.type = pb.ModelProto.SentencePiece.USER_DEFINED
-        p.mergeable = False
-        p.atomic = False
+        raise SystemExit(
+            f"vocab id {pid} is outside the byte alphabet but is not declared "
+            "as an added token in tokenizer.json")
     p.score = 0.0
     max_id = max(max_id, pid)
+
+# ExpansionProcessor requires exactly one UNKNOWN. Qwen's inherited ABI has no
+# unknown token, so append one reserved non-mergeable ID WITHOUT renumbering any
+# inherited ID. Learned continuation IDs begin after it.
+unknown_id = max_id + 1
+unk = spec.base_pieces.add()
+unk.external_id = unknown_id
+unk.piece = "<|intervalpiece_expansion_unk|>"
+unk.type = pb.ModelProto.SentencePiece.UNKNOWN
+unk.mergeable = False
+unk.atomic = False
 
 for rank, (left, right) in enumerate(merges):
     m = spec.base_merges.add()
@@ -74,7 +119,7 @@ for rank, (left, right) in enumerate(merges):
     m.left = left
     m.right = right
 
-spec.first_new_external_id = max_id + 1
+spec.first_new_external_id = unknown_id + 1
 spec_path = os.path.join(OUT, "qwen.spec")
 open(spec_path, "wb").write(spec.SerializeToString())
 print(f"spec: {len(spec.base_pieces)} pieces, first_new_external_id={spec.first_new_external_id}")
@@ -101,32 +146,36 @@ else:
         "|3/4k0 PR: C5 1/4 PL: A-3 1/4 PR: D5 1/4 PL: F3"]]
     print("domain corpus: built-in fallback lines")
 
-# Held out, so the compression number is not read off the training units.
-holdout = [u for u, _ in weighted[::7]][:200]
-domain = [u for u, _ in weighted[:200]]
+# Exact input rows used for evaluation are excluded from continuation training.
+holdout_pairs = weighted[::7][:200]
+holdout = [u for u, _ in holdout_pairs]
+holdout_set = set(holdout)
+training_weighted = [(u, n) for u, n in weighted if u not in holdout_set]
+if not training_weighted:
+    raise SystemExit("holdout split consumed the entire Qwen acceptance corpus")
 
 prose = ["The quick brown fox jumps over the lazy dog.",
          "SentencePiece is an unsupervised text tokenizer.",
          "Continuation must leave ordinary language exactly as it was."]
 
-# Weighted TSV, so the run also exercises repetition-equivalence at scale.
-corpus_path = os.path.join(OUT, "qwen_corpus.tsv")
-encoded_rows = []
-with open(corpus_path, "w", encoding="utf-8") as f:
-    for unit, count in weighted:
-        encoded = encode_bytelevel(unit)
-        encoded_rows.append(encoded)
-        f.write(f"{encoded}\t{count}\n")
-    for line in prose:
-        encoded = encode_bytelevel(line)
-        encoded_rows.append(encoded)
-        f.write(f"{encoded}\t10\n")
+# Train on the ORIGINAL tokenizer's actual pretoken surfaces. This pins the
+# continuation to Qwen's tokenizer.json pretokenization rather than a guessed
+# byte-level transform and prevents merges across pretoken boundaries.
+surface_counts = Counter()
+for text, count in training_weighted:
+    for surface in pretoken_surfaces(text):
+        surface_counts[surface] += count
 
-# Optional hierarchy-enabled large-base acceptance. Empty gates are deliberate:
-# this run tests the Qwen-sized inherited replay/ID/performance path through the
-# hierarchy machinery without conflating it with the focused semantic gate
-# regressions. Every learned continuation merge remains on the hierarchical
-# runtime path, but no occurrence is restricted by a grammar boundary.
+corpus_path = os.path.join(OUT, "qwen_corpus.tsv")
+encoded_rows = sorted(surface_counts)
+with open(corpus_path, "w", encoding="utf-8") as f:
+    for surface, count in sorted(surface_counts.items()):
+        f.write(f"{surface}\t{count}\n")
+
+# Optional hierarchy-guided large-base acceptance. Empty gates are deliberate:
+# this tests Qwen-sized inherited replay/ID/performance through the NEW
+# training-only hierarchy scorer without conflating it with semantic fixtures.
+# Learned continuation rules remain ordinary flat runtime rules.
 hierarchy_path = None
 if HIERARCHY:
     hierarchy_path = os.path.join(OUT, "qwen_hierarchy.tsv")
@@ -167,30 +216,35 @@ def check(cond, label):
 
 print("\n--- acceptance ---")
 base_by_id = {p.external_id: p for p in result.base_pieces}
-check(len(base_by_id) == len(vocab), "every inherited piece is returned")
+check(len(base_by_id) == len(vocab) + 1,
+      "every inherited piece plus one reserved UNKNOWN is returned")
 check(all(base_by_id[i].piece == p for p, i in vocab.items()),
       "every inherited external ID keeps its exact string")
 types_ok = all(
-    (base_by_id[i].type == pb.ModelProto.SentencePiece.NORMAL) ==
-    all(ch in ALPHABET for ch in p) for p, i in vocab.items())
-check(types_ok, "every inherited token type is unchanged")
+    base_by_id[i].type ==
+        (pb.ModelProto.SentencePiece.USER_DEFINED
+         if i in added_ids else pb.ModelProto.SentencePiece.NORMAL)
+    for p, i in vocab.items())
+check(types_ok, "authoritative tokenizer.json added-token roles are preserved")
+check(base_by_id[unknown_id].type == pb.ModelProto.SentencePiece.UNKNOWN,
+      "one appended UNKNOWN makes the explicit runtime loadable")
 
 check([ (m.left, m.right) for m in result.base_merges ] == merges,
       "inherited merge order is preserved exactly")
 check(result.rank_prepend is False, "no bootstrap merges were rank-prepended")
 if HIERARCHY:
-    check(result.boundary_policy.startswith("bpe_hierarchical_completion_v1:"),
-          "hierarchy-enabled Qwen expansion records hierarchical runtime policy")
+    check(result.boundary_policy.startswith("bpe_hierarchy_guided_training_v1:"),
+          "hierarchy-guided Qwen expansion records training-only hierarchy policy")
 else:
-    check(not result.boundary_policy.startswith("bpe_hierarchical_completion_v1:"),
-          "ordinary Qwen expansion remains on the flat runtime policy")
+    check(not result.boundary_policy.startswith("bpe_hierarchy_guided_training_v1:"),
+          "ordinary Qwen expansion remains outside hierarchy-guided training")
 
 learned = list(result.learned_pieces)
 check(len(learned) > 0, f"learned {len(learned)} new pieces")
 check(all(p.external_id > max_id for p in learned),
       "every new ID begins after the maximum occupied base ID")
-check(result.first_new_external_id == max_id + 1,
-      f"first_new_external_id == {max_id + 1}")
+check(result.first_new_external_id == unknown_id + 1,
+      f"first_new_external_id == {unknown_id + 1}")
 
 lm = list(result.learned_merges)
 check(len(lm) == len(learned), "every new piece has a recorded merge")
@@ -219,15 +273,34 @@ def bpe_apply(text):
 check(all(bpe_apply(p.piece) == [p.piece] for p in learned),
       "every new token is reachable by replaying the final merge table")
 
-# Compression on the domain corpus, base program vs continued program.
+# The original tokenizer.json is the independent inherited-tokenization oracle.
+# Replaying inherited merges over its ACTUAL pretoken surfaces must produce the
+# same token strings/IDs before we measure continuation compression.
 base_rank = {(l, r): i for i, (l, r) in enumerate(merges)}
-def toklen(text, table):
+def program_tokens(text, table):
     global rank_of
     saved = rank_of; rank_of = table
     try:
-        return len(bpe_apply(encode_bytelevel(text)))
+        out = []
+        for unit in pretoken_surfaces(text):
+            out.extend(bpe_apply(unit))
+        return out
     finally:
         rank_of = saved
+
+oracle_probes = holdout[:200] + prose
+for probe in oracle_probes:
+    enc = oracle.encode(probe, add_special_tokens=False)
+    got_tokens = program_tokens(probe, base_rank)
+    check(got_tokens == enc.tokens,
+          f"inherited replay matches original tokenizer.json on {probe[:40]!r}")
+    if got_tokens == enc.tokens:
+        check([vocab[t] for t in got_tokens] == enc.ids,
+              f"inherited IDs match original tokenizer.json on {probe[:40]!r}")
+
+def toklen(text, table):
+    return len(program_tokens(text, table))
+
 before = sum(toklen(l, base_rank) for l in holdout)
 after = sum(toklen(l, rank_of) for l in holdout)
 print(f"  domain tokens: base={before} continued={after} "
@@ -238,6 +311,17 @@ prose_before = sum(toklen(l, base_rank) for l in prose)
 prose_after = sum(toklen(l, rank_of) for l in prose)
 check(prose_before == prose_after,
       f"ordinary language is untouched ({prose_before} tokens either way)")
+
+# The produced explicit artifact must be loadable by the project's real C++
+# runtime, including the appended UNKNOWN ABI.
+cli = os.path.join(os.path.dirname(SPM), "spm_expansion_cli")
+if not os.path.isfile(cli):
+    raise SystemExit(f"spm_expansion_cli is required for real acceptance: {cli}")
+load = subprocess.run(
+    [cli, f"--expansion={prefix}.expansion", "--mode=idmap_sha"],
+    capture_output=True, text=True)
+check(load.returncode == 0 and bool(load.stdout.strip()),
+      "C++ ExpansionProcessor loads the real Qwen continuation artifact")
 
 native = os.path.exists(prefix + ".model")
 print(f"  native .model emitted: {native} "
