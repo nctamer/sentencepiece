@@ -688,6 +688,97 @@ TEST(BPETrainerTest, OldSixToThreeAliasFailureIsUnrepresentable) {
   EXPECT_EQ("ab", out[1].piece);
 }
 
+TEST(BPETrainerTest, HierarchySelfOverlapSupportIncreaseIsRequeued) {
+  // The left a+a replacement is initially hierarchy-ineligible but still
+  // consumes the overlapping right occurrence in flat BPE's replacement set.
+  // After x+a is selected, that left occurrence disappears and the surviving
+  // right a+a becomes the supported replacement. Its score rises 0 -> 10
+  // WITHOUT AddNewPair creating a new a+a adjacency, so ResetFreq must requeue
+  // the dirty candidate instead of leaving its stale zero heap key buried.
+  const std::vector<RefRow> rows = {
+      {"xaaa", 10, {{1, {0, 2, 4}}}},
+      {"bc", 5, {}},
+  };
+  const int first_new_id = RefFirstNewId(rows);
+  const RefRun oracle =
+      RunFlatHierarchyReference(rows, first_new_id, /*requested_new_pieces=*/2);
+  ASSERT_EQ(2u, oracle.rules.size());
+  EXPECT_EQ("x", oracle.rules[0].left);
+  EXPECT_EQ("a", oracle.rules[0].right);
+  EXPECT_EQ(10u, oracle.rules[0].support);
+  EXPECT_EQ("a", oracle.rules[1].left);
+  EXPECT_EQ("a", oracle.rules[1].right);
+  EXPECT_EQ(10u, oracle.rules[1].support);
+
+  const auto run =
+      TrainHierarchyFixture("hier_self_overlap_support_increase", rows, 2);
+  ASSERT_EQ(2, run.result.learned_merges_size());
+  ASSERT_EQ(2u, run.trace.size());
+  for (int i = 0; i < 2; ++i) {
+    const auto& got = run.result.learned_merges(i);
+    const auto& want = oracle.rules[i];
+    EXPECT_EQ(want.left, got.left()) << "rank " << i;
+    EXPECT_EQ(want.right, got.right()) << "rank " << i;
+    EXPECT_EQ(want.support, got.weighted_count()) << "rank " << i;
+    EXPECT_EQ(want.external_id, got.external_id()) << "rank " << i;
+
+    const std::vector<std::string> fields =
+        absl::StrSplit(run.trace[i], '\t');
+    ASSERT_EQ(8u, fields.size()) << "rank " << i;
+    EXPECT_EQ(want.post_state_sha256, fields[7]) << "rank " << i;
+  }
+  EXPECT_EQ(oracle.final_sha256,
+            run.result.training_final_segmentation_sha256());
+}
+
+TEST(BPETrainerTest, ExpansionRuntimeUsesDeclaredMultiCodepointAtoms) {
+  ExpansionResult result;
+  result.set_schema_version(1);
+  result.set_model_type(EXPANSION_BPE);
+
+  auto add_piece = [&](int id, absl::string_view piece,
+                       ModelProto::SentencePiece::Type type,
+                       bool mergeable, bool atomic, bool learned) {
+    ExpansionPiece* p = learned ? result.add_learned_pieces()
+                                : result.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(type);
+    p->set_mergeable(mergeable);
+    p->set_atomic(atomic);
+  };
+  add_piece(0, "<unk>", ModelProto::SentencePiece::UNKNOWN,
+            false, false, false);
+  add_piece(1, "ab", ModelProto::SentencePiece::NORMAL,
+            true, true, false);
+  add_piece(2, "c", ModelProto::SentencePiece::NORMAL,
+            true, true, false);
+  add_piece(3, "abc", ModelProto::SentencePiece::NORMAL,
+            true, false, true);
+
+  auto* merge = result.add_learned_merges();
+  merge->set_rank(0);
+  merge->set_left("ab");
+  merge->set_right("c");
+  merge->set_external_id(3);
+
+  NormalizerSpec* ns = result.mutable_contract()->mutable_normalizer_spec();
+  ns->set_name("identity");
+  ns->set_add_dummy_prefix(false);
+  ns->set_remove_extra_whitespaces(false);
+  ns->set_escape_whitespaces(false);
+
+  expansion::ExpansionProcessor runtime;
+  ASSERT_TRUE(runtime.Load(result).ok());
+  std::vector<expansion::TokenSpan> out;
+  ASSERT_TRUE(runtime.Encode("abc", &out).ok());
+  ASSERT_EQ(1u, out.size());
+  EXPECT_EQ(3, out[0].id);
+  EXPECT_EQ("abc", out[0].piece);
+  EXPECT_EQ(0, out[0].begin);
+  EXPECT_EQ(3, out[0].end);
+}
+
 TEST(BPETrainerTest, RandomLaminarHierarchyMatchesFlatReferenceOracle) {
   std::mt19937 rng(0x51A7BEEF);
   std::uniform_int_distribution<int> weight_dist(1, 5);
