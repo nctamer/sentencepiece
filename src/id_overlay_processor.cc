@@ -12,7 +12,6 @@
 #include <queue>
 #include <utility>
 
-#include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
 #include "filesystem.h"
 
@@ -209,7 +208,8 @@ absl::Status IdOverlayProcessor::LoadFromSerialized(
 
 absl::Status IdOverlayProcessor::LoadFromFile(absl::string_view path) {
   auto input = filesystem::NewReadableFile(path, true);
-  ABSL_RETURN_IF_ERROR(input->status());
+  const absl::Status input_status = input->status();
+  if (!input_status.ok()) return input_status;
   std::string blob;
   if (!input->ReadAll(&blob)) {
     return absl::InternalError(absl::StrCat("cannot read ", path));
@@ -383,8 +383,9 @@ absl::Status IdOverlayProcessor::EncodeIds(
           absl::StrCat("nested open fence at token ", pos));
     }
     if (id == close_fence_id_) {
-      ABSL_RETURN_IF_ERROR(ApplyBlock(block, dropout,
-                                     SplitMix64(seed ^ pos), out, stats));
+      const absl::Status block_status =
+          ApplyBlock(block, dropout, SplitMix64(seed ^ pos), out, stats);
+      if (!block_status.ok()) return block_status;
       block.clear();
       out->push_back(id);
       inside = false;
@@ -396,8 +397,9 @@ absl::Status IdOverlayProcessor::EncodeIds(
     if (!allow_unclosed) {
       return absl::InvalidArgumentError("unclosed overlay block");
     }
-    ABSL_RETURN_IF_ERROR(
-        ApplyBlock(block, dropout, SplitMix64(seed ^ ids.size()), out, stats));
+    const absl::Status block_status =
+        ApplyBlock(block, dropout, SplitMix64(seed ^ ids.size()), out, stats);
+    if (!block_status.ok()) return block_status;
   }
   return absl::OkStatus();
 }
