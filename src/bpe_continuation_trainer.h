@@ -127,6 +127,29 @@ class ContinuationTrainer : public TrainerInterface {
     }
   };
 
+  // Replay of the learned prefix is a FIXED-POINT closure, not a one-pass
+  // history. A later scoped alias may create operands for an earlier rank.
+  // Entries are ordered exactly like inference: lowest rank, then leftmost
+  // occurrence within a record. Different records are independent.
+  struct ReplayEntry {
+    int learned_rank = -1;
+    int sid = -1;
+    int left = -1;
+    int right = -1;
+  };
+  struct ReplayEntryComparator {
+    bool operator()(const ReplayEntry& a, const ReplayEntry& b) const {
+      if (a.learned_rank != b.learned_rank) {
+        return a.learned_rank > b.learned_rank;
+      }
+      if (a.sid != b.sid) return a.sid > b.sid;
+      return a.left > b.left;
+    }
+  };
+  using ReplayQueue =
+      std::priority_queue<ReplayEntry, std::vector<ReplayEntry>,
+                          ReplayEntryComparator>;
+
   static uint64_t EncodePos(int sid, int l, int r);
   static Position DecodePos(uint64_t n);
 
@@ -141,7 +164,13 @@ class ContinuationTrainer : public TrainerInterface {
   int GetPrevIndex(int sid, int index) const;
   void AddNewPair(int sid, int left, int right);
   void ResetFreq(int sid, int left, int right, const Candidate* best);
-  absl::Status AcceptCandidate(Candidate* candidate);
+  // Schedule an already-learned exact-scope rule when one matches this
+  // adjacency; otherwise expose it to the NEW-candidate table.
+  void ScheduleKnownOrAddCandidate(int sid, int left, int right,
+                                   ReplayQueue* replay);
+  bool ReplayEntryStillMatches(const ReplayEntry& entry) const;
+  absl::Status AcceptCandidateWithClosure(Candidate* candidate,
+                                          int selected_learned_rank);
   void DrainPendingQueue();
   // After inherited/base replay, discard the ungated candidate index and
   // rebuild it from the CURRENT segmentation with occurrence-local hierarchy
@@ -189,6 +218,9 @@ class ContinuationTrainer : public TrainerInterface {
                             absl::string_view label);
   absl::Status LearnExpansion();
   std::vector<ExpansionMerge> EffectiveMergeTable() const;
+  // SHA-256 over canonical PreparedCorpus order and the exact final ordered
+  // token strings. This proves trainer state, not merely token cardinality.
+  std::string FinalSegmentationSha256() const;
   // Rank of each declared (left, right) pair. Built once per finalization:
   // a real inherited tokenizer carries ~10^5 merges, so rebuilding this per
   // candidate piece would make reachability verification quadratic in the
@@ -228,6 +260,11 @@ class ContinuationTrainer : public TrainerInterface {
   // a duplicate token ID. A different ancestry for an existing child remains
   // redundant and is retired.
   std::map<std::pair<std::string, std::string>, int> pair_external_id_;
+  // Learned exact-scope operation -> learned_merges_ index. Unlike Candidate,
+  // these entries remain live forever because a later scoped alias can create
+  // a brand-new occurrence of an earlier operation.
+  std::map<std::tuple<std::string, std::string, int>, int>
+      learned_rule_rank_;
   // USER_DEFINED base piece strings and their longest-prefix matcher. The
   // matcher borrows the strings, so the set must outlive it.
   std::set<std::string> user_defined_piece_strings_;
