@@ -509,12 +509,25 @@ bool ContinuationTrainer::HierarchySupportsMerge(int sid, int left,
   const size_t end = span_end_[sid][right];
   if (begin >= end) return false;
 
+  const HierarchyRecord& record = hierarchy_[sid];
+  if (record.restrict_support) {
+    bool owned = false;
+    for (const auto& range : record.support_ranges) {
+      if (range.first <= begin && end <= range.second) {
+        owned = true;
+        break;
+      }
+      if (range.first > begin) break;
+    }
+    if (!owned) return false;
+  }
+
   // A resulting span is hierarchy-supported iff, for every enabled parent it
   // partially traverses, it is a consecutive union of complete children.
   // Fully containing a nested parent is fine: at an ancestor level that whole
   // parent is one completed child. This also permits a flat rule to repair a
   // temporarily partial token, e.g. Vn:d5 + C5 -> Vn:d5C5.
-  for (const HierarchyGate& gate : hierarchy_[sid].gates) {
+  for (const HierarchyGate& gate : record.gates) {
     if (!gate.enabled || end <= gate.begin || begin >= gate.end) continue;
     if (begin <= gate.begin && end >= gate.end) continue;  // whole parent
 
@@ -599,12 +612,13 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
     absl::StrAppend(&canonical, line, "\n");
     if (line.empty() || line[0] == '#') continue;
     const std::vector<std::string> fields = absl::StrSplit(line, '\t');
-    const size_t want_fields = metadata_v2 ? 3 : 2;
+    const size_t want_fields = metadata_v2 ? 4 : 2;
     if (fields.size() != want_fields) {
       return absl::InvalidArgumentError(
           metadata_v2
               ? "BPE hierarchy v2 row must be "
                 "<normalized-text><tab><metadata-key><tab><gate-spec>"
+                "<tab><support-range-spec>"
               : "BPE hierarchy row must be "
                 "<normalized-text><tab><gate-spec>");
     }
@@ -628,8 +642,37 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
     }
     seen[sid] = true;
     HierarchyRecord& record = hierarchy_[sid];
+    record.restrict_support = metadata_v2;
 
     const std::string& gate_spec = fields[metadata_v2 ? 2 : 1];
+    if (metadata_v2) {
+      const std::string& support_spec = fields[3];
+      size_t previous_end = 0;
+      if (!support_spec.empty()) {
+        for (absl::string_view range_text : absl::StrSplit(support_spec, ',')) {
+          const size_t dash = range_text.find('-');
+          if (dash == absl::string_view::npos) {
+            return absl::InvalidArgumentError(
+                "hierarchy v2 support range must be <begin>-<end>");
+          }
+          size_t begin = 0;
+          size_t end = 0;
+          if (!absl::SimpleAtoi(range_text.substr(0, dash), &begin) ||
+              !absl::SimpleAtoi(range_text.substr(dash + 1), &end) ||
+              begin >= end || end > fields[0].size()) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "invalid hierarchy v2 support range: ", range_text));
+          }
+          if (!record.support_ranges.empty() && begin < previous_end) {
+            return absl::InvalidArgumentError(
+                "hierarchy v2 support ranges must be sorted and non-overlapping");
+          }
+          record.support_ranges.push_back({begin, end});
+          previous_end = end;
+        }
+      }
+    }
+
     if (!gate_spec.empty()) {
       for (absl::string_view gate_text : absl::StrSplit(gate_spec, ';')) {
         if (gate_text.empty()) continue;
