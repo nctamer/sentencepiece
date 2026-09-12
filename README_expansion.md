@@ -231,7 +231,7 @@ provenance. The result boundary policy is
 `bpe_hierarchy_guided_training_v1:<sha256>`, but the emitted merge table is an
 ordinary flat table and `ExpansionProcessor::Encode` requires no hierarchy.
 
-### Shape options are about NEW pieces### Shape options are about NEW pieces
+### Shape options are about NEW pieces
 
 `max_sentencepiece_length`, `split_by_whitespace`, `split_by_unicode_script`,
 `split_by_number` and `split_digits` are fresh-training heuristics, applied to
