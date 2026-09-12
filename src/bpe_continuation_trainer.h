@@ -6,6 +6,7 @@
 #ifndef BPE_CONTINUATION_TRAINER_H_
 #define BPE_CONTINUATION_TRAINER_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -46,9 +47,8 @@ class ContinuationTrainer : public TrainerInterface {
   absl::Status Train() override;
 
  private:
-  // Canonical token symbol. Scope belongs to a MERGE OPERATION, not to the
-  // resulting token: "ab" is one token even when a+b is selected separately
-  // as an ordinary merge and as a completion-crossing merge.
+  // Canonical token symbol. Learned symbols have unique construction: a later
+  // rank never aliases/reuses an existing child surface.
   struct Symbol {
     const Symbol* left = nullptr;
     const Symbol* right = nullptr;
@@ -111,15 +111,24 @@ class ContinuationTrainer : public TrainerInterface {
   };
 
   struct QueueEntryComparator {
+    static bool ByteLess(const std::string& a, const std::string& b) {
+      return std::lexicographical_compare(
+          a.begin(), a.end(), b.begin(), b.end(),
+          [](char x, char y) {
+            return static_cast<unsigned char>(x) <
+                   static_cast<unsigned char>(y);
+          });
+    }
+
     bool operator()(const QueueEntry& e1, const QueueEntry& e2) const {
-      // Highest hierarchy-supported weighted count wins, then the pair itself
-      // is the total deterministic key. Do NOT tie-break on concatenated child
-      // text: a+bc and ab+c both produce abc.
+      // Highest hierarchy-supported weighted count wins, then unsigned UTF-8
+      // byte order of (left,right) is the total deterministic key. Do NOT
+      // tie-break on concatenated child text: a+bc and ab+c both produce abc.
       if (e1.freq != e2.freq) return e1.freq < e2.freq;
       if (e1.candidate->left_text != e2.candidate->left_text) {
-        return e1.candidate->left_text > e2.candidate->left_text;
+        return ByteLess(e2.candidate->left_text, e1.candidate->left_text);
       }
-      return e1.candidate->right_text > e2.candidate->right_text;
+      return ByteLess(e2.candidate->right_text, e1.candidate->right_text);
     }
   };
 
