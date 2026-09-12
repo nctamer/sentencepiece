@@ -1613,6 +1613,13 @@ std::string ContinuationTrainer::BaseIdMapSha256() const {
 
 absl::Status ContinuationTrainer::BuildNativeModel(
     const std::vector<ExpansionMerge>& merges, ModelProto* model) const {
+  if (!hierarchy_sha256_.empty()) {
+    return absl::FailedPreconditionError(
+        "hierarchical completion is part of BPE inference semantics; native "
+        "SentencePiece has no per-occurrence hierarchy gate, so emitting a "
+        "native .model would be semantically false");
+  }
+
   std::vector<ExpansionPiece> pieces = base_pieces_;
   pieces.insert(pieces.end(), bootstrap_pieces_.begin(), bootstrap_pieces_.end());
   pieces.insert(pieces.end(), learned_pieces_.begin(), learned_pieces_.end());
@@ -1731,19 +1738,28 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   ABSL_RETURN_IF_ERROR(
       ValidateMergeProgram(effective, /*require_all_declared_pieces=*/true));
 
-  int unreachable = 0;
-  const PairRanks pair_rank = BuildPairRanks(effective);
-  for (const auto& piece : learned_pieces_) {
-    if (!IsReachable(piece.piece(), pair_rank)) {
-      ++unreachable;
-      LOG(ERROR) << "unreachable learned BPE piece id=" << piece.external_id()
-                 << " piece=" << piece.piece();
+  // Flat replay is a valid reachability oracle only for a flat BPE program.
+  // In a hierarchical program it is actively wrong: after /+12 is learned
+  // from /12, flat replay would fire that earlier rule inside /128 and falsely
+  // declare a later /+128 construction unreachable. Every hierarchical learned
+  // merge already has a stronger witness: it was accepted from at least one
+  // positive-weight, hierarchy-eligible live occurrence, and
+  // ValidateMergeProgram above proves its parents are rank-constructible.
+  if (hierarchy_.empty()) {
+    int unreachable = 0;
+    const PairRanks pair_rank = BuildPairRanks(effective);
+    for (const auto& piece : learned_pieces_) {
+      if (!IsReachable(piece.piece(), pair_rank)) {
+        ++unreachable;
+        LOG(ERROR) << "unreachable learned BPE piece id=" << piece.external_id()
+                   << " piece=" << piece.piece();
+      }
     }
-  }
-  if (unreachable != 0) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "BPE expansion failed reachability verification: ", unreachable,
-        " learned pieces are unreachable in the serialized final merge table"));
+    if (unreachable != 0) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "BPE expansion failed reachability verification: ", unreachable,
+          " learned pieces are unreachable in the serialized final merge table"));
+    }
   }
 
   ExpansionResult result;
