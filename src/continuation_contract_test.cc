@@ -2968,6 +2968,33 @@ TEST(ExpansionProcessorTest, HierarchyEligibilityIsOccurrenceLocalAtRuntime) {
 }
 
 
+TEST(ExpansionProcessorTest, RejectsNestedGateCrossingOuterDirectChild) {
+  const ExpansionResult r = MakeProgram(
+      {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL},
+       {"a", kNORMAL}, {"b", kNORMAL}, {"c", kNORMAL}, {"d", kNORMAL}},
+      {});
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+
+  // Normalized surface is "▁abcd": byte 3 starts 'a'. The outer parent is
+  // [3,7) with children "ab" | "cd" (cut 5). The nested parent [3,6)
+  // crosses that child boundary but ends inside "cd", so it cannot belong to
+  // one consistent constituent tree even though the intervals are laminar.
+  expansion::CompletionGate outer;
+  outer.level = 2;
+  outer.cuts = {3, 5, 7};
+  expansion::CompletionGate inner;
+  inner.level = 1;
+  inner.cuts = {3, 4, 6};
+
+  std::vector<expansion::TokenSpan> out;
+  const absl::Status st =
+      p.EncodeWithHierarchy("abcd", {outer, inner}, &out);
+  EXPECT_FALSE(st.ok());
+  EXPECT_NE(std::string::npos,
+            std::string(st.message()).find("direct-child"));
+}
+
 TEST(ExpansionProcessorTest, SamePairCanHaveDistinctExactScopeRules) {
   ExpansionResult r;
   r.set_schema_version(1);
