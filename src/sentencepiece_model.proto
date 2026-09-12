@@ -238,10 +238,19 @@ message ExpansionMerge {
   // Audit data for newly learned merges.  Old/inherited artifacts legitimately
   // omit these fields.
   optional uint64 weighted_count = 5 [default = 0];
-  // 0 = no grammar boundary crossed; positive values are hierarchy levels
-  // supplied by the sidecar (InterMo uses 1=sub-lexical grammar,
-  // 2=context/whitespace composition, 3=whole-interval composition).
+  // Historical audit field. For newly produced hierarchical artifacts this
+  // is kept equal to scope_level so older review tooling remains readable.
   optional int32 grammar_level = 6 [default = 0];
+
+  // Exact operation scope for hierarchical BPE.
+  //   -1 = unscoped / inherited / legacy rule
+  //    0 = ordinary merge that crosses no completion boundary
+  //   >0 = merge across complete children of that hierarchy level
+  //
+  // Scope is part of the merge OPERATION identity, not the token identity:
+  // the same (left,right) pair may legitimately have distinct rules at
+  // different scopes while still constructing the same external token ID.
+  optional int32 scope_level = 7 [default = -1];
 }
 
 enum ExpansionModelType {
