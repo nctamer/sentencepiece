@@ -96,9 +96,14 @@ class ExpansionProcessor {
   absl::Status status_;
   std::vector<std::string> id_to_piece_;
   std::vector<int> id_to_type_;
-  struct MergeRule { int rank = 0; bool hierarchy_gated = false; };
+  struct MergeRule {
+    int rank = 0;
+    // -1 = unconditional inherited/legacy rule; >=0 = exact hierarchy scope.
+    int scope_level = -1;
+  };
   absl::flat_hash_map<std::string, int> piece_to_id_;
-  absl::flat_hash_map<std::string, MergeRule> merge_rule_;
+  // Multiple scoped operations may share one (left,right) surface pair.
+  absl::flat_hash_map<std::string, std::vector<MergeRule>> merge_rules_;
   std::unique_ptr<normalizer::Normalizer> normalizer_;
   // Longest-prefix matcher over the USER_DEFINED piece strings. Owns nothing;
   // the strings live in id_to_piece_.
