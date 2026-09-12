@@ -258,6 +258,10 @@ message ExpansionMerge {
   // the same (left,right) pair may legitimately have distinct rules at
   // different scopes while still constructing the same external token ID.
   optional int32 scope_level = 7 [default = -1];
+  // Weighted count of all non-overlapping replacements actually performed
+  // when this learned flat rule was selected. This is intentionally separate
+  // from weighted_count, which is the hierarchy-supported selection score.
+  optional uint64 application_count = 8 [default = 0];
 }
 
 enum ExpansionModelType {
