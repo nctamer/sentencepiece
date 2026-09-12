@@ -311,6 +311,7 @@ absl::Status ContinuationTrainer::AcceptCandidate(Candidate* candidate) {
         support_weight, " applied ", applied_weight));
   }
 
+  candidate->last_application_weight = applied_weight;
   candidate->active = false;
   candidate->pending = false;
   candidate->positions.clear();
@@ -1505,6 +1506,8 @@ absl::Status ContinuationTrainer::LearnExpansion() {
     // fresh, this later rank cannot enable an older rule; therefore sequential
     // training application equals ranked replay of the serialized prefix.
     ABSL_RETURN_IF_ERROR(AcceptCandidate(best));
+    learned_merges_.back().set_application_count(
+        best->last_application_weight);
     live_by_string_[child] = best->result;
 
     if (!trainer_spec_.bpe_reference_trace_file().empty()) {
@@ -1512,7 +1515,8 @@ absl::Status ContinuationTrainer::LearnExpansion() {
       // always zero for the flat program.
       reference_trace_lines_.push_back(absl::StrCat(
           selected_learned_rank, "\t", merge.left(), "\t", merge.right(),
-          "\t0\t", merge.weighted_count(), "\t1\t", external_id, "\t",
+          "\t0\t", learned_merges_.back().weighted_count(), "\t",
+          learned_merges_.back().application_count(), "\t", external_id, "\t",
           FinalSegmentationSha256()));
     }
 
