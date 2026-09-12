@@ -245,7 +245,12 @@ absl::Status WriteMergeTable(
   auto output = filesystem::NewWritableFile(filename);
   if (!output->status().ok()) return output->status();
   for (const auto& merge : merges) {
-    if (!output->WriteLine(absl::StrCat(merge.left(), "\t", merge.right()))) {
+    const std::string row =
+        merge.has_scope_level()
+            ? absl::StrCat(merge.left(), "\t", merge.right(), "\t",
+                           merge.scope_level())
+            : absl::StrCat(merge.left(), "\t", merge.right());
+    if (!output->WriteLine(row)) {
       return absl::DataLossError(
           absl::StrCat("failed to write merge table: ", filename));
     }
