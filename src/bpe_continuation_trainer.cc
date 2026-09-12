@@ -668,6 +668,13 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
             return absl::InvalidArgumentError(
                 "hierarchy v2 support ranges must be sorted and non-overlapping");
           }
+          for (size_t cut : {begin, end}) {
+            if (cut != fields[0].size() &&
+                (static_cast<unsigned char>(fields[0][cut]) & 0xC0) == 0x80) {
+              return absl::InvalidArgumentError(
+                  "hierarchy support range falls inside a UTF-8 codepoint");
+            }
+          }
           record.support_ranges.push_back({begin, end});
           previous_end = end;
         }

@@ -58,12 +58,25 @@ bool IdOverlayProcessor::IsOverlay(int id) const {
 }
 
 absl::Status IdOverlayProcessor::Load(const IdOverlayProgram& program) {
+  // Publish a complete validated program, never partially installed rules.
+  IdOverlayProcessor candidate;
+  const auto status = candidate.LoadValidated(program);
+  if (!status.ok()) return status;
+  candidate.loaded_ = true;
+  *this = std::move(candidate);
+  return absl::OkStatus();
+}
+
+absl::Status IdOverlayProcessor::LoadValidated(const IdOverlayProgram& program) {
   rules_.clear();
   protected_ids_.clear();
   expansion_by_id_.clear();
   overlay_ids_.clear();
   base_identity_sha256_.clear();
 
+  if (!program.IsInitialized()) {
+    return absl::InvalidArgumentError("overlay program lacks required fields");
+  }
   if (program.schema_version() != 1) {
     return absl::InvalidArgumentError(absl::StrCat(
         "unsupported IdOverlayProgram schema_version ",
@@ -115,6 +128,7 @@ absl::Status IdOverlayProcessor::Load(const IdOverlayProgram& program) {
 
   absl::flat_hash_set<uint32_t> ranks;
   absl::flat_hash_set<int> children;
+  absl::flat_hash_set<std::vector<int>> expansions;
   std::vector<const IdOverlayRule*> ordered;
   ordered.reserve(program.rules_size());
   for (const auto& r : program.rules()) ordered.push_back(&r);
@@ -162,6 +176,11 @@ absl::Status IdOverlayProcessor::Load(const IdOverlayProgram& program) {
           "duplicate overlay pair at rank ", r.rank()));
     }
 
+    const size_t expansion_size = expansion_by_id_[r.left_id()].size() +
+                                  expansion_by_id_[r.right_id()].size();
+    if (expansion_size > static_cast<size_t>(max_expansion_ids_)) {
+      return absl::ResourceExhaustedError("overlay macro expansion exceeds limit");
+    }
     std::vector<int> expected = expansion_by_id_[r.left_id()];
     expected.insert(expected.end(), expansion_by_id_[r.right_id()].begin(),
                     expansion_by_id_[r.right_id()].end());
@@ -186,6 +205,9 @@ absl::Status IdOverlayProcessor::Load(const IdOverlayProgram& program) {
       }
     }
 
+    if (!expansions.insert(expected).second) {
+      return absl::InvalidArgumentError("duplicate expanded overlay atom sequence");
+    }
     expansion_by_id_[r.child_id()] = std::move(expected);
     overlay_ids_.push_back(r.child_id());
     rules_.emplace(key, Rule{r.left_id(), r.right_id(), r.child_id(),
@@ -197,6 +219,9 @@ absl::Status IdOverlayProcessor::Load(const IdOverlayProgram& program) {
 
 absl::Status IdOverlayProcessor::LoadFromSerialized(
     absl::string_view serialized) {
+  if (serialized.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return absl::ResourceExhaustedError("serialized overlay exceeds parser limit");
+  }
   IdOverlayProgram program;
   if (!program.ParseFromArray(serialized.data(),
                               static_cast<int>(serialized.size()))) {
@@ -338,6 +363,7 @@ absl::Status IdOverlayProcessor::ApplyBlock(
 absl::Status IdOverlayProcessor::EncodeIds(
     const std::vector<int>& ids, double dropout, uint64_t seed,
     bool allow_unclosed, std::vector<int>* out, OverlayStats* stats) const {
+  if (!loaded_) return absl::FailedPreconditionError("overlay is not loaded");
   if (out == nullptr) {
     return absl::InvalidArgumentError("EncodeIds output is null");
   }
@@ -407,16 +433,24 @@ absl::Status IdOverlayProcessor::EncodeIds(
 absl::Status IdOverlayProcessor::ExpandIds(const std::vector<int>& ids,
                                            bool allow_unclosed,
                                            std::vector<int>* out) const {
+  if (!loaded_) return absl::FailedPreconditionError("overlay is not loaded");
   if (out == nullptr) {
     return absl::InvalidArgumentError("ExpandIds output is null");
   }
   out->clear();
+  if (ids.size() > static_cast<size_t>(max_input_ids_)) {
+    return absl::ResourceExhaustedError("input exceeds max_input_ids");
+  }
   bool inside = false;
   for (size_t pos = 0; pos < ids.size(); ++pos) {
     const int id = ids[pos];
     if (id < 0 || id >= model_vocab_size_) {
       return absl::OutOfRangeError(
           absl::StrCat("input id out of model vocabulary at ", pos, ": ", id));
+    }
+    const size_t width = IsOverlay(id) ? expansion_by_id_[id].size() : 1;
+    if (width > static_cast<size_t>(max_input_ids_) - out->size()) {
+      return absl::ResourceExhaustedError("expanded sequence exceeds max_input_ids");
     }
     if (!inside) {
       if (id == close_fence_id_) {
@@ -449,11 +483,6 @@ absl::Status IdOverlayProcessor::ExpandIds(const std::vector<int>& ids,
       out->push_back(id);
     } else if (IsOverlay(id)) {
       const auto& expansion = expansion_by_id_[id];
-      if (out->size() + expansion.size() >
-          static_cast<size_t>(max_expansion_ids_)) {
-        return absl::ResourceExhaustedError(
-            "expanded sequence exceeds max_expansion_ids");
-      }
       out->insert(out->end(), expansion.begin(), expansion.end());
     } else {
       return absl::InvalidArgumentError(

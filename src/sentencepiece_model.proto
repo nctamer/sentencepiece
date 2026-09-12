@@ -425,7 +425,9 @@ message IdOverlayProgram {
   // Existing base special/control IDs. Fences are protected automatically too.
   repeated int32 protected_base_ids = 8 [packed = true];
   repeated IdOverlayRule rules = 9;
+  // Sequence limit, enforced on both encoded input and fully expanded output.
   optional int32 max_input_ids = 10 [default = 1048576];
+  // Per-macro base-ID expansion limit, not the length of an entire sequence.
   optional int32 max_expansion_ids = 11 [default = 1048576];
 
   // Human/audit provenance; base_identity_sha256 is the enforcement key.

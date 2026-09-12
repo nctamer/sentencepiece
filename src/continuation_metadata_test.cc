@@ -78,5 +78,75 @@ TEST(ContinuationMetadataTest, LegacyTsvStillFoldsBySurfaceOnly) {
   EXPECT_TRUE(corpus.metadata_keys[0].empty());
 }
 
+TEST(ContinuationMetadataTest, RealTrainerSeparatesSupportFromApplications) {
+  const std::string prefix = TempFile("metadata_train");
+  {
+    std::ofstream out(prefix + ".tsv");
+    out << "aa\t2\tA\naa\t3\tB\nbb\t4\tC\n";
+  }
+  {
+    std::ofstream out(prefix + ".hier");
+    out << "# sentencepiece-bpe-hierarchy-v2\n"
+           "aa\tA\t\t0-2\naa\tB\t\t\nbb\tC\t\t0-2\n";
+  }
+  ExpansionSpec spec;
+  spec.set_model_type(EXPANSION_BPE);
+  spec.set_first_new_external_id(3);
+  spec.set_requested_new_pieces(2);
+  auto* p = spec.add_base_pieces();
+  p->set_external_id(0); p->set_piece("<unk>");
+  p->set_type(ModelProto::SentencePiece::UNKNOWN); p->set_mergeable(false);
+  for (int id = 1; id <= 2; ++id) {
+    p = spec.add_base_pieces();
+    p->set_external_id(id); p->set_piece(id == 1 ? "a" : "b");
+    p->set_atomic(true);
+  }
+  {
+    std::ofstream out(prefix + ".spec", std::ios::binary);
+    out << spec.SerializeAsString();
+  }
+  TrainerSpec ts;
+  ts.set_model_type(TrainerSpec::BPE);
+  ts.add_input(prefix + ".tsv"); ts.set_input_format("tsv_meta");
+  ts.set_model_prefix(prefix); ts.set_vocab_size(5);
+  ts.set_expansion_spec(prefix + ".spec");
+  ts.set_expansion_result(prefix + ".expansion");
+  ts.set_bpe_hierarchy_file(prefix + ".hier");
+  ts.set_input_sentence_size(0);
+  ts.set_split_by_whitespace(false); ts.set_split_by_unicode_script(false);
+  ts.set_split_by_number(false); ts.set_bos_id(-1); ts.set_eos_id(-1);
+  auto status = SentencePieceTrainer::Train(ts, Identity(), NormalizerSpec{});
+  ASSERT_TRUE(status.ok()) << status;
+  std::ifstream in(prefix + ".expansion", std::ios::binary);
+  const std::string bytes((std::istreambuf_iterator<char>(in)), {});
+  ExpansionResult result;
+  ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(2, result.learned_merges_size());
+  EXPECT_EQ("b", result.learned_merges(0).left());
+  EXPECT_EQ(4, result.learned_merges(0).weighted_count());
+  EXPECT_EQ(4, result.learned_merges(0).application_count());
+  EXPECT_EQ("a", result.learned_merges(1).left());
+  EXPECT_EQ(2, result.learned_merges(1).weighted_count());
+  EXPECT_EQ(5, result.learned_merges(1).application_count());
+  EXPECT_EQ(9, result.training_final_weighted_tokens());
+  // A v2 support range, just like a hierarchy cut, must align to UTF-8.
+  spec.mutable_base_pieces(1)->set_piece("é");
+  {
+    std::ofstream out(prefix + ".spec", std::ios::binary);
+    out << spec.SerializeAsString();
+  }
+  {
+    std::ofstream out(prefix + ".tsv");
+    out << "éé\t2\tA\n";
+  }
+  {
+    std::ofstream out(prefix + ".hier");
+    out << "# sentencepiece-bpe-hierarchy-v2\néé\tA\t\t1-4\n";
+  }
+  status = SentencePieceTrainer::Train(ts, Identity(), NormalizerSpec{});
+  EXPECT_FALSE(status.ok());
+  EXPECT_NE(std::string::npos, std::string(status.message()).find("UTF-8"));
+}
+
 }  // namespace
 }  // namespace sentencepiece::continuation

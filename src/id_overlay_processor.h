@@ -67,6 +67,8 @@ class IdOverlayProcessor {
   }
 
  private:
+  absl::Status LoadValidated(const IdOverlayProgram& program);
+  bool loaded_ = false;
   struct Rule {
     int left = -1;
     int right = -1;
