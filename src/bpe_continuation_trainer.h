@@ -254,6 +254,8 @@ class ContinuationTrainer : public TrainerInterface {
   std::vector<ExpansionMerge> base_merges_;
   std::vector<ExpansionMerge> bootstrap_merges_;
   std::vector<ExpansionMerge> learned_merges_;
+  // Populated only when TrainerSpec.bpe_reference_trace_file is set.
+  std::vector<std::string> reference_trace_lines_;
 
   absl::flat_hash_set<std::string> existing_piece_strings_;
   absl::flat_hash_set<std::string> atomic_piece_strings_;
