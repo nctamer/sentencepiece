@@ -377,6 +377,12 @@ message ExpansionResult {
   // reached the same segmentation cardinality on the full weighted corpus.
   optional uint64 training_final_tokens = 26 [default = 0];
   optional uint64 training_final_weighted_tokens = 27 [default = 0];
+
+  // Exact trainer final state over canonical PreparedCorpus order. The digest
+  // commits to normalized row bytes, aggregated row weight, and the ordered
+  // final token strings using length-prefixed fields. Runtime replay must
+  // reproduce this, not merely the same number of tokens.
+  optional string training_final_segmentation_sha256 = 28;
 }
 
 // ModelProto stores model parameters.
