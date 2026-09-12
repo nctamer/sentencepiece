@@ -1004,6 +1004,91 @@ TEST(BPETrainerTest, ExactCountTiesPreferLowerGrammarScope) {
       << "exact count ties must prefer ordinary/lower scope";
 }
 
+
+TEST(BPETrainerTest, EqualSurfaceAncestriesUsePairBytesAsFinalTieBreak) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "ancestry_tie_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "ancestry_tie.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "ancestry_tie.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "ancestry_tie_model");
+  const std::string result_path = prefix + ".expansion";
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("abcX\t5"));
+    ASSERT_TRUE(out->WriteLine("Yabc\t5"));
+  }
+  {
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    // abcX: parent is a | bc, so b+c is ordinary; a+b is blocked.
+    ASSERT_TRUE(out->WriteLine("abcX\t1:0,1,3"));
+    // Yabc: parent is ab | c, so a+b is ordinary; b+c is blocked.
+    ASSERT_TRUE(out->WriteLine("Yabc\t1:1,3,4"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(6);
+  expansion.set_requested_new_pieces(3);
+  auto add_normal = [&](int id, absl::string_view piece) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id); p->set_piece(std::string(piece));
+    p->set_type(id == 0 ? ModelProto::SentencePiece::UNKNOWN
+                        : ModelProto::SentencePiece::NORMAL);
+    p->set_mergeable(id != 0); p->set_atomic(id != 0);
+  };
+  add_normal(0, "<unk>"); add_normal(1, "a");
+  add_normal(2, "b"); add_normal(3, "c");
+  for (const auto& [id, piece] :
+       std::vector<std::pair<int, std::string>>{{4, "X"}, {5, "Y"}}) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id); p->set_piece(piece);
+    p->set_type(ModelProto::SentencePiece::USER_DEFINED);
+    p->set_mergeable(false); p->set_atomic(false);
+  }
+  { auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString())); }
+
+  TrainerSpec ts;
+  ts.set_model_type(TrainerSpec::BPE); ts.add_input(input);
+  ts.set_input_format("tsv"); ts.set_model_prefix(prefix); ts.set_vocab_size(9);
+  ts.set_expansion_spec(spec_path); ts.set_expansion_result(result_path);
+  ts.set_bpe_hierarchy_file(hierarchy); ts.set_input_sentence_size(0);
+  ts.set_split_by_whitespace(false); ts.set_split_by_unicode_script(false);
+  ts.set_split_by_number(false); ts.set_split_digits(false);
+  ts.set_bos_id(-1); ts.set_eos_id(-1); ts.set_pad_id(-1);
+  ts.set_hard_vocab_limit(true);
+  NormalizerSpec ns; ns.set_name("identity"); ns.set_add_dummy_prefix(false);
+  ns.set_remove_extra_whitespaces(false);
+  NormalizerSpec dns;
+  ASSERT_TRUE(SentencePieceTrainer::Train(ts, ns, dns).ok());
+
+  std::string bytes;
+  { auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes)); }
+  ExpansionResult result; ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(3, result.learned_pieces_size());
+  ASSERT_EQ(3, result.learned_merges_size());
+
+  EXPECT_EQ("a", result.learned_merges(0).left());
+  EXPECT_EQ("b", result.learned_merges(0).right());
+  EXPECT_EQ("b", result.learned_merges(1).left());
+  EXPECT_EQ("c", result.learned_merges(1).right());
+
+  // At this point a+bc and ab+c both have count 5, scope 1, and both
+  // concatenate to "abc". Concatenated-surface tie-breaking cannot order
+  // them; the child pair itself must. ("a","bc") sorts before ("ab","c").
+  EXPECT_EQ("a", result.learned_merges(2).left());
+  EXPECT_EQ("bc", result.learned_merges(2).right());
+  EXPECT_EQ(1, result.learned_merges(2).scope_level());
+  EXPECT_EQ(5, result.learned_merges(2).weighted_count());
+}
+
 TEST(BPETrainerTest, SamePairAtTwoScopesSharesOneTokenId) {
   const std::string input =
       filesystem::JoinPath(::testing::TempDir(), "scope_alias_input.tsv");
