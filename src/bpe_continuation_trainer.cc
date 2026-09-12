@@ -754,8 +754,9 @@ absl::Status ContinuationTrainer::ValidateMergeProgram(
     bool require_all_declared_pieces) const {
   std::set<std::string> constructible(atomic_pieces_ordered_.begin(),
                                       atomic_pieces_ordered_.end());
-  std::set<std::pair<std::string, std::string>> seen_pairs;
-  std::set<std::string> constructed_children;
+  std::set<std::tuple<std::string, std::string, int>> seen_operations;
+  std::map<std::string, std::pair<std::string, std::string>>
+      constructed_children;
   std::map<std::string, std::pair<int, bool>> pieces;
 
   auto add_piece = [&](const ExpansionPiece& piece) -> absl::Status {
@@ -785,10 +786,17 @@ absl::Status ContinuationTrainer::ValidateMergeProgram(
     if (merge.left().empty() || merge.right().empty()) {
       return absl::InvalidArgumentError("merge parents must be nonempty");
     }
-    if (!seen_pairs.insert({merge.left(), merge.right()}).second) {
+    const int scope = merge.has_scope_level() ? merge.scope_level() : -1;
+    if (scope < -1) {
+      return absl::InvalidArgumentError(
+          "merge scope_level must be -1 (unscoped) or nonnegative");
+    }
+    if (!seen_operations
+             .insert(std::make_tuple(merge.left(), merge.right(), scope))
+             .second) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "duplicate merge pair in effective program: ", merge.left(), " + ",
-          merge.right()));
+          "duplicate merge operation in effective program: ", merge.left(),
+          " + ", merge.right(), " scope=", scope));
     }
     if (!constructible.count(merge.left()) ||
         !constructible.count(merge.right())) {
@@ -809,11 +817,21 @@ absl::Status ContinuationTrainer::ValidateMergeProgram(
           "merge child external_id mismatch for ", child, ": merge says ",
           merge.external_id(), " but piece says ", piece_it->second.first));
     }
-    if (!constructed_children.insert(child).second) {
+
+    const std::pair<std::string, std::string> ancestry = {
+        merge.left(), merge.right()};
+    const auto child_seen = constructed_children.find(child);
+    if (child_seen == constructed_children.end()) {
+      constructed_children.emplace(child, ancestry);
+    } else if (child_seen->second != ancestry) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "piece has multiple merge constructions in effective program: ",
-          child));
+          "piece has multiple merge ancestries in effective program: ", child,
+          " first=", child_seen->second.first, "+",
+          child_seen->second.second, " later=", merge.left(), "+",
+          merge.right()));
     }
+    // Repeating the SAME ancestry at another scope is intentional: it is one
+    // token ID with multiple scoped operations.
     constructible.insert(child);
   }
 
