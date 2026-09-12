@@ -87,11 +87,12 @@ class ContinuationTrainer : public TrainerInterface {
     int right;
   };
 
-  // One grammar parent whose direct children partition [begin,end). `cuts`
-  // contains begin, every direct-child boundary, and end. Crossing one of
-  // its internal cuts is legal only when both current tokens start/end on cuts
-  // of this same parent: each side is therefore a whole child or a consecutive
-  // union of whole children.
+  // One immutable grammar parent whose direct children partition
+  // [begin,end). `cuts` contains begin, every direct-child boundary, and end.
+  // The hierarchy scores a candidate by its RESULT span: if that result crosses
+  // an internal cut, its begin/end must also be cuts of this parent. Input
+  // tokens need not each have hierarchy-perfect ancestry; this permits a later
+  // flat merge to repair a temporarily partial span.
   struct HierarchyGate {
     size_t begin = 0;
     size_t end = 0;
