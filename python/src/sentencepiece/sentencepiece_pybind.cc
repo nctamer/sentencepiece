@@ -3,6 +3,7 @@
 #include <sentencepiece.pb.h>
 #include <sentencepiece_processor.h>
 #include <sentencepiece_trainer.h>
+#include <id_overlay_processor.h>
 
 #include <algorithm>
 #include <iostream>
@@ -540,6 +541,126 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
   py::class_<PyThreadPool>(m, "ThreadPool")
       .def(py::init<int>())
       .def("num_threads", &PyThreadPool::num_threads);
+
+  py::class_<sentencepiece::overlay::IdOverlayProcessor>(
+      m, "IdOverlayProcessor")
+      .def(py::init<>())
+      .def("LoadFromFile",
+           [](sentencepiece::overlay::IdOverlayProcessor& self,
+              const std::string& path) {
+             py::gil_scoped_release release;
+             auto status = self.LoadFromFile(path);
+             if (!status.ok()) throw status;
+             return true;
+           })
+      .def("LoadFromSerializedProto",
+           [](sentencepiece::overlay::IdOverlayProcessor& self,
+              const py::bytes& serialized) {
+             std::string_view view = serialized.cast<std::string_view>();
+             py::gil_scoped_release release;
+             auto status = self.LoadFromSerialized(view);
+             if (!status.ok()) throw status;
+             return true;
+           })
+      .def("EncodeIds",
+           [](const sentencepiece::overlay::IdOverlayProcessor& self,
+              const std::vector<int>& ids, double dropout, uint64_t seed,
+              bool allow_unclosed) {
+             std::vector<int> out;
+             py::gil_scoped_release release;
+             auto status = self.EncodeIds(ids, dropout, seed, allow_unclosed,
+                                          &out);
+             if (!status.ok()) throw status;
+             return out;
+           },
+           py::arg("ids"), py::arg("dropout") = 0.0,
+           py::arg("seed") = 0, py::arg("allow_unclosed") = false)
+      .def("EncodeIdsWithStats",
+           [](const sentencepiece::overlay::IdOverlayProcessor& self,
+              const std::vector<int>& ids, double dropout, uint64_t seed,
+              bool allow_unclosed) {
+             std::vector<int> out;
+             sentencepiece::overlay::OverlayStats stats;
+             {
+               py::gil_scoped_release release;
+               auto status = self.EncodeIds(ids, dropout, seed,
+                                            allow_unclosed, &out, &stats);
+               if (!status.ok()) throw status;
+             }
+             py::dict d;
+             d["candidates_pushed"] = stats.candidates_pushed;
+             d["candidates_popped"] = stats.candidates_popped;
+             d["stale_pops"] = stats.stale_pops;
+             d["dropout_skips"] = stats.dropout_skips;
+             d["merges"] = stats.merges;
+             return py::make_tuple(out, d);
+           },
+           py::arg("ids"), py::arg("dropout") = 0.0,
+           py::arg("seed") = 0, py::arg("allow_unclosed") = false)
+      .def("EncodeBatch",
+           [](const sentencepiece::overlay::IdOverlayProcessor& self,
+              const std::vector<std::vector<int>>& batch, double dropout,
+              const std::vector<uint64_t>& seeds, bool allow_unclosed) {
+             if (!seeds.empty() && seeds.size() != batch.size()) {
+               throw py::value_error(
+                   "seeds must be empty or have one entry per batch row");
+             }
+             std::vector<std::vector<int>> out(batch.size());
+             {
+               // The entire batch loop is native and executes without the GIL.
+               py::gil_scoped_release release;
+               for (size_t i = 0; i < batch.size(); ++i) {
+                 const uint64_t seed = seeds.empty() ? 0 : seeds[i];
+                 auto status = self.EncodeIds(batch[i], dropout, seed,
+                                              allow_unclosed, &out[i]);
+                 if (!status.ok()) throw status;
+               }
+             }
+             return out;
+           },
+           py::arg("batch"), py::arg("dropout") = 0.0,
+           py::arg("seeds") = std::vector<uint64_t>{},
+           py::arg("allow_unclosed") = false)
+      .def("ExpandIds",
+           [](const sentencepiece::overlay::IdOverlayProcessor& self,
+              const std::vector<int>& ids, bool allow_unclosed) {
+             std::vector<int> out;
+             py::gil_scoped_release release;
+             auto status = self.ExpandIds(ids, allow_unclosed, &out);
+             if (!status.ok()) throw status;
+             return out;
+           },
+           py::arg("ids"), py::arg("allow_unclosed") = false)
+      .def("ExpandBatch",
+           [](const sentencepiece::overlay::IdOverlayProcessor& self,
+              const std::vector<std::vector<int>>& batch,
+              bool allow_unclosed) {
+             std::vector<std::vector<int>> out(batch.size());
+             {
+               py::gil_scoped_release release;
+               for (size_t i = 0; i < batch.size(); ++i) {
+                 auto status =
+                     self.ExpandIds(batch[i], allow_unclosed, &out[i]);
+                 if (!status.ok()) throw status;
+               }
+             }
+             return out;
+           },
+           py::arg("batch"), py::arg("allow_unclosed") = false)
+      .def_property_readonly("base_vocab_size",
+           &sentencepiece::overlay::IdOverlayProcessor::base_vocab_size)
+      .def_property_readonly("model_vocab_size",
+           &sentencepiece::overlay::IdOverlayProcessor::model_vocab_size)
+      .def_property_readonly("first_overlay_id",
+           &sentencepiece::overlay::IdOverlayProcessor::first_overlay_id)
+      .def_property_readonly("open_fence_id",
+           &sentencepiece::overlay::IdOverlayProcessor::open_fence_id)
+      .def_property_readonly("close_fence_id",
+           &sentencepiece::overlay::IdOverlayProcessor::close_fence_id)
+      .def_property_readonly("rule_count",
+           &sentencepiece::overlay::IdOverlayProcessor::rule_count)
+      .def_property_readonly("base_identity_sha256",
+           &sentencepiece::overlay::IdOverlayProcessor::base_identity_sha256);
 
   py::class_<sentencepiece::SentencePieceProcessor>(m, "SentencePieceProcessor")
       .def(py::init<>())
