@@ -352,16 +352,19 @@ TEST(BPETrainerTest, CompletionHierarchyUnlocksOnlyWholeChildren) {
   EXPECT_EQ("a", result.learned_merges(0).left());
   EXPECT_EQ("b", result.learned_merges(0).right());
   EXPECT_EQ(0, result.learned_merges(0).grammar_level());
+  EXPECT_EQ(0, result.learned_merges(0).scope_level());
   EXPECT_EQ(5, result.learned_merges(0).weighted_count());
 
   EXPECT_EQ("c", result.learned_merges(1).left());
   EXPECT_EQ("d", result.learned_merges(1).right());
   EXPECT_EQ(0, result.learned_merges(1).grammar_level());
+  EXPECT_EQ(0, result.learned_merges(1).scope_level());
   EXPECT_EQ(5, result.learned_merges(1).weighted_count());
 
   EXPECT_EQ("ab", result.learned_merges(2).left());
   EXPECT_EQ("cd", result.learned_merges(2).right());
   EXPECT_EQ(1, result.learned_merges(2).grammar_level());
+  EXPECT_EQ(1, result.learned_merges(2).scope_level());
   EXPECT_EQ(5, result.learned_merges(2).weighted_count());
   EXPECT_TRUE(absl::StartsWith(
       result.boundary_policy(), "bpe_hierarchical_completion_v1:"));
@@ -771,21 +774,29 @@ TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
   EXPECT_EQ("1", result.learned_merges(0).left());
   EXPECT_EQ("2", result.learned_merges(0).right());
   EXPECT_EQ(27, result.learned_merges(0).weighted_count());
+  ASSERT_TRUE(result.learned_merges(0).has_scope_level());
+  EXPECT_EQ(0, result.learned_merges(0).scope_level());
 
   EXPECT_EQ("/", result.learned_merges(1).left());
   EXPECT_EQ("12", result.learned_merges(1).right());
   EXPECT_EQ(20, result.learned_merges(1).weighted_count());
   EXPECT_EQ(1, result.learned_merges(1).grammar_level());
+  ASSERT_TRUE(result.learned_merges(1).has_scope_level());
+  EXPECT_EQ(1, result.learned_merges(1).scope_level());
 
   EXPECT_EQ("12", result.learned_merges(2).left());
   EXPECT_EQ("8", result.learned_merges(2).right());
   EXPECT_EQ(7, result.learned_merges(2).weighted_count());
   EXPECT_EQ(0, result.learned_merges(2).grammar_level());
+  ASSERT_TRUE(result.learned_merges(2).has_scope_level());
+  EXPECT_EQ(0, result.learned_merges(2).scope_level());
 
   EXPECT_EQ("/", result.learned_merges(3).left());
   EXPECT_EQ("128", result.learned_merges(3).right());
   EXPECT_EQ(7, result.learned_merges(3).weighted_count());
   EXPECT_EQ(1, result.learned_merges(3).grammar_level());
+  ASSERT_TRUE(result.learned_merges(3).has_scope_level());
+  EXPECT_EQ(1, result.learned_merges(3).scope_level());
 
   // The artifact produced by training must replay with the same occurrence-
   // local decision. This is the regression the first flat runtime was missing.
