@@ -3154,6 +3154,38 @@ TEST(ExpansionProcessorTest, UnknownCharacterBecomesTheUnkIdAndDecodesEmpty) {
   EXPECT_EQ("", back);
 }
 
+TEST(ExpansionProcessorTest, UnknownDoesNotRecoverNonAtomicSurfaceByLookup) {
+  ExpansionResult r;
+  r.set_schema_version(1);
+  r.set_model_type(EXPANSION_BPE);
+  auto add = [&](int id, absl::string_view piece,
+                 ModelProto::SentencePiece::Type type,
+                 bool mergeable, bool atomic) {
+    auto* p = r.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(type);
+    p->set_mergeable(mergeable);
+    p->set_atomic(atomic);
+  };
+  add(0, "<unk>", ModelProto::SentencePiece::UNKNOWN, false, false);
+  add(1, "\xe2\x96\x81", ModelProto::SentencePiece::NORMAL, true, true);
+  add(2, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  // Same surface as the OOV scalar, but deliberately not in the reversible
+  // atomic alphabet. It must not capture runtime UNKNOWN by string lookup.
+  add(3, "Z", ModelProto::SentencePiece::NORMAL, false, false);
+  *r.mutable_contract()->mutable_normalizer_spec() = MusicNormalizer();
+
+  expansion::ExpansionProcessor p;
+  ASSERT_TRUE(p.Load(r).ok());
+  std::vector<expansion::TokenSpan> spans;
+  ASSERT_TRUE(p.Encode("aZ", &spans).ok());
+  ASSERT_EQ(3u, spans.size());
+  EXPECT_EQ(2, spans[1].id);
+  EXPECT_EQ(p.unk_id(), spans[2].id);
+  EXPECT_EQ("Z", spans[2].piece);
+}
+
 TEST(ExpansionProcessorTest, IdMapShaDistinguishesSameSizeDifferentMeaning) {
   const ExpansionResult a = MakeProgram(
       {{"<unk>", kUNK}, {"\xe2\x96\x81", kNORMAL}, {"a", kNORMAL}}, {});
