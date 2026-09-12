@@ -188,7 +188,7 @@ if HIERARCHY:
 prefix = os.path.join(OUT, "qwen_cont_hier" if HIERARCHY else "qwen_cont")
 cmd = [SPM, f"--input={corpus_path}", f"--model_prefix={prefix}",
        "--model_type=bpe", f"--expansion_spec={spec_path}",
-       f"--vocab_size={max_id + 1 + spec.requested_new_pieces}",
+       f"--vocab_size={spec.first_new_external_id + spec.requested_new_pieces}",
        "--normalization_rule_name=identity",
        "--add_dummy_prefix=false", "--remove_extra_whitespaces=false",
        "--split_by_whitespace=false", "--split_by_unicode_script=false",
