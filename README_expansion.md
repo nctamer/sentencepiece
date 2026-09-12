@@ -112,11 +112,12 @@ stays distinguishable from "unset", which falls back to filling
 `trainer_spec.vocab_size`. An inherited merge that never fires on the
 continuation corpus is still exported and still costs nothing.
 
-A learned candidate whose string already exists allocates no ID. If the same
-`(left,right)` construction was already selected at another hierarchy scope,
-the new scoped operation is still serialized and points at the same external
-token ID. A genuinely different ancestry for the same child string is retired
-rather than silently giving one token two constructions.
+Every newly learned BPE rank allocates exactly one fresh NORMAL piece. A pair
+already present in the inherited/learned program is never selected again, and a
+candidate whose concatenated child string already exists is retired. This
+unique-construction rule is not cosmetic: because a later rank always creates a
+fresh symbol, it cannot manufacture an operand of an earlier rank. Sequential
+training application is therefore equivalent to ordinary ranked flat replay.
 
 ---
 
@@ -173,91 +174,64 @@ unit itself (e.g. an inherited `▁PL:`) is replayed whole. Provenance:
 `▁1/12 | ▁PL: | ▁d3▁F#3 | ▁PR: | ▁a3▁D4 | ▁Vn: | ▁f#4▁D4` and a stage learns only
 inside those units.
 
-### Completion-gated hierarchy (`--bpe_hierarchy_file`)
+### Training-only hierarchy guidance (`--bpe_hierarchy_file`)
 
 BPE may optionally receive an adapter-produced
-`sentencepiece-bpe-hierarchy-v1` sidecar. SentencePiece still knows nothing
-about the domain grammar: each normalized corpus row is keyed by exact surface
-bytes and supplies laminar grammar parents as ordered child byte cuts.
+`sentencepiece-bpe-hierarchy-v1` sidecar. The sidecar is **training metadata
+only**. It changes which ordinary surface pair wins the next rank; it is not
+serialized as runtime scope and it is not required by inference.
 
-For an internal child boundary, a pair is eligible only when the current left
-token begins on a child cut and the current right token ends on a child cut of
-that same parent. Thus a partial child cannot be carried across the boundary;
-once both sides have collapsed to complete children (or consecutive unions of
-complete children), the ordinary weighted pair enters the BPE competition.
-Ungated boundaries retain ordinary BPE behavior. The hierarchy and explicit
-string fences are mutually exclusive.
+The trainer maintains exactly one evolving state: the ordinary flat BPE
+segmentation produced by the ranked prefix learned so far. Candidate identity is
+just `(left,right)`. For a candidate, the trainer first determines the exact
+left-to-right, non-overlapping occurrence set that ordinary flat BPE would
+replace if that pair were selected next. An occurrence contributes its row
+weight to the candidate's support iff the RESULTING source span is compatible
+with the immutable laminar hierarchy.
 
-Hierarchy eligibility is **occurrence-local and scope-typed**. Candidate
-identity is `(left,right,scope_level)`, not merely `(left,right)`:
+Compatibility is span based. For every grammar parent partially traversed by
+the resulting span, the span must be a consecutive union of complete children
+of that parent. Fully containing a nested parent is allowed: at an ancestor
+level the completed nested parent is one child. This permits ordinary flat BPE
+to temporarily form a partial token and later repair it by completing a larger
+parent.
 
-- scope 0 is an ordinary/internal merge that crosses no completion boundary;
-- positive scope N is a merge across complete children of hierarchy level N.
+The selected pair is the pair with maximum hierarchy-supported weighted count;
+ties are resolved by `left` bytes then `right` bytes. After selection, the
+rule is appended as an ordinary unscoped rank and is applied **globally** to
+every flat occurrence, including occurrences that contributed no hierarchy
+support. Thus `ExpansionMerge.weighted_count` is a training support statistic,
+not necessarily the total application weight.
 
-Counts never pool across scopes. If `a+b` occurs five times internally and five
-times as a level-1 completion crossing, those are two candidates of count 5,
-not one candidate of count 10. This is the recursive analogue of BoundlessBPE's
-separate ordinary and supermerge populations.
+This distinction is deliberate. For example, if `a+b` is supported in one
+row but occurs inside an incomplete grammar child in another, support comes only
+from the first row; if it wins, flat BPE still merges `a+b` in both rows.
+The next iteration is counted from that real flat state.
 
-Within one scoped candidate, only hierarchy-eligible, **non-overlapping**
-occurrences contribute. Repeated identical pairs follow the replacements that
-can actually be performed: `aaa` contains one applicable `a+a` replacement,
-not two. At acceptance the trainer asserts that the selected weighted count is
-exactly the weighted number of replacements it performed.
+The following invariants make this mathematically equivalent to the serialized
+flat program:
 
-An ineligible occurrence never poisons another occurrence globally. After
-`1+2 -> 12`, for example, `/+12` may be a level-1 candidate in `/12`
-while remaining blocked as a proper prefix in `/128`.
+1. one learned operation per ordinary `(left,right)` pair;
+2. every learned operation creates a previously nonexistent NORMAL child;
+3. application uses the same deterministic left-to-right non-overlap rule as
+   inference;
+4. after every rank, the trainer state is ordinary replay of the learned prefix.
 
-Tie order is part of the deterministic contract: larger weighted count first,
-then **lower scope first** (ordinary wins an exact tie with a higher-level
-crossing), then `left` bytes and `right` bytes. The pair itself is the final
-key; concatenated child text is insufficient because `a+bc` and `ab+c`
-both produce `abc`.
+The fresh-child invariant is what removes the former scoped-alias failure: a
+later operation cannot create a symbol named by an older rule, so it cannot
+wake an older rank between two applications of the newly selected rule.
+There is no backward closure and no hierarchy-scoped alias operation.
 
-Scope survives serialization. `ExpansionMerge.scope_level` is the exact
-operation scope; `grammar_level` is retained as compatible audit metadata.
-The same pair may therefore appear at multiple scopes while all such operations
-construct the same external token ID.
+Inherited/base/bootstrap ranks replay first and are never vetoed by a newly
+introduced training hierarchy. Only selection of appended ranks is guided by
+the sidecar.
 
-That aliasing breaks an ordinary-BPE monotonicity assumption: a later scoped
-operation can create a token that is an operand of an **earlier** learned rank.
-Selected candidates are therefore retired only from the NEW-operation
-competition, never from replay. The trainer keeps a permanent
-`(left,right,scope)->rank` index. After each replacement it locally closes
-the affected neighbors under already-learned lower ranks before exposing the
-remaining adjacencies as new candidates. The regression
-`ScopedAliasReplaysEarlierRanksToFixedPoint` pins the concrete
-`a+b(scope0) -> ab; ab+c(scope2) -> abc; a+b(scope1) -> ab` backward
-cascade.
+The sidecar SHA-256 remains in the continuation contract for training
+provenance. The result boundary policy is
+`bpe_hierarchy_guided_training_v1:<sha256>`, but the emitted merge table is an
+ordinary flat table and `ExpansionProcessor::Encode` requires no hierarchy.
 
-That semantic condition survives into inference. A hierarchical
-`ExpansionResult` is not a standalone context-free merge table:
-`ExpansionProcessor::Encode` fails closed, and the caller must use
-`EncodeWithHierarchy(text, gates, ...)`. The runtime computes the exact
-current occurrence scope and applies a learned rule only when it equals the
-serialized `scope_level`. It uses an intrusive live-neighbour sequence plus a
-rank heap; after each merge only the two adjacent pairs are reconsidered.
-
-Continuation is explicitly two-phase:
-
-1. base/bootstrap merges replay first, unconditionally and in their inherited
-   rank order, so an existing tokenizer such as Qwen is reproduced exactly;
-2. only appended learned merges are hierarchy-gated per occurrence.
-
-If inherited tokenization already partially crosses a newly introduced grammar
-child boundary, continuation cannot undo that token without changing the base
-tokenizer. That gate alone is disabled for that input occurrence. Fresh
-hierarchical training has no inherited tokenizer to preserve, so the same
-condition is a hard error rather than permission to disable a gate.
-
-Learned `ExpansionMerge` records carry `weighted_count`,
-`scope_level` and compatible `grammar_level` audit data. The exact sidecar
-SHA-256 is recorded in the
-effective continuation contract and
-`boundary_policy=bpe_hierarchical_completion_v1:<sha256>`.
-
-### Shape options are about NEW pieces
+### Shape options are about NEW pieces### Shape options are about NEW pieces
 
 `max_sentencepiece_length`, `split_by_whitespace`, `split_by_unicode_script`,
 `split_by_number` and `split_digits` are fresh-training heuristics, applied to
@@ -376,10 +350,11 @@ frequency is the weighted number of **non-overlapping replacements that can
 actually be applied** at that exact scope. Acceptance checks count == applied
 weight and fails with an internal error on any discrepancy.
 
-For recursive hierarchy correctness the optimized trainer is not treated as its
+For hierarchy-guided correctness the optimized trainer is not treated as its
 own oracle. Tests include a separate restart-and-replay implementation that
-rebuilds tiny corpora from atoms after every operation, full-replays the ranked
-scoped program, and recounts candidates from scratch. With the opt-in
+rebuilds tiny corpora from atoms after every operation, full-replays the ordinary
+flat ranked program, recomputes hierarchy support from source spans, and
+recounts candidates from scratch. With the opt-in
 `TrainerSpec.bpe_reference_trace_file`, the optimized trainer emits a
 test-only per-rank state trace; generated laminar-tree tests compare operation,
 count, allocation/ID and full-corpus segmentation SHA at every iteration.
@@ -434,7 +409,7 @@ reachability proof. `--expansion_spec` supersedes it.
 | File | Contents |
 |---|---|
 | `<prefix>.expansion` | `ExpansionResult` — authoritative |
-| `<prefix>.merges` | effective merge table in rank order; flat rows are `left<TAB>right`, scoped rows add `<TAB>scope_level` |
+| `<prefix>.merges` | effective ordinary flat merge table in rank order (`left<TAB>right`) |
 | `<prefix>.vocab` | pieces in external ID order |
 | `<prefix>.model` | native `ModelProto` — **only when proven exact** |
 
