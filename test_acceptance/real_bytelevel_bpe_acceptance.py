@@ -123,9 +123,12 @@ for piece, pid in vocab.items():
 # unknown token, so append one reserved non-mergeable ID WITHOUT renumbering any
 # inherited ID. Learned continuation IDs begin after it.
 unknown_id = max_id + 1
+unknown_piece = "<|intervalpiece_expansion_unk|>"
+if unknown_piece in vocab:
+    raise SystemExit(f"reserved UNKNOWN surface already exists: {unknown_piece}")
 unk = spec.base_pieces.add()
 unk.external_id = unknown_id
-unk.piece = "<|intervalpiece_expansion_unk|>"
+unk.piece = unknown_piece
 unk.type = pb.ModelProto.SentencePiece.UNKNOWN
 unk.mergeable = False
 unk.atomic = False
