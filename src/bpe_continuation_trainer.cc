@@ -245,6 +245,17 @@ void ContinuationTrainer::ResetFreq(int sid, int left, int right,
       FindCandidate(symbols_[sid][left], symbols_[sid][right]);
   if (candidate != nullptr && candidate != best) {
     candidate->needs_recomputation = true;
+    // Hierarchy support over the flat non-overlap replacement set is not
+    // monotone. In a self-overlap run (e.g. a|a|a), removing the unsupported
+    // left replacement can expose the overlapping right replacement and make
+    // this candidate's support INCREASE without creating a new adjacency.
+    // Therefore a dirty candidate cannot safely wait for its stale heap key to
+    // reach the top: schedule every local invalidation for recomputation before
+    // the next rank is selected.
+    if (!candidate->pending) {
+      candidate->pending = true;
+      pending_queue_.push_back(candidate);
+    }
   }
 }
 
