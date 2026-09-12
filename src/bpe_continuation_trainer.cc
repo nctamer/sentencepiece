@@ -552,18 +552,45 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
 
   std::string canonical;
   std::string line;
-  if (!input->ReadLine(&line) ||
-      line != "# sentencepiece-bpe-hierarchy-v1") {
+  if (!input->ReadLine(&line)) {
+    return absl::InvalidArgumentError("BPE hierarchy sidecar is empty");
+  }
+  const bool metadata_v2 = line == "# sentencepiece-bpe-hierarchy-v2";
+  if (!metadata_v2 && line != "# sentencepiece-bpe-hierarchy-v1") {
     return absl::InvalidArgumentError(
         "BPE hierarchy sidecar must start with "
-        "'# sentencepiece-bpe-hierarchy-v1'");
+        "'# sentencepiece-bpe-hierarchy-v1' or "
+        "'# sentencepiece-bpe-hierarchy-v2'");
+  }
+  if (metadata_v2 &&
+      corpus_.metadata_keys.size() != corpus_.sentences.size()) {
+    return absl::InvalidArgumentError(
+        "hierarchy v2 requires one metadata key per prepared corpus row");
+  }
+  if (!metadata_v2) {
+    for (const auto& key : corpus_.metadata_keys) {
+      if (!key.empty()) {
+        return absl::InvalidArgumentError(
+            "tsv_meta corpus requires sentencepiece-bpe-hierarchy-v2");
+      }
+    }
   }
   absl::StrAppend(&canonical, line, "\n");
 
+  auto row_key = [](absl::string_view surface, absl::string_view metadata) {
+    return absl::StrCat(surface.size(), ":", surface, metadata);
+  };
   absl::flat_hash_map<std::string, int> sid_of;
   sid_of.reserve(corpus_.sentences.size());
   for (size_t sid = 0; sid < corpus_.sentences.size(); ++sid) {
-    sid_of[corpus_.sentences[sid].first] = static_cast<int>(sid);
+    const absl::string_view metadata =
+        metadata_v2 ? absl::string_view(corpus_.metadata_keys[sid])
+                    : absl::string_view();
+    const std::string key = row_key(corpus_.sentences[sid].first, metadata);
+    if (!sid_of.emplace(key, static_cast<int>(sid)).second) {
+      return absl::InvalidArgumentError(
+          "prepared corpus contains duplicate hierarchy row identity");
+    }
   }
 
   hierarchy_.resize(corpus_.sentences.size());
@@ -572,11 +599,22 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
     absl::StrAppend(&canonical, line, "\n");
     if (line.empty() || line[0] == '#') continue;
     const std::vector<std::string> fields = absl::StrSplit(line, '\t');
-    if (fields.size() != 2) {
+    const size_t want_fields = metadata_v2 ? 3 : 2;
+    if (fields.size() != want_fields) {
       return absl::InvalidArgumentError(
-          "BPE hierarchy row must be <normalized-text><tab><gate-spec>");
+          metadata_v2
+              ? "BPE hierarchy v2 row must be "
+                "<normalized-text><tab><metadata-key><tab><gate-spec>"
+              : "BPE hierarchy row must be "
+                "<normalized-text><tab><gate-spec>");
     }
-    const auto sid_it = sid_of.find(fields[0]);
+    const absl::string_view metadata =
+        metadata_v2 ? absl::string_view(fields[1]) : absl::string_view();
+    if (metadata_v2 && metadata.empty()) {
+      return absl::InvalidArgumentError(
+          "BPE hierarchy v2 metadata key must not be empty");
+    }
+    const auto sid_it = sid_of.find(row_key(fields[0], metadata));
     if (sid_it == sid_of.end()) {
       return absl::InvalidArgumentError(absl::StrCat(
           "BPE hierarchy contains a row absent from the normalized corpus: ",
@@ -585,13 +623,15 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
     const int sid = sid_it->second;
     if (seen[sid]) {
       return absl::InvalidArgumentError(
-          absl::StrCat("duplicate BPE hierarchy row: ", fields[0]));
+          absl::StrCat("duplicate BPE hierarchy row: ", fields[0],
+                       metadata_v2 ? absl::StrCat(" [", fields[1], "]") : ""));
     }
     seen[sid] = true;
     HierarchyRecord& record = hierarchy_[sid];
 
-    if (!fields[1].empty()) {
-      for (absl::string_view gate_text : absl::StrSplit(fields[1], ';')) {
+    const std::string& gate_spec = fields[metadata_v2 ? 2 : 1];
+    if (!gate_spec.empty()) {
+      for (absl::string_view gate_text : absl::StrSplit(gate_spec, ';')) {
         if (gate_text.empty()) continue;
         const size_t colon = gate_text.find(':');
         if (colon == absl::string_view::npos) {
@@ -693,7 +733,9 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
     if (!seen[sid]) {
       return absl::InvalidArgumentError(absl::StrCat(
           "BPE hierarchy is missing normalized corpus row: ",
-          corpus_.sentences[sid].first));
+          corpus_.sentences[sid].first,
+          metadata_v2 ? absl::StrCat(" [", corpus_.metadata_keys[sid], "]")
+                      : ""));
     }
   }
   hierarchy_sha256_ = continuation::Sha256Hex(canonical);
