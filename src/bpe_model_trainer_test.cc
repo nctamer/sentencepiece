@@ -78,6 +78,15 @@ struct RefRun {
 
 using RefKey = std::pair<std::string, std::string>;
 
+bool RefByteLess(const std::string& a, const std::string& b) {
+  return std::lexicographical_compare(
+      a.begin(), a.end(), b.begin(), b.end(),
+      [](char x, char y) {
+        return static_cast<unsigned char>(x) <
+               static_cast<unsigned char>(y);
+      });
+}
+
 bool RefSupportsMerge(const RefRow& row, const RefToken& left,
                       const RefToken& right) {
   if (left.end != right.begin) return false;
@@ -229,8 +238,10 @@ RefRun RunFlatHierarchyReference(const std::vector<RefRow>& rows,
 
     auto better = [](const auto& a, const auto& b) {
       if (a.second != b.second) return a.second > b.second;
-      if (a.first.first != b.first.first) return a.first.first < b.first.first;
-      return a.first.second < b.first.second;
+      if (a.first.first != b.first.first) {
+        return RefByteLess(a.first.first, b.first.first);
+      }
+      return RefByteLess(a.first.second, b.first.second);
     };
     auto best = counts.begin();
     for (auto it = std::next(counts.begin()); it != counts.end(); ++it) {
