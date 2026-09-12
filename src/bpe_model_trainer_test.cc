@@ -810,6 +810,277 @@ TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
          "/+128 to reproduce the training construction";
 }
 
+
+TEST(BPETrainerTest, HierarchyKeepsPairCountsSeparatedByExactScope) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "scope_pool_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "scope_pool.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "scope_pool.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "scope_pool_model");
+  const std::string result_path = prefix + ".expansion";
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("abx\t5"));
+    ASSERT_TRUE(out->WriteLine("ab\t5"));
+    ASSERT_TRUE(out->WriteLine("cd\t8"));
+  }
+  {
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    ASSERT_TRUE(out->WriteLine("abx\t1:0,2,3"));  // a+b is ordinary/internal.
+    ASSERT_TRUE(out->WriteLine("ab\t1:0,1,2"));   // a+b is level-1 crossing.
+    ASSERT_TRUE(out->WriteLine("cd\t"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(6);
+  expansion.set_requested_new_pieces(1);
+  auto add = [&](int id, absl::string_view piece) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id);
+    p->set_piece(std::string(piece));
+    p->set_type(id == 0 ? ModelProto::SentencePiece::UNKNOWN
+                        : ModelProto::SentencePiece::NORMAL);
+    p->set_mergeable(id != 0);
+    p->set_atomic(id != 0);
+  };
+  add(0, "<unk>"); add(1, "a"); add(2, "b");
+  add(3, "x"); add(4, "c"); add(5, "d");
+  { auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString())); }
+
+  TrainerSpec ts;
+  ts.set_model_type(TrainerSpec::BPE); ts.add_input(input);
+  ts.set_input_format("tsv"); ts.set_model_prefix(prefix); ts.set_vocab_size(7);
+  ts.set_expansion_spec(spec_path); ts.set_expansion_result(result_path);
+  ts.set_bpe_hierarchy_file(hierarchy); ts.set_input_sentence_size(0);
+  ts.set_split_by_whitespace(false); ts.set_split_by_unicode_script(false);
+  ts.set_split_by_number(false); ts.set_split_digits(false);
+  ts.set_bos_id(-1); ts.set_eos_id(-1); ts.set_pad_id(-1);
+  ts.set_hard_vocab_limit(true);
+  NormalizerSpec ns; ns.set_name("identity"); ns.set_add_dummy_prefix(false);
+  ns.set_remove_extra_whitespaces(false);
+  NormalizerSpec dns;
+  ASSERT_TRUE(SentencePieceTrainer::Train(ts, ns, dns).ok());
+
+  std::string bytes;
+  { auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes)); }
+  ExpansionResult result; ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(1, result.learned_merges_size());
+  const auto& first = result.learned_merges(0);
+  EXPECT_EQ("c", first.left());
+  EXPECT_EQ("d", first.right());
+  EXPECT_EQ(8, first.weighted_count());
+  ASSERT_TRUE(first.has_scope_level());
+  EXPECT_EQ(0, first.scope_level())
+      << "a+b must remain two candidates of count 5, not one pooled count 10";
+}
+
+TEST(BPETrainerTest, RepeatedPairCountEqualsNonOverlappingReplacements) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "overlap_count_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "overlap_count.spec");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "overlap_count_model");
+  const std::string result_path = prefix + ".expansion";
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("aaa\t2"));
+    ASSERT_TRUE(out->WriteLine("bc\t3"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(4);
+  expansion.set_requested_new_pieces(1);
+  auto add = [&](int id, absl::string_view piece) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id); p->set_piece(std::string(piece));
+    p->set_type(id == 0 ? ModelProto::SentencePiece::UNKNOWN
+                        : ModelProto::SentencePiece::NORMAL);
+    p->set_mergeable(id != 0); p->set_atomic(id != 0);
+  };
+  add(0, "<unk>"); add(1, "a"); add(2, "b"); add(3, "c");
+  { auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString())); }
+
+  TrainerSpec ts;
+  ts.set_model_type(TrainerSpec::BPE); ts.add_input(input);
+  ts.set_input_format("tsv"); ts.set_model_prefix(prefix); ts.set_vocab_size(5);
+  ts.set_expansion_spec(spec_path); ts.set_expansion_result(result_path);
+  ts.set_input_sentence_size(0);
+  ts.set_split_by_whitespace(false); ts.set_split_by_unicode_script(false);
+  ts.set_split_by_number(false); ts.set_split_digits(false);
+  ts.set_bos_id(-1); ts.set_eos_id(-1); ts.set_pad_id(-1);
+  ts.set_hard_vocab_limit(true);
+  NormalizerSpec ns; ns.set_name("identity"); ns.set_add_dummy_prefix(false);
+  ns.set_remove_extra_whitespaces(false);
+  NormalizerSpec dns;
+  ASSERT_TRUE(SentencePieceTrainer::Train(ts, ns, dns).ok());
+
+  std::string bytes;
+  { auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes)); }
+  ExpansionResult result; ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(1, result.learned_merges_size());
+  EXPECT_EQ("b", result.learned_merges(0).left());
+  EXPECT_EQ("c", result.learned_merges(0).right());
+  EXPECT_EQ(3, result.learned_merges(0).weighted_count())
+      << "aaa weight 2 contains one non-overlapping aa replacement, not two";
+}
+
+TEST(BPETrainerTest, ExactCountTiesPreferLowerGrammarScope) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "scope_tie_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "scope_tie.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "scope_tie.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "scope_tie_model");
+  const std::string result_path = prefix + ".expansion";
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("zz\t5"));
+    ASSERT_TRUE(out->WriteLine("ab\t5"));
+  }
+  {
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    ASSERT_TRUE(out->WriteLine("zz\t"));
+    ASSERT_TRUE(out->WriteLine("ab\t1:0,1,2"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(4);
+  expansion.set_requested_new_pieces(1);
+  auto add = [&](int id, absl::string_view piece) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id); p->set_piece(std::string(piece));
+    p->set_type(id == 0 ? ModelProto::SentencePiece::UNKNOWN
+                        : ModelProto::SentencePiece::NORMAL);
+    p->set_mergeable(id != 0); p->set_atomic(id != 0);
+  };
+  add(0, "<unk>"); add(1, "z"); add(2, "a"); add(3, "b");
+  { auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString())); }
+
+  TrainerSpec ts;
+  ts.set_model_type(TrainerSpec::BPE); ts.add_input(input);
+  ts.set_input_format("tsv"); ts.set_model_prefix(prefix); ts.set_vocab_size(5);
+  ts.set_expansion_spec(spec_path); ts.set_expansion_result(result_path);
+  ts.set_bpe_hierarchy_file(hierarchy); ts.set_input_sentence_size(0);
+  ts.set_split_by_whitespace(false); ts.set_split_by_unicode_script(false);
+  ts.set_split_by_number(false); ts.set_split_digits(false);
+  ts.set_bos_id(-1); ts.set_eos_id(-1); ts.set_pad_id(-1);
+  ts.set_hard_vocab_limit(true);
+  NormalizerSpec ns; ns.set_name("identity"); ns.set_add_dummy_prefix(false);
+  ns.set_remove_extra_whitespaces(false);
+  NormalizerSpec dns;
+  ASSERT_TRUE(SentencePieceTrainer::Train(ts, ns, dns).ok());
+
+  std::string bytes;
+  { auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes)); }
+  ExpansionResult result; ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(1, result.learned_merges_size());
+  EXPECT_EQ("z", result.learned_merges(0).left());
+  EXPECT_EQ("z", result.learned_merges(0).right());
+  EXPECT_EQ(5, result.learned_merges(0).weighted_count());
+  EXPECT_EQ(0, result.learned_merges(0).scope_level())
+      << "exact count ties must prefer ordinary/lower scope";
+}
+
+TEST(BPETrainerTest, SamePairAtTwoScopesSharesOneTokenId) {
+  const std::string input =
+      filesystem::JoinPath(::testing::TempDir(), "scope_alias_input.tsv");
+  const std::string spec_path =
+      filesystem::JoinPath(::testing::TempDir(), "scope_alias.spec");
+  const std::string hierarchy =
+      filesystem::JoinPath(::testing::TempDir(), "scope_alias.tsv");
+  const std::string prefix =
+      filesystem::JoinPath(::testing::TempDir(), "scope_alias_model");
+  const std::string result_path = prefix + ".expansion";
+  {
+    auto out = filesystem::NewWritableFile(input);
+    ASSERT_TRUE(out->WriteLine("abX\t12"));
+    ASSERT_TRUE(out->WriteLine("ab\t11"));
+    ASSERT_TRUE(out->WriteLine("cd\t1"));
+  }
+  {
+    auto out = filesystem::NewWritableFile(hierarchy);
+    ASSERT_TRUE(out->WriteLine("# sentencepiece-bpe-hierarchy-v1"));
+    ASSERT_TRUE(out->WriteLine("abX\t1:0,2,3"));
+    ASSERT_TRUE(out->WriteLine("ab\t1:0,1,2"));
+    ASSERT_TRUE(out->WriteLine("cd\t"));
+  }
+
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_first_new_external_id(6);
+  expansion.set_requested_new_pieces(2);
+  auto add_normal = [&](int id, absl::string_view piece) {
+    auto* p = expansion.add_base_pieces();
+    p->set_external_id(id); p->set_piece(std::string(piece));
+    p->set_type(id == 0 ? ModelProto::SentencePiece::UNKNOWN
+                        : ModelProto::SentencePiece::NORMAL);
+    p->set_mergeable(id != 0); p->set_atomic(id != 0);
+  };
+  add_normal(0, "<unk>"); add_normal(1, "a"); add_normal(2, "b");
+  add_normal(3, "c"); add_normal(4, "d");
+  auto* frozen = expansion.add_base_pieces();
+  frozen->set_external_id(5); frozen->set_piece("X");
+  frozen->set_type(ModelProto::SentencePiece::USER_DEFINED);
+  frozen->set_mergeable(false); frozen->set_atomic(false);
+  { auto out = filesystem::NewWritableFile(spec_path, true);
+    ASSERT_TRUE(out->Write(expansion.SerializeAsString())); }
+
+  TrainerSpec ts;
+  ts.set_model_type(TrainerSpec::BPE); ts.add_input(input);
+  ts.set_input_format("tsv"); ts.set_model_prefix(prefix); ts.set_vocab_size(8);
+  ts.set_expansion_spec(spec_path); ts.set_expansion_result(result_path);
+  ts.set_bpe_hierarchy_file(hierarchy); ts.set_input_sentence_size(0);
+  ts.set_split_by_whitespace(false); ts.set_split_by_unicode_script(false);
+  ts.set_split_by_number(false); ts.set_split_digits(false);
+  ts.set_bos_id(-1); ts.set_eos_id(-1); ts.set_pad_id(-1);
+  ts.set_hard_vocab_limit(true);
+  NormalizerSpec ns; ns.set_name("identity"); ns.set_add_dummy_prefix(false);
+  ns.set_remove_extra_whitespaces(false);
+  NormalizerSpec dns;
+  ASSERT_TRUE(SentencePieceTrainer::Train(ts, ns, dns).ok());
+
+  std::string bytes;
+  { auto in = filesystem::NewReadableFile(result_path, true);
+    ASSERT_TRUE(in->ReadAll(&bytes)); }
+  ExpansionResult result; ASSERT_TRUE(result.ParseFromString(bytes));
+  ASSERT_EQ(2, result.learned_pieces_size());
+  ASSERT_GE(result.learned_merges_size(), 3);
+  EXPECT_EQ("a", result.learned_merges(0).left());
+  EXPECT_EQ("b", result.learned_merges(0).right());
+  EXPECT_EQ(0, result.learned_merges(0).scope_level());
+  EXPECT_EQ("a", result.learned_merges(1).left());
+  EXPECT_EQ("b", result.learned_merges(1).right());
+  EXPECT_EQ(1, result.learned_merges(1).scope_level());
+  EXPECT_EQ(result.learned_merges(0).external_id(),
+            result.learned_merges(1).external_id())
+      << "scope belongs to the operation; ab remains one token ID";
+}
+
 TEST(BPETrainerTest, HierarchyNeverVetoesInheritedMergeReplay) {
   const std::string input =
       filesystem::JoinPath(::testing::TempDir(), "hier_inherited_input.tsv");
