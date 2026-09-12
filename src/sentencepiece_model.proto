@@ -371,6 +371,12 @@ message ExpansionResult {
   // explicit program is the only valid tokenizer for this artifact.
   optional bool native_model_emitted = 24 [default = false];
   optional string native_model_refusal = 25;
+
+  // Final trainer segmentation witnesses over PreparedCorpus row order. These
+  // are independent of decode/round-trip and let a runtime replay prove it
+  // reached the same segmentation cardinality on the full weighted corpus.
+  optional uint64 training_final_tokens = 26 [default = 0];
+  optional uint64 training_final_weighted_tokens = 27 [default = 0];
 }
 
 // ModelProto stores model parameters.
