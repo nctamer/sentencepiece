@@ -392,6 +392,44 @@ message ExpansionResult {
   optional string training_final_segmentation_sha256 = 28;
 }
 
+// Ranked integer-ID BPE layered over an already-tokenized base stream.
+// This is deliberately a separate artifact contract from ExpansionResult:
+// inherited Qwen merges have already run before this program sees its input.
+message IdOverlayRule {
+  required uint32 rank = 1;
+  required int32 left_id = 2;
+  required int32 right_id = 3;
+  required int32 child_id = 4;
+  // Complete expansion of child_id into original base IDs. Exporters compute
+  // this once; runtimes verify it compositionally and decode without recursion.
+  repeated int32 base_expansion = 5 [packed = true];
+  // Training diagnostics. Support and application are intentionally distinct.
+  optional uint64 hierarchy_support_count = 6 [default = 0];
+  optional uint64 application_count = 7 [default = 0];
+}
+
+message IdOverlayProgram {
+  optional uint32 schema_version = 1 [default = 1];
+  required string base_identity_sha256 = 2;
+  // Base namespace after the two fence AddedTokens have been reserved.
+  required int32 base_vocab_size = 3;
+  // Actual embedding/output namespace capacity required by this artifact.
+  required int32 model_vocab_size = 4;
+  required int32 first_overlay_id = 5;
+  required int32 open_fence_id = 6;
+  required int32 close_fence_id = 7;
+  // Existing base special/control IDs. Fences are protected automatically too.
+  repeated int32 protected_base_ids = 8 [packed = true];
+  repeated IdOverlayRule rules = 9;
+  optional int32 max_input_ids = 10 [default = 1048576];
+  optional int32 max_expansion_ids = 11 [default = 1048576];
+
+  // Human/audit provenance; base_identity_sha256 is the enforcement key.
+  optional string base_model = 12;
+  optional string base_revision = 13;
+  optional string program_sha256 = 14;
+}
+
 // ModelProto stores model parameters.
 message ModelProto {
   message SentencePiece {
