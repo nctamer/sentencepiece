@@ -45,29 +45,40 @@ class ContinuationTrainer : public TrainerInterface {
   absl::Status Train() override;
 
  private:
+  // Canonical token symbol. Scope belongs to a MERGE OPERATION, not to the
+  // resulting token: "ab" is one token even when a+b is selected separately
+  // as an ordinary merge and as a completion-crossing merge.
   struct Symbol {
     const Symbol* left = nullptr;
     const Symbol* right = nullptr;
     string_util::UnicodeText chars;
     uint64_t fp = 0;
-    uint64_t freq = 0;
     bool is_unk = false;
-    // A USER_DEFINED occurrence. Never a merge participant on either side,
-    // which is exactly what native training achieves by replacing the
-    // occurrence with a pretokenization boundary (trainer_interface.cc).
+    // A USER_DEFINED occurrence. Never a merge participant on either side.
     bool frozen = false;
-    // Hierarchy eligibility is occurrence-local; pair positions contains only
-    // currently eligible occurrences. There is intentionally no global
-    // "unsafe surface pair" bit.
-    bool active = true;
-    bool pending = false;
-    bool needs_recomputation = true;
-    absl::btree_set<uint64_t> positions;
 
     [[nodiscard]] bool IsBigram() const {
       return left != nullptr && right != nullptr;
     }
     [[nodiscard]] std::string ToString() const;
+  };
+
+  // Training candidate identity is (left token, right token, exact scope).
+  // This is the recursive Boundless distinction between ordinary and super
+  // candidates generalized to hierarchy levels. Positions contains ONLY
+  // occurrences at this exact scope.
+  struct Candidate {
+    Symbol* left = nullptr;
+    Symbol* right = nullptr;
+    Symbol* result = nullptr;
+    std::string left_text;
+    std::string right_text;
+    int scope_level = 0;
+    uint64_t freq = 0;
+    bool active = true;
+    bool pending = false;
+    bool needs_recomputation = true;
+    absl::btree_set<uint64_t> positions;
   };
 
   struct Position {
@@ -96,16 +107,22 @@ class ContinuationTrainer : public TrainerInterface {
 
   struct QueueEntry {
     uint64_t freq;
-    Symbol* symbol;
+    Candidate* candidate;
   };
 
   struct QueueEntryComparator {
     bool operator()(const QueueEntry& e1, const QueueEntry& e2) const {
+      // Highest count wins. Exact ties prefer the lower/ordinary scope, then
+      // use the pair itself as a total deterministic key. Do NOT tie-break on
+      // only left+right: a+bc and ab+c have the same concatenation.
       if (e1.freq != e2.freq) return e1.freq < e2.freq;
-      if (e1.symbol->chars.size() != e2.symbol->chars.size()) {
-        return e1.symbol->chars.size() > e2.symbol->chars.size();
+      if (e1.candidate->scope_level != e2.candidate->scope_level) {
+        return e1.candidate->scope_level > e2.candidate->scope_level;
       }
-      return e1.symbol->chars > e2.symbol->chars;
+      if (e1.candidate->left_text != e2.candidate->left_text) {
+        return e1.candidate->left_text > e2.candidate->left_text;
+      }
+      return e1.candidate->right_text > e2.candidate->right_text;
     }
   };
 
@@ -115,12 +132,15 @@ class ContinuationTrainer : public TrainerInterface {
   Symbol* GetAtomicSymbol(absl::string_view atom);
   Symbol* GetFrozenSymbol(absl::string_view piece);
   Symbol* GetPairSymbol(const Symbol* left, const Symbol* right);
-  void ComputeFreq(Symbol* symbol) const;
+  Candidate* GetCandidate(Symbol* left, Symbol* right, int scope_level);
+  Candidate* FindCandidate(const Symbol* left, const Symbol* right,
+                           int scope_level) const;
+  void ComputeFreq(Candidate* candidate) const;
   int GetNextIndex(int sid, int index) const;
   int GetPrevIndex(int sid, int index) const;
   void AddNewPair(int sid, int left, int right);
-  void ResetFreq(int sid, int left, int right, const Symbol* best);
-  absl::Status AcceptSymbol(Symbol* symbol);
+  void ResetFreq(int sid, int left, int right, const Candidate* best);
+  absl::Status AcceptCandidate(Candidate* candidate);
   void DrainPendingQueue();
   // After inherited/base replay, discard the ungated candidate index and
   // rebuild it from the CURRENT segmentation with occurrence-local hierarchy
@@ -132,8 +152,9 @@ class ContinuationTrainer : public TrainerInterface {
   // corpus surface, so it remains aligned after PreparedCorpus aggregation.
   absl::Status LoadHierarchy();
   bool CanMerge(int sid, int left, int right) const;
+  // Exact candidate scope. 0 means ordinary/internal; >0 is the level of the
+  // completion boundary crossed by this occurrence.
   int GrammarLevelForPair(int sid, int left, int right) const;
-  int MaxGrammarLevel(const Symbol* symbol) const;
 
   // Segments `text` into the declared reversible atomic alphabet. Exactly one
   // segmentation is required: zero parses means the adapter omitted an atom,
@@ -200,6 +221,12 @@ class ContinuationTrainer : public TrainerInterface {
 
   absl::flat_hash_set<std::string> existing_piece_strings_;
   absl::flat_hash_set<std::string> atomic_piece_strings_;
+  absl::flat_hash_map<std::string, int> piece_external_id_by_string_;
+  // Pair -> child ID for already-emitted constructions. This allows the same
+  // (left,right) operation to be selected at another scope without allocating
+  // a duplicate token ID. A different ancestry for an existing child remains
+  // redundant and is retired.
+  std::map<std::pair<std::string, std::string>, int> pair_external_id_;
   // USER_DEFINED base piece strings and their longest-prefix matcher. The
   // matcher borrows the strings, so the set must outlive it.
   std::set<std::string> user_defined_piece_strings_;
@@ -231,9 +258,12 @@ class ContinuationTrainer : public TrainerInterface {
   int target_new_pieces_ = 0;
 
   absl::flat_hash_map<uint64_t, Symbol*> symbols_cache_;
+  std::map<std::tuple<std::string, std::string, int>, Candidate*>
+      candidate_cache_;
   std::priority_queue<QueueEntry, std::vector<QueueEntry>, QueueEntryComparator>
       pq_;
-  std::vector<Symbol*> pending_queue_;
+  std::vector<Candidate*> pending_queue_;
+  std::vector<std::unique_ptr<Candidate>> allocated_candidates_;
   std::vector<std::unique_ptr<Symbol>> allocated_;
   std::vector<std::vector<Symbol*>> symbols_;
   // Intrusive live-neighbor links over the fixed occurrence slots. Merges
