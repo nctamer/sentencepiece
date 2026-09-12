@@ -659,6 +659,8 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
            &sentencepiece::overlay::IdOverlayProcessor::close_fence_id)
       .def_property_readonly("rule_count",
            &sentencepiece::overlay::IdOverlayProcessor::rule_count)
+      .def_property_readonly("overlay_ids",
+           &sentencepiece::overlay::IdOverlayProcessor::overlay_ids)
       .def_property_readonly("base_identity_sha256",
            &sentencepiece::overlay::IdOverlayProcessor::base_identity_sha256);
 
