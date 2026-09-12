@@ -104,6 +104,11 @@ class ContinuationTrainer : public TrainerInterface {
   struct HierarchyRecord {
     std::vector<HierarchyGate> gates;
     absl::flat_hash_map<size_t, int> gate_at_boundary;
+    // v2 only: hierarchy support is counted only when the complete candidate
+    // result is inside one of these grammar-owned byte ranges. Learned rules
+    // are still applied globally by the flat BPE replay after selection.
+    bool restrict_support = false;
+    std::vector<std::pair<size_t, size_t>> support_ranges;
   };
 
   struct QueueEntry {
