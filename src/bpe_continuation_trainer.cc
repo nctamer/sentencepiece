@@ -1609,6 +1609,15 @@ absl::Status ContinuationTrainer::LearnExpansion() {
     ABSL_RETURN_IF_ERROR(
         AcceptCandidateWithClosure(best, selected_learned_rank));
     live_by_string_[child] = best->result;
+
+    if (!trainer_spec_.bpe_reference_trace_file().empty()) {
+      reference_trace_lines_.push_back(absl::StrCat(
+          selected_learned_rank, "\t", merge.left(), "\t", merge.right(),
+          "\t", best->scope_level, "\t", merge.weighted_count(), "\t",
+          allocates_piece ? 1 : 0, "\t", external_id, "\t",
+          FinalSegmentationSha256()));
+    }
+
     DrainPendingQueue();
   }
 
@@ -2195,6 +2204,19 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
         trainer_spec_.model_prefix() + ".vocab", all_pieces));
   }
 
+  if (!trainer_spec_.bpe_reference_trace_file().empty()) {
+    auto trace = filesystem::NewWritableFile(
+        trainer_spec_.bpe_reference_trace_file());
+    if (!trace->status().ok()) return trace->status();
+    for (const std::string& line : reference_trace_lines_) {
+      if (!trace->WriteLine(line)) {
+        return absl::DataLossError(absl::StrCat(
+            "failed to write BPE reference trace: ",
+            trainer_spec_.bpe_reference_trace_file()));
+      }
+    }
+  }
+
   const std::string result_path = !trainer_spec_.expansion_result().empty()
                                       ? trainer_spec_.expansion_result()
                                       : trainer_spec_.model_prefix() + ".expansion";
@@ -2291,6 +2313,7 @@ absl::Status ContinuationTrainer::Train() {
   base_merges_.clear();
   bootstrap_merges_.clear();
   learned_merges_.clear();
+  reference_trace_lines_.clear();
   sentences_.clear();
   final_pieces_.clear();
   allocated_.clear();
