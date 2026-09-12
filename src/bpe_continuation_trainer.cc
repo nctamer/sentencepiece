@@ -1310,24 +1310,25 @@ absl::Status ContinuationTrainer::ReplayMerges(
       ++absent;
       continue;
     }
-    Symbol* symbol = GetPairSymbol(left->second, right->second);
-    if (symbol == nullptr) {
+    Candidate* candidate = GetCandidate(left->second, right->second, 0);
+    if (candidate == nullptr) {
       return absl::InvalidArgumentError(absl::StrCat(
           label, " merge is incompatible with current trainer piece-shape "
           "constraints at effective rank ", merge.rank(), ": ", merge.left(),
           " + ", merge.right()));
     }
-    // During inherited/base replay hierarchy gating is disabled, so this
-    // pair's positions are every live occurrence. The continuation hierarchy
-    // is allowed to constrain only merges learned after this prefix.
-    symbol->needs_recomputation = true;
-    ComputeFreq(symbol);
-    if (symbol->freq == 0) {
+
+    // Inherited/bootstrap replay is authoritative and hierarchy-blind. The
+    // candidate index is unscoped until RebuildHierarchyCandidateIndex().
+    candidate->needs_recomputation = true;
+    ComputeFreq(candidate);
+    if (candidate->freq == 0) {
       ++absent;
       continue;
     }
-    live_by_string_[merge.left() + merge.right()] = symbol;
-    ABSL_RETURN_IF_ERROR(AcceptSymbol(symbol));
+
+    live_by_string_[merge.left() + merge.right()] = candidate->result;
+    ABSL_RETURN_IF_ERROR(AcceptCandidate(candidate));
     DrainPendingQueue();
     ++applied;
   }
@@ -1338,62 +1339,91 @@ absl::Status ContinuationTrainer::ReplayMerges(
 
 absl::Status ContinuationTrainer::LearnExpansion() {
   while (static_cast<int>(learned_pieces_.size()) < target_new_pieces_) {
-    Symbol* best = nullptr;
+    Candidate* best = nullptr;
     while (!pq_.empty()) {
       QueueEntry entry = pq_.top();
       pq_.pop();
-      Symbol* symbol = entry.symbol;
-      if (!symbol->active || entry.freq != symbol->freq) continue;
-      if (symbol->needs_recomputation) {
-        ComputeFreq(symbol);
-        pq_.push({symbol->freq, symbol});
+      Candidate* candidate = entry.candidate;
+      if (!candidate->active || entry.freq != candidate->freq) continue;
+      if (candidate->needs_recomputation) {
+        ComputeFreq(candidate);
+        pq_.push({candidate->freq, candidate});
         continue;
       }
-      if (symbol->freq == 0) continue;
-      best = symbol;
+      if (candidate->freq == 0) continue;
+      best = candidate;
       break;
     }
 
     if (best == nullptr) break;
-    if (!best->IsBigram()) {
-      return absl::InternalError("BPE continuation selected a non-bigram");
-    }
-    const std::string child = best->ToString();
-    if (existing_piece_strings_.contains(child)) {
-      // A rediscovered inherited/bootstrap string is not a new token and does
-      // not consume expansion budget. Applying an alternative ancestry here
-      // would mutate the corpus with a merge that is absent from the exported
-      // rank program, so the candidate is retired instead.
-      symbols_cache_.erase(best->fp);
-      best->active = false;
-      continue;
+    if (best->result == nullptr || !best->result->IsBigram()) {
+      return absl::InternalError("BPE continuation selected an invalid candidate");
     }
 
-    ExpansionPiece piece;
-    piece.set_external_id(next_external_id_++);
-    piece.set_piece(child);
-    piece.set_type(ModelProto::SentencePiece::NORMAL);
-    piece.set_mergeable(true);
-    piece.set_atomic(false);
-    piece.set_score(-static_cast<float>(base_merges_.size() +
-                                        bootstrap_merges_.size() +
-                                        learned_pieces_.size()));
+    const std::string child = best->result->ToString();
+    const std::pair<std::string, std::string> pair = {
+        best->left_text, best->right_text};
+
+    int external_id = -1;
+    bool allocates_piece = false;
+    const auto child_it = piece_external_id_by_string_.find(child);
+    if (child_it != piece_external_id_by_string_.end()) {
+      // A second SCOPE for the SAME pair is a real operation and must survive
+      // into the artifact/runtime, but it constructs the same token ID.
+      const auto pair_it = pair_external_id_.find(pair);
+      if (pair_it == pair_external_id_.end() ||
+          pair_it->second != child_it->second) {
+        // Existing child through a different ancestry is redundant rather than
+        // a new vocabulary item. Preserve the existing construction policy.
+        best->active = false;
+        best->positions.clear();
+        continue;
+      }
+      external_id = child_it->second;
+    } else {
+      if (next_external_id_ == std::numeric_limits<int>::max()) {
+        return absl::OutOfRangeError(
+            "BPE continuation exhausted the external ID range");
+      }
+      external_id = next_external_id_++;
+      allocates_piece = true;
+    }
 
     ExpansionMerge merge;
-    merge.set_left(best->left->ToString());
-    merge.set_right(best->right->ToString());
-    merge.set_external_id(piece.external_id());
+    merge.set_left(best->left_text);
+    merge.set_right(best->right_text);
+    merge.set_external_id(external_id);
     merge.set_weighted_count(best->freq);
-    merge.set_grammar_level(MaxGrammarLevel(best));
+    merge.set_grammar_level(best->scope_level);
+    // For a hierarchical artifact scope 0 is meaningful (ordinary/internal),
+    // so presence matters. Flat continuation stays unscoped for compatibility.
+    if (!hierarchy_.empty()) {
+      merge.set_scope_level(best->scope_level);
+    }
 
-    // Exact parent provenance is captured at the acceptance point, before the
-    // corpus is mutated. No exporter is ever asked to infer a split later.
-    learned_pieces_.push_back(piece);
+    if (allocates_piece) {
+      ExpansionPiece piece;
+      piece.set_external_id(external_id);
+      piece.set_piece(child);
+      piece.set_type(ModelProto::SentencePiece::NORMAL);
+      piece.set_mergeable(true);
+      piece.set_atomic(false);
+      piece.set_score(-static_cast<float>(
+          base_merges_.size() + bootstrap_merges_.size() +
+          learned_merges_.size()));
+
+      learned_pieces_.push_back(piece);
+      existing_piece_strings_.insert(child);
+      piece_external_id_by_string_[child] = external_id;
+    }
+
+    // The operation spends a rank even when its token already exists from the
+    // same pair at another scope. This is the required ordinary/super split.
     learned_merges_.push_back(merge);
-    existing_piece_strings_.insert(child);
+    pair_external_id_[pair] = external_id;
 
-    ABSL_RETURN_IF_ERROR(AcceptSymbol(best));
-    live_by_string_[child] = best;
+    ABSL_RETURN_IF_ERROR(AcceptCandidate(best));
+    live_by_string_[child] = best->result;
     DrainPendingQueue();
   }
 
