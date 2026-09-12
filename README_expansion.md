@@ -220,6 +220,17 @@ operation scope; `grammar_level` is retained as compatible audit metadata.
 The same pair may therefore appear at multiple scopes while all such operations
 construct the same external token ID.
 
+That aliasing breaks an ordinary-BPE monotonicity assumption: a later scoped
+operation can create a token that is an operand of an **earlier** learned rank.
+Selected candidates are therefore retired only from the NEW-operation
+competition, never from replay. The trainer keeps a permanent
+`(left,right,scope)->rank` index. After each replacement it locally closes
+the affected neighbors under already-learned lower ranks before exposing the
+remaining adjacencies as new candidates. The regression
+`ScopedAliasReplaysEarlierRanksToFixedPoint` pins the concrete
+`a+b(scope0) -> ab; ab+c(scope2) -> abc; a+b(scope1) -> ab` backward
+cascade.
+
 That semantic condition survives into inference. A hierarchical
 `ExpansionResult` is not a standalone context-free merge table:
 `ExpansionProcessor::Encode` fails closed, and the caller must use
@@ -364,6 +375,20 @@ mass is proven to fit in `uint64_t` before any candidate is summed. Candidate
 frequency is the weighted number of **non-overlapping replacements that can
 actually be applied** at that exact scope. Acceptance checks count == applied
 weight and fails with an internal error on any discrepancy.
+
+For recursive hierarchy correctness the optimized trainer is not treated as its
+own oracle. Tests include a separate restart-and-replay implementation that
+rebuilds tiny corpora from atoms after every operation, full-replays the ranked
+scoped program, and recounts candidates from scratch. With the opt-in
+`TrainerSpec.bpe_reference_trace_file`, the optimized trainer emits a
+test-only per-rank state trace; generated laminar-tree tests compare operation,
+count, allocation/ID and full-corpus segmentation SHA at every iteration.
+Production must leave this field unset.
+
+`ExpansionResult.training_final_segmentation_sha256` independently commits to
+the final canonical PreparedCorpus segmentation (normalized row, aggregated
+weight and ordered final token strings). A production runtime must reproduce
+that digest exactly; token-count equality alone is insufficient.
 
 ---
 
