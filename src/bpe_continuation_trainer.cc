@@ -1656,11 +1656,29 @@ std::vector<ExpansionMerge> ContinuationTrainer::EffectiveMergeTable() const {
 
 
 std::string ContinuationTrainer::FinalSegmentationSha256() const {
-  // PreparedCorpus is already normalized, duplicate-folded and byte-sorted.
+  // Canonical order is an explicit UNSIGNED byte order, not the platform's
+  // signed-char std::string ordering. Runtime auditors can therefore reproduce
+  // it exactly in any language.
+  std::vector<size_t> order(symbols_.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  auto byte_less = [&](size_t lhs, size_t rhs) {
+    const std::string& a = sentences_[lhs].first;
+    const std::string& b = sentences_[rhs].first;
+    return std::lexicographical_compare(
+        a.begin(), a.end(), b.begin(), b.end(),
+        [](char x, char y) {
+          return static_cast<unsigned char>(x) <
+                 static_cast<unsigned char>(y);
+        });
+  };
+  std::sort(order.begin(), order.end(), byte_less);
+
   // Length prefixes make the representation unambiguous even when a token
-  // contains the whitespace marker or other punctuation.
+  // contains the whitespace marker or punctuation:
+  //   <row_bytes>:<row>\t<weight>\t<count>
+  //       \t<piece_bytes>:<piece>...\n
   std::string canonical;
-  for (size_t sid = 0; sid < symbols_.size(); ++sid) {
+  for (const size_t sid : order) {
     const std::string& row = sentences_[sid].first;
     uint64_t live = 0;
     for (const Symbol* symbol : symbols_[sid]) {
