@@ -146,6 +146,7 @@ set(SPM_TRAIN_SRCS
   trainer_factory.h
   trainer_interface.h
   continuation_io.h
+  id_overlay_processor.h
   unigram_model_trainer.h
   unigram_continuation_trainer.h
   word_model_trainer.h
@@ -159,6 +160,7 @@ set(SPM_TRAIN_SRCS
   trainer_interface.cc
   continuation_io.cc
   expansion_processor.cc
+  id_overlay_processor.cc
   unigram_model_trainer.cc
   unigram_continuation_trainer.cc
   unigram_refit.cc
@@ -180,6 +182,7 @@ set(SPM_TEST_SRCS
   char_model_test.cc
   char_model_trainer_test.cc
   continuation_contract_test.cc
+  id_overlay_processor_test.cc
   continuation_workingmodel_test.cc
   unigram_refit_test.cc
   filesystem_test.cc
