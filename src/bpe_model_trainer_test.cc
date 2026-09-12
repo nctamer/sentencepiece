@@ -31,6 +31,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "continuation_io.h"
 #include "filesystem.h"
 #include "expansion_processor.h"
@@ -69,6 +70,7 @@ struct RefRule {
   uint64_t count = 0;
   int external_id = -1;
   bool allocated = false;
+  std::string post_state_sha256;
 };
 struct RefRun {
   std::vector<RefRule> rules;
@@ -262,6 +264,14 @@ RefRun RunScopedReference(const std::vector<RefRow>& rows,
       rule.allocated = false;
     }
     rules.push_back(std::move(rule));
+
+    // This is deliberately expensive: reconstruct the entire corpus after
+    // EVERY operation so the optimized trainer can be checked iteration by
+    // iteration, not only at the end.
+    std::vector<std::vector<RefToken>> post;
+    post.reserve(rows.size());
+    for (const RefRow& row : rows) post.push_back(RefReplayRow(row, rules));
+    rules.back().post_state_sha256 = RefFinalSha256(rows, post);
   }
 
   RefRun out;
@@ -1437,6 +1447,8 @@ TEST(BPETrainerTest, RandomLaminarHierarchyMatchesIndependentReplayOracle) {
   const std::string prefix =
       filesystem::JoinPath(::testing::TempDir(), "oracle_random_model");
   const std::string result_path = prefix + ".expansion";
+  const std::string trace_path =
+      filesystem::JoinPath(::testing::TempDir(), "oracle_random.trace");
 
   constexpr int kRows = 2048;
   constexpr int kLength = 6;
@@ -1521,6 +1533,7 @@ TEST(BPETrainerTest, RandomLaminarHierarchyMatchesIndependentReplayOracle) {
   ts.set_expansion_spec(spec_path);
   ts.set_expansion_result(result_path);
   ts.set_bpe_hierarchy_file(hierarchy);
+  ts.set_bpe_reference_trace_file(trace_path);
   ts.set_input_sentence_size(0);
   ts.set_split_by_whitespace(false);
   ts.set_split_by_unicode_script(false);
@@ -1559,6 +1572,29 @@ TEST(BPETrainerTest, RandomLaminarHierarchyMatchesIndependentReplayOracle) {
     EXPECT_EQ(want.external_id, got.external_id()) << "rank " << rank;
   }
   ASSERT_EQ(kRequested, result.learned_pieces_size());
+
+  // Exact per-iteration state: operation, selected count, allocation/ID, and
+  // full restarted-corpus segmentation digest.
+  std::vector<std::string> trace_lines;
+  {
+    auto trace = filesystem::NewReadableFile(trace_path);
+    ASSERT_TRUE(trace->status().ok());
+    std::string blob;
+    ASSERT_TRUE(trace->ReadAll(&blob));
+    for (absl::string_view line : absl::StrSplit(blob, '\n')) {
+      if (!line.empty()) trace_lines.emplace_back(line);
+    }
+  }
+  ASSERT_EQ(reference.rules.size(), trace_lines.size());
+  for (size_t rank = 0; rank < reference.rules.size(); ++rank) {
+    const RefRule& want = reference.rules[rank];
+    EXPECT_EQ(
+        absl::StrCat(rank, "\t", want.left, "\t", want.right, "\t",
+                     want.scope, "\t", want.count, "\t",
+                     want.allocated ? 1 : 0, "\t", want.external_id, "\t",
+                     want.post_state_sha256),
+        trace_lines[rank]) << "iteration " << rank;
+  }
 
   ASSERT_TRUE(result.has_training_final_segmentation_sha256());
   EXPECT_EQ(reference.final_sha256,
