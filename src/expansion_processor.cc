@@ -472,13 +472,15 @@ absl::Status ExpansionProcessor::EncodeImpl(
     int version = 0;
     bool frozen = false;
     bool alive = true;
+    bool unknown = false;
   };
   std::vector<Sym> syms;
   auto push_symbol = [&](absl::string_view piece, size_t begin, size_t end,
-                         bool frozen) {
+                         bool frozen, bool unknown = false) {
     const int idx = static_cast<int>(syms.size());
     syms.push_back({std::string(piece), static_cast<int>(begin),
-                    static_cast<int>(end), idx - 1, -1, 0, frozen, true});
+                    static_cast<int>(end), idx - 1, -1, 0, frozen, true,
+                    unknown});
     if (idx > 0) syms[idx - 1].next = idx;
   };
 
@@ -488,7 +490,10 @@ absl::Status ExpansionProcessor::EncodeImpl(
     ABSL_RETURN_IF_ERROR(SegmentAtoms(run, &atoms));
     size_t cursor = begin;
     for (const std::string& atom : atoms) {
-      push_symbol(atom, cursor, cursor + atom.size(), false);
+      const bool unknown =
+          !std::binary_search(atomic_pieces_ordered_.begin(),
+                              atomic_pieces_ordered_.end(), atom);
+      push_symbol(atom, cursor, cursor + atom.size(), false, unknown);
       cursor += atom.size();
     }
     return absl::OkStatus();
@@ -587,7 +592,7 @@ absl::Status ExpansionProcessor::EncodeImpl(
       const Sym& l = syms[left];
       const Sym& r = syms[right];
       if (!l.alive || !r.alive || l.next != right || r.prev != left ||
-          l.frozen || r.frozen) {
+          l.frozen || r.frozen || l.unknown || r.unknown) {
         return;
       }
       const MergeRule* rule = matching_rule(l, r, scoped_phase);
@@ -689,7 +694,9 @@ absl::Status ExpansionProcessor::EncodeImpl(
   while (at >= 0) {
     const Sym& sym = syms[at];
     const auto it = piece_to_id_.find(sym.s);
-    out->push_back({it == piece_to_id_.end() ? unk_id_ : it->second,
+    out->push_back({sym.unknown || it == piece_to_id_.end()
+                        ? unk_id_
+                        : it->second,
                     sym.s, sym.begin, sym.end});
     at = sym.next;
   }
