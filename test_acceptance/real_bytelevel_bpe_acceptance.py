@@ -57,6 +57,23 @@ def pretoken_surfaces(text):
     return units
 
 vocab = json.load(open(os.path.join(SNAP, "vocab.json")))
+# Hugging Face may store added/special tokens only in tokenizer.json. Preserve
+# the complete occupied ID ABI before choosing the appended UNKNOWN/new IDs.
+by_id = {int(pid): piece for piece, pid in vocab.items()}
+for pid, meta in added_tokens.items():
+    piece = meta["content"]
+    if pid in by_id and by_id[pid] != piece:
+        raise SystemExit(
+            f"tokenizer.json added-token id {pid} conflicts with vocab.json")
+    if piece in vocab and int(vocab[piece]) != pid:
+        raise SystemExit(
+            f"tokenizer.json added token {piece!r} conflicts with vocab.json id")
+    by_id[pid] = piece
+    vocab[piece] = pid
+if sorted(by_id) != list(range(max(by_id) + 1)):
+    raise SystemExit(
+        "Qwen occupied tokenizer IDs are not contiguous; explicit dense runtime "
+        "needs an adapter policy for holes before continuation")
 merges = []
 with open(os.path.join(SNAP, "merges.txt"), encoding="utf-8") as f:
     for line in f:
