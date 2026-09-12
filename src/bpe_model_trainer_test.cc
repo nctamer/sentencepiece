@@ -709,7 +709,7 @@ TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
   expansion.set_model_type(EXPANSION_BPE);
   expansion.set_preserve_base_ids(true);
   expansion.set_first_new_external_id(5);
-  expansion.set_requested_new_pieces(2);
+  expansion.set_requested_new_pieces(4);
   auto add = [&](int id, absl::string_view piece,
                  ModelProto::SentencePiece::Type type, bool mergeable,
                  bool atomic) {
@@ -735,7 +735,7 @@ TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
   trainer_spec.add_input(input);
   trainer_spec.set_input_format("tsv");
   trainer_spec.set_model_prefix(prefix);
-  trainer_spec.set_vocab_size(7);
+  trainer_spec.set_vocab_size(9);
   trainer_spec.set_expansion_spec(spec_path);
   trainer_spec.set_expansion_result(result_path);
   trainer_spec.set_bpe_hierarchy_file(hierarchy);
@@ -766,7 +766,7 @@ TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
   }
   ExpansionResult result;
   ASSERT_TRUE(result.ParseFromString(bytes));
-  ASSERT_EQ(2, result.learned_merges_size());
+  ASSERT_EQ(4, result.learned_merges_size());
 
   EXPECT_EQ("1", result.learned_merges(0).left());
   EXPECT_EQ("2", result.learned_merges(0).right());
@@ -776,6 +776,16 @@ TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
   EXPECT_EQ("12", result.learned_merges(1).right());
   EXPECT_EQ(20, result.learned_merges(1).weighted_count());
   EXPECT_EQ(1, result.learned_merges(1).grammar_level());
+
+  EXPECT_EQ("12", result.learned_merges(2).left());
+  EXPECT_EQ("8", result.learned_merges(2).right());
+  EXPECT_EQ(7, result.learned_merges(2).weighted_count());
+  EXPECT_EQ(0, result.learned_merges(2).grammar_level());
+
+  EXPECT_EQ("/", result.learned_merges(3).left());
+  EXPECT_EQ("128", result.learned_merges(3).right());
+  EXPECT_EQ(7, result.learned_merges(3).weighted_count());
+  EXPECT_EQ(1, result.learned_merges(3).grammar_level());
 
   // The artifact produced by training must replay with the same occurrence-
   // local decision. This is the regression the first flat runtime was missing.
@@ -794,9 +804,10 @@ TEST(BPETrainerTest, CompletionHierarchyDoesNotShadowShortDenominator) {
   long_gate.cuts = {0, 1, 4};
   std::vector<expansion::TokenSpan> long_out;
   ASSERT_TRUE(runtime.EncodeWithHierarchy("/128", {long_gate}, &long_out).ok());
-  std::vector<std::string> replayed;
-  for (const auto& x : long_out) replayed.push_back(x.piece);
-  EXPECT_EQ(std::vector<std::string>({"/", "12", "8"}), replayed);
+  ASSERT_EQ(1u, long_out.size());
+  EXPECT_EQ("/128", long_out[0].piece)
+      << "the earlier /+12 rank is blocked locally, allowing 12+8 and then "
+         "/+128 to reproduce the training construction";
 }
 
 TEST(BPETrainerTest, HierarchyNeverVetoesInheritedMergeReplay) {
