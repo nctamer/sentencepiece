@@ -26,7 +26,7 @@ std::string Key(absl::string_view l, absl::string_view r) {
 
 absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
   id_to_piece_.clear(); id_to_type_.clear();
-  piece_to_id_.clear(); merge_rule_.clear();
+  piece_to_id_.clear(); merge_rules_.clear();
   user_defined_matcher_.reset();
   requires_hierarchy_ = false;
   has_inherited_merge_program_ = false;
@@ -96,18 +96,42 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
 
   struct RankedMerge {
     ExpansionMerge merge;
-    bool hierarchy_gated = false;
+    int scope_level = -1;
   };
   std::vector<RankedMerge> merges;
   has_inherited_merge_program_ =
       result.base_merges_size() != 0 || result.bootstrap_merges_size() != 0;
-  for (const auto& m : result.base_merges()) merges.push_back({m, false});
-  for (const auto& m : result.bootstrap_merges()) merges.push_back({m, false});
+
+  for (const auto& m : result.base_merges()) {
+    if (m.has_scope_level() && m.scope_level() >= 0) {
+      status_ = absl::FailedPreconditionError(
+          "scoped inherited base merges are unsupported without the inherited "
+          "hierarchy provider");
+      return status_;
+    }
+    merges.push_back({m, -1});
+  }
+  for (const auto& m : result.bootstrap_merges()) {
+    if (m.has_scope_level() && m.scope_level() >= 0) {
+      status_ = absl::FailedPreconditionError(
+          "scoped bootstrap merges are unsupported without their hierarchy "
+          "provider");
+      return status_;
+    }
+    merges.push_back({m, -1});
+  }
   for (const auto& m : result.learned_merges()) {
-    // Only merges learned by a hierarchical continuation are occurrence
-    // conditioned. The inherited/base program is authoritative and remains
-    // unconditional even when it crosses a continuation grammar boundary.
-    merges.push_back({m, requires_hierarchy_});
+    if (requires_hierarchy_) {
+      if (!m.has_scope_level() || m.scope_level() < 0) {
+        status_ = absl::FailedPreconditionError(
+            "hierarchical ExpansionResult contains an unscoped learned merge; "
+            "rebuild it with scoped operation semantics");
+        return status_;
+      }
+      merges.push_back({m, m.scope_level()});
+    } else {
+      merges.push_back({m, -1});
+    }
   }
   std::sort(merges.begin(), merges.end(),
             [](const RankedMerge& a, const RankedMerge& b) {
@@ -127,9 +151,17 @@ absl::Status ExpansionProcessor::Load(const ExpansionResult& result) {
         return status_;
       }
     }
-    merge_rule_.emplace(
-        Key(merge.left(), merge.right()),
-        MergeRule{static_cast<int>(i), merges[i].hierarchy_gated});
+    auto& rules = merge_rules_[Key(merge.left(), merge.right())];
+    for (const MergeRule& existing : rules) {
+      if (existing.scope_level == merges[i].scope_level) {
+        status_ = absl::FailedPreconditionError(absl::StrCat(
+            "duplicate merge operation for pair ", merge.left(), " + ",
+            merge.right(), " at scope ", merges[i].scope_level));
+        return status_;
+      }
+    }
+    rules.push_back(
+        MergeRule{static_cast<int>(i), merges[i].scope_level});
   }
 
   // THE ARTIFACT'S OWN NORMALIZER IS AUTHORITATIVE. Falling back to a default
@@ -324,25 +356,51 @@ absl::Status ExpansionProcessor::EncodeImpl(
 
   std::vector<bool> gate_enabled(gates == nullptr ? 0 : gates->size(), true);
 
-  auto occurrence_allowed =
-      [&](const Sym& left, const Sym& right, const MergeRule& rule) -> bool {
-    if (!rule.hierarchy_gated) return true;
-    if (gates == nullptr) return false;
+  // Exact current occurrence scope: 0 ordinary/internal, >0 a completed
+  // child boundary, -2 hierarchy-ineligible.
+  auto occurrence_scope = [&](const Sym& left, const Sym& right) -> int {
+    if (gates == nullptr) return 0;
     const int boundary = left.end;
-    if (boundary != right.begin) return false;
+    if (boundary != right.begin) return -2;
     const auto it = gate_at_boundary.find(boundary);
-    if (it == gate_at_boundary.end()) return true;
-    if (!gate_enabled[it->second]) return true;
+    if (it == gate_at_boundary.end()) return 0;
+    if (!gate_enabled[it->second]) return 0;
     const CompletionGate& gate = (*gates)[it->second];
     if (left.begin < gate.cuts.front() || right.end > gate.cuts.back()) {
-      return false;
+      return -2;
     }
-    return std::binary_search(gate.cuts.begin(), gate.cuts.end(), left.begin) &&
-           std::binary_search(gate.cuts.begin(), gate.cuts.end(), right.end);
+    if (!std::binary_search(gate.cuts.begin(), gate.cuts.end(), left.begin) ||
+        !std::binary_search(gate.cuts.begin(), gate.cuts.end(), right.end)) {
+      return -2;
+    }
+    return gate.level;
+  };
+
+  auto matching_rule = [&](const Sym& left, const Sym& right,
+                           bool scoped_phase) -> const MergeRule* {
+    const auto it = merge_rules_.find(Key(left.s, right.s));
+    if (it == merge_rules_.end()) return nullptr;
+    if (!scoped_phase) {
+      const MergeRule* best = nullptr;
+      for (const MergeRule& rule : it->second) {
+        if (rule.scope_level != -1) continue;
+        if (best == nullptr || rule.rank < best->rank) best = &rule;
+      }
+      return best;
+    }
+    const int scope = occurrence_scope(left, right);
+    if (scope < 0) return nullptr;
+    const MergeRule* best = nullptr;
+    for (const MergeRule& rule : it->second) {
+      if (rule.scope_level != scope) continue;
+      if (best == nullptr || rule.rank < best->rank) best = &rule;
+    }
+    return best;
   };
 
   struct Candidate {
     int rank;
+    int scope_level;
     int left;
     int right;
     int left_version;
@@ -350,12 +408,12 @@ absl::Status ExpansionProcessor::EncodeImpl(
   };
   struct Worse {
     bool operator()(const Candidate& a, const Candidate& b) const {
-      if (a.rank != b.rank) return a.rank > b.rank;  // min rank first
-      return a.left > b.left;                        // then leftmost
+      if (a.rank != b.rank) return a.rank > b.rank;
+      return a.left > b.left;
     }
   };
 
-  auto run_phase = [&](bool hierarchy_gated_phase) {
+  auto run_phase = [&](bool scoped_phase) {
     std::priority_queue<Candidate, std::vector<Candidate>, Worse> pq;
 
     auto push_pair = [&](int left, int right) {
@@ -366,17 +424,12 @@ absl::Status ExpansionProcessor::EncodeImpl(
           l.frozen || r.frozen) {
         return;
       }
-      const auto it = merge_rule_.find(Key(l.s, r.s));
-      if (it == merge_rule_.end() ||
-          it->second.hierarchy_gated != hierarchy_gated_phase ||
-          !occurrence_allowed(l, r, it->second)) {
-        return;
-      }
-      pq.push({it->second.rank, left, right, l.version, r.version});
+      const MergeRule* rule = matching_rule(l, r, scoped_phase);
+      if (rule == nullptr) return;
+      pq.push({rule->rank, rule->scope_level, left, right,
+               l.version, r.version});
     };
 
-    // Build the phase-local heap from the current live segmentation. Phase 0
-    // is the exact inherited/base tokenizer; phase 1 sees only its result.
     int cur = 0;
     while (cur >= 0 && cur < static_cast<int>(syms.size()) &&
            !syms[cur].alive) {
@@ -398,11 +451,9 @@ absl::Status ExpansionProcessor::EncodeImpl(
           right.prev != c.left) {
         continue;
       }
-      const auto rule_it = merge_rule_.find(Key(left.s, right.s));
-      if (rule_it == merge_rule_.end() ||
-          rule_it->second.hierarchy_gated != hierarchy_gated_phase ||
-          rule_it->second.rank != c.rank ||
-          !occurrence_allowed(left, right, rule_it->second)) {
+      const MergeRule* rule = matching_rule(left, right, scoped_phase);
+      if (rule == nullptr || rule->rank != c.rank ||
+          rule->scope_level != c.scope_level) {
         continue;
       }
 
@@ -415,20 +466,15 @@ absl::Status ExpansionProcessor::EncodeImpl(
       if (next >= 0) syms[next].prev = c.left;
       right.alive = false;
       ++right.version;
-
       push_pair(prev, c.left);
       push_pair(c.left, next);
     }
   };
 
-  // Phase 0: inherited/base/bootstrap program. Grammar is deliberately absent
-  // here so a Qwen/base tokenizer is reproduced exactly.
+  // Inherited/base/bootstrap (and all rules in a flat artifact) are
+  // unconditional. A newly introduced hierarchy may not veto them.
   run_phase(false);
 
-  // An inherited token may already partially straddle a newly introduced
-  // grammar child boundary. Enforcing that parent would require undoing the
-  // inherited token, which continuation is forbidden to do. Disable only that
-  // incompatible gate for this occurrence; all compatible gates remain active.
   if (requires_hierarchy_ && gates != nullptr) {
     for (size_t gi = 0; gi < gates->size(); ++gi) {
       const CompletionGate& gate = (*gates)[gi];
@@ -466,8 +512,7 @@ absl::Status ExpansionProcessor::EncodeImpl(
     }
   }
 
-  // Phase 1: appended continuation rules. Candidate applicability is
-  // occurrence-local and uses the same child-completion predicate as training.
+  // Appended hierarchical rules are exact-scope operations.
   run_phase(true);
 
   int at = 0;
