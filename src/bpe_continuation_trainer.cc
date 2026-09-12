@@ -1931,6 +1931,24 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   result.set_requested_new_pieces(target_new_pieces_);
   result.set_actual_new_pieces(static_cast<int>(learned_pieces_.size()));
   result.set_unreachable_pieces(0);
+
+  uint64_t final_tokens = 0;
+  uint64_t final_weighted_tokens = 0;
+  for (size_t sid = 0; sid < symbols_.size(); ++sid) {
+    uint64_t live = 0;
+    for (Symbol* symbol : symbols_[sid]) {
+      if (symbol != nullptr) ++live;
+    }
+    final_tokens += live;
+    const uint64_t weight =
+        static_cast<uint64_t>(sentences_[sid].second);
+    // InitializeCorpusSymbols proved the initial weighted position mass fits
+    // uint64_t; merging only decreases it, so this accumulation cannot wrap.
+    final_weighted_tokens += live * weight;
+  }
+  result.set_training_final_tokens(final_tokens);
+  result.set_training_final_weighted_tokens(final_weighted_tokens);
+
   result.set_rank_prepend(expansion_spec_.allow_rank_prepend());
   result.set_vocab_sha256(expansion_spec_.vocab_sha256());
   result.set_merges_sha256(expansion_spec_.merges_sha256());
