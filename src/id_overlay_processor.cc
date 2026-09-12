@@ -62,6 +62,7 @@ absl::Status IdOverlayProcessor::Load(const IdOverlayProgram& program) {
   rules_.clear();
   protected_ids_.clear();
   expansion_by_id_.clear();
+  overlay_ids_.clear();
   base_identity_sha256_.clear();
 
   if (program.schema_version() != 1) {
@@ -187,9 +188,11 @@ absl::Status IdOverlayProcessor::Load(const IdOverlayProgram& program) {
     }
 
     expansion_by_id_[r.child_id()] = std::move(expected);
+    overlay_ids_.push_back(r.child_id());
     rules_.emplace(key, Rule{r.left_id(), r.right_id(), r.child_id(),
                              r.rank()});
   }
+  std::sort(overlay_ids_.begin(), overlay_ids_.end());
   return absl::OkStatus();
 }
 
