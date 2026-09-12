@@ -119,6 +119,7 @@ set(SPM_SRCS
   filesystem.h
   init.h
   sentencepiece_processor.h
+  id_overlay_processor.h
   word_model.h
   model_factory.h
   char_model.h
@@ -132,6 +133,7 @@ set(SPM_SRCS
   model_interface.cc
   normalizer.cc
   sentencepiece_processor.cc
+  id_overlay_processor.cc
   unigram_model.cc
   util.cc
   word_model.cc)
@@ -146,7 +148,6 @@ set(SPM_TRAIN_SRCS
   trainer_factory.h
   trainer_interface.h
   continuation_io.h
-  id_overlay_processor.h
   unigram_model_trainer.h
   unigram_continuation_trainer.h
   word_model_trainer.h
@@ -160,7 +161,6 @@ set(SPM_TRAIN_SRCS
   trainer_interface.cc
   continuation_io.cc
   expansion_processor.cc
-  id_overlay_processor.cc
   unigram_model_trainer.cc
   unigram_continuation_trainer.cc
   unigram_refit.cc
