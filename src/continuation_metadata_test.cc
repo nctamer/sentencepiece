@@ -78,6 +78,16 @@ TEST(ContinuationMetadataTest, LegacyTsvStillFoldsBySurfaceOnly) {
   EXPECT_TRUE(corpus.metadata_keys[0].empty());
 }
 
+TEST(ContinuationMetadataTest, PythonMapApiAcceptsHierarchyAndTracePaths) {
+  TrainerSpec spec;
+  ASSERT_TRUE(SentencePieceTrainer::SetProtoField(
+      "bpe_hierarchy_file", "hierarchy.tsv", &spec).ok());
+  ASSERT_TRUE(SentencePieceTrainer::SetProtoField(
+      "bpe_reference_trace_file", "tiny.trace", &spec).ok());
+  EXPECT_EQ("hierarchy.tsv", spec.bpe_hierarchy_file());
+  EXPECT_EQ("tiny.trace", spec.bpe_reference_trace_file());
+}
+
 TEST(ContinuationMetadataTest, RealTrainerSeparatesSupportFromApplications) {
   const std::string prefix = TempFile("metadata_train");
   {
@@ -129,6 +139,30 @@ TEST(ContinuationMetadataTest, RealTrainerSeparatesSupportFromApplications) {
   EXPECT_EQ(2, result.learned_merges(1).weighted_count());
   EXPECT_EQ(5, result.learned_merges(1).application_count());
   EXPECT_EQ(9, result.training_final_weighted_tokens());
+  // More than std::sort's small insertion-sort threshold: equal surfaces
+  // with different metadata/weights must not acquire an incidental order.
+  std::string canonical;
+  {
+    std::ofstream corpus(prefix + ".tsv");
+    std::ofstream hierarchy(prefix + ".hier");
+    hierarchy << "# sentencepiece-bpe-hierarchy-v2\n";
+    for (int i = 10; i < 42; ++i) {
+      corpus << "aa\t" << i << "\t" << i << "\n";
+      hierarchy << "aa\t" << i << "\t\t0-2\n";
+      canonical += "2:aa\t" + std::to_string(i) + "\t1\t2:aa\n";
+    }
+    corpus << "bb\t4\tZ\n";
+    hierarchy << "bb\tZ\t\t0-2\n";
+    canonical += "2:bb\t4\t1\t2:bb\n";
+  }
+  status = SentencePieceTrainer::Train(ts, Identity(), NormalizerSpec{});
+  ASSERT_TRUE(status.ok()) << status;
+  {
+    std::ifstream repeated(prefix + ".expansion", std::ios::binary);
+    const std::string payload((std::istreambuf_iterator<char>(repeated)), {});
+    ASSERT_TRUE(result.ParseFromString(payload));
+  }
+  EXPECT_EQ(Sha256Hex(canonical), result.training_final_segmentation_sha256());
   // A v2 support range, just like a hierarchy cut, must align to UTF-8.
   spec.mutable_base_pieces(1)->set_piece("é");
   {

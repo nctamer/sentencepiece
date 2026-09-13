@@ -512,15 +512,12 @@ bool ContinuationTrainer::HierarchySupportsMerge(int sid, int left,
 
   const HierarchyRecord& record = hierarchy_[sid];
   if (record.restrict_support) {
-    bool owned = false;
-    for (const auto& range : record.support_ranges) {
-      if (range.first <= begin && end <= range.second) {
-        owned = true;
-        break;
-      }
-      if (range.first > begin) break;
-    }
-    if (!owned) return false;
+    auto range = std::upper_bound(
+        record.support_ranges.begin(), record.support_ranges.end(), begin,
+        [](size_t offset, const auto& item) { return offset < item.first; });
+    if (range == record.support_ranges.begin()) return false;
+    --range;
+    if (end > range->second) return false;
   }
 
   // A resulting span is hierarchy-supported iff, for every enabled parent it
@@ -528,18 +525,16 @@ bool ContinuationTrainer::HierarchySupportsMerge(int sid, int left,
   // Fully containing a nested parent is fine: at an ancestor level that whole
   // parent is one completed child. This also permits a flat rule to repair a
   // temporarily partial token, e.g. Vn:d5 + C5 -> Vn:d5C5.
-  for (const HierarchyGate& gate : record.gates) {
-    if (!gate.enabled || end <= gate.begin || begin >= gate.end) continue;
+  // Only parents owning a strictly crossed cut can veto this span. Visiting
+  // their sorted cut index avoids a whole-record grammar scan per adjacency.
+  auto boundary = std::upper_bound(
+      record.ordered_boundaries.begin(), record.ordered_boundaries.end(), begin,
+      [](size_t offset, const auto& item) { return offset < item.first; });
+  for (; boundary != record.ordered_boundaries.end() && boundary->first < end;
+       ++boundary) {
+    const HierarchyGate& gate = record.gates[boundary->second];
+    if (!gate.enabled) continue;
     if (begin <= gate.begin && end >= gate.end) continue;  // whole parent
-
-    bool crosses_internal_cut = false;
-    for (size_t i = 1; i + 1 < gate.cuts.size(); ++i) {
-      if (begin < gate.cuts[i] && gate.cuts[i] < end) {
-        crosses_internal_cut = true;
-        break;
-      }
-    }
-    if (!crosses_internal_cut) continue;
 
     if (begin < gate.begin || end > gate.end ||
         !std::binary_search(gate.cuts.begin(), gate.cuts.end(), begin) ||
@@ -733,50 +728,49 @@ absl::Status ContinuationTrainer::LoadHierarchy() {
 
         const int gate_index = static_cast<int>(record.gates.size());
         for (size_t i = 1; i + 1 < gate.cuts.size(); ++i) {
-          if (!record.gate_at_boundary.emplace(gate.cuts[i], gate_index)
-                   .second) {
-            return absl::InvalidArgumentError(absl::StrCat(
-                "two hierarchy parents claim the same child boundary at byte ",
-                gate.cuts[i]));
-          }
+          record.ordered_boundaries.emplace_back(gate.cuts[i], gate_index);
         }
         record.gates.push_back(std::move(gate));
       }
     }
 
-    for (size_t i = 0; i < record.gates.size(); ++i) {
-      for (size_t j = i + 1; j < record.gates.size(); ++j) {
-        const auto& a = record.gates[i];
-        const auto& b = record.gates[j];
-        const bool disjoint = a.end <= b.begin || b.end <= a.begin;
-        const bool a_contains = a.begin <= b.begin && b.end <= a.end;
-        const bool b_contains = b.begin <= a.begin && a.end <= b.end;
-        if (!(disjoint || a_contains || b_contains)) {
-          return absl::InvalidArgumentError(
-              "BPE hierarchy spans are not laminar");
+    std::sort(record.ordered_boundaries.begin(), record.ordered_boundaries.end());
+    for (size_t i = 1; i < record.ordered_boundaries.size(); ++i) {
+      if (record.ordered_boundaries[i-1].first == record.ordered_boundaries[i].first) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "two hierarchy parents claim the same child boundary at byte ",
+            record.ordered_boundaries[i].first));
+      }
+    }
+    std::vector<size_t> gate_order(record.gates.size());
+    for (size_t i = 0; i < gate_order.size(); ++i) gate_order[i] = i;
+    std::sort(gate_order.begin(), gate_order.end(), [&](size_t x, size_t y) {
+      const auto& a = record.gates[x];
+      const auto& b = record.gates[y];
+      return a.begin != b.begin ? a.begin < b.begin : a.end > b.end;
+    });
+    std::vector<size_t> ancestors;
+    for (size_t index : gate_order) {
+      const auto& inner = record.gates[index];
+      while (!ancestors.empty() &&
+             record.gates[ancestors.back()].end <= inner.begin) {
+        ancestors.pop_back();
+      }
+      for (size_t parent : ancestors) {
+        const auto& outer = record.gates[parent];
+        if (inner.end > outer.end) {
+          return absl::InvalidArgumentError("BPE hierarchy spans are not laminar");
         }
-        auto child_compatible = [](const HierarchyGate& outer,
-                                   const HierarchyGate& inner) {
-          bool crosses_outer_child_boundary = false;
-          for (size_t k = 1; k + 1 < outer.cuts.size(); ++k) {
-            if (inner.begin < outer.cuts[k] && outer.cuts[k] < inner.end) {
-              crosses_outer_child_boundary = true;
-              break;
-            }
-          }
-          if (!crosses_outer_child_boundary) return true;
-          return std::binary_search(outer.cuts.begin(), outer.cuts.end(),
-                                    inner.begin) &&
-                 std::binary_search(outer.cuts.begin(), outer.cuts.end(),
-                                    inner.end);
-        };
-        if ((a_contains && !child_compatible(a, b)) ||
-            (b_contains && !child_compatible(b, a))) {
+        const auto cut = std::upper_bound(outer.cuts.begin() + 1,
+                                         outer.cuts.end() - 1, inner.begin);
+        if (cut != outer.cuts.end() - 1 && *cut < inner.end &&
+            (!std::binary_search(outer.cuts.begin(), outer.cuts.end(), inner.begin) ||
+             !std::binary_search(outer.cuts.begin(), outer.cuts.end(), inner.end))) {
           return absl::InvalidArgumentError(
-              "nested BPE hierarchy parent crosses an outer direct-child "
-              "boundary");
+              "nested BPE hierarchy parent crosses an outer direct-child boundary");
         }
       }
+      ancestors.push_back(index);
     }
   }
   if (!input->status().ok()) return input->status();
@@ -1582,6 +1576,18 @@ std::string ContinuationTrainer::FinalSegmentationSha256() const {
   auto byte_less = [&](size_t lhs, size_t rhs) {
     const std::string& a = sentences_[lhs].first;
     const std::string& b = sentences_[rhs].first;
+    // Distinct hierarchy metadata can accompany identical surfaces. Their
+    // weights must have a deterministic order in the serialized witness.
+    if (a == b) {
+      const std::string& ma = corpus_.metadata_keys[lhs];
+      const std::string& mb = corpus_.metadata_keys[rhs];
+      return std::lexicographical_compare(
+          ma.begin(), ma.end(), mb.begin(), mb.end(),
+          [](char x, char y) {
+            return static_cast<unsigned char>(x) <
+                   static_cast<unsigned char>(y);
+          });
+    }
     return std::lexicographical_compare(
         a.begin(), a.end(), b.begin(), b.end(),
         [](char x, char y) {

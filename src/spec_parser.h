@@ -153,6 +153,8 @@ inline std::string PrintProto(const TrainerSpec& message,
   PRINT_PARAM(split_by_whitespace);
   PRINT_PARAM(split_digits);
   PRINT_PARAM(expansion_spec);
+  PRINT_PARAM(bpe_hierarchy_file);
+  PRINT_PARAM(bpe_reference_trace_file);
   PRINT_PARAM(expansion_result);
   PRINT_PARAM(unigram_prior_model);
   // Legacy intermo extensions (TrainerSpec 200/201/204/205).
@@ -241,6 +243,8 @@ absl::Status SentencePieceTrainer::SetProtoField(absl::string_view name,
   PARSE_BOOL(split_by_whitespace);
   PARSE_BOOL(split_digits);
   PARSE_STRING(expansion_spec);
+  PARSE_STRING(bpe_hierarchy_file);
+  PARSE_STRING(bpe_reference_trace_file);
   PARSE_STRING(expansion_result);
   PARSE_STRING(unigram_prior_model);
   // Legacy intermo extensions. Kept so pre-continuation CLI/API callers keep
