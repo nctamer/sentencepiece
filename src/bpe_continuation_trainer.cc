@@ -41,19 +41,21 @@ std::string ContinuationTrainer::Symbol::ToString() const {
   return string_util::UnicodeTextToUTF8(chars);
 }
 
-uint64_t ContinuationTrainer::EncodePos(int sid, int l, int r) {
-  CHECK_GE(l, 0);
-  CHECK_GE(r, 0);
-  CHECK_LE(l, std::numeric_limits<uint16_t>::max());
-  CHECK_LE(r, std::numeric_limits<uint16_t>::max());
+uint64_t ContinuationTrainer::EncodePos(int sid, int left) {
+  CHECK_GE(sid, 0);
+  CHECK_GE(left, 0);
   return (static_cast<uint64_t>(sid) << 32) |
-         (static_cast<uint64_t>(l) << 16) | static_cast<uint64_t>(r);
+         static_cast<uint32_t>(left);
 }
 
-ContinuationTrainer::Position ContinuationTrainer::DecodePos(uint64_t n) {
-  return Position{static_cast<int>(n >> 32),
-                  static_cast<int>((n >> 16) & 0xffff),
-                  static_cast<int>(n & 0xffff)};
+ContinuationTrainer::Position ContinuationTrainer::DecodePos(uint64_t n) const {
+  const int sid = static_cast<int>(n >> 32);
+  const int left = static_cast<int>(static_cast<uint32_t>(n));
+  // A live left slot has exactly one live successor. Stale entries are still
+  // checked against BOTH candidate symbols before counting or replacement.
+  // Fresh children strictly grow, so an unchanged candidate cannot acquire a
+  // different matching successor through an ABA transition at this slot.
+  return Position{sid, left, GetNextIndex(sid, left)};
 }
 
 ContinuationTrainer::Symbol* ContinuationTrainer::GetAtomicSymbol(
@@ -229,7 +231,7 @@ void ContinuationTrainer::AddNewPair(int sid, int left, int right) {
   Candidate* candidate = GetCandidate(left_symbol, right_symbol);
   if (candidate == nullptr || !candidate->active) return;
 
-  candidate->positions.insert(EncodePos(sid, left, right));
+  candidate->positions.insert(EncodePos(sid, left));
   candidate->needs_recomputation = true;
   if (!candidate->pending) {
     candidate->pending = true;
@@ -1315,11 +1317,9 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
   prev_live_.assign(sentences_.size(), {});
   next_live_.assign(sentences_.size(), {});
 
-  // EncodePos packs the two symbol indexes of a position into 16 bits each.
-  // An over-long record is a legitimate input, not a programming error, so it
-  // is refused here with a status instead of aborting the process inside
-  // EncodePos's CHECK.
-  constexpr size_t kMaxAtomsPerRecord = 1u << 16;
+  // Keep signed live-link indexes representable. Occurrence keys retain their
+  // eight-byte footprint: uint32 row + uint32 left; right comes from the link.
+  constexpr size_t kMaxAtomsPerRecord = std::numeric_limits<int>::max();
 
   // Every pair frequency is bounded by the total weighted position mass, so
   // proving that sum fits in uint64_t proves no accumulation can wrap. A
@@ -1335,8 +1335,7 @@ absl::Status ContinuationTrainer::InitializeCorpusSymbols() {
       return absl::OutOfRangeError(absl::StrCat(
           "continuation training unit segments into ", record.size(),
           " atomic symbols, which exceeds the ", kMaxAtomsPerRecord,
-          " this trainer can index; split the record or shrink "
-          "max_sentence_length"));
+          " this trainer can index"));
     }
     const uint64_t weight = static_cast<uint64_t>(sentences_[sid].second);
     if (weight != 0 &&
@@ -2232,6 +2231,10 @@ absl::Status ContinuationTrainer::Train() {
   ABSL_RETURN_IF_ERROR(LoadExplicitFences());
   ABSL_RETURN_IF_ERROR(continuation::LoadPreparedCorpus(
       trainer_spec_, normalizer_spec_, components_, &corpus_));
+  if (corpus_.sentences.size() >
+      static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return absl::OutOfRangeError("too many continuation rows for live indexes");
+  }
   ABSL_RETURN_IF_ERROR(LoadHierarchy());
   ABSL_RETURN_IF_ERROR(InitializeCorpusSymbols());
 

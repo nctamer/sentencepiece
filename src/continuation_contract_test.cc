@@ -641,26 +641,30 @@ ExpansionSpec SingleAtomSpec(int requested_new_pieces) {
   return expansion;
 }
 
-// EncodePos packs two 16-bit symbol indexes. An over-long record used to trip
-// a CHECK and take the process down; valid input must produce a status.
-TEST(BPEContinuationContractTest, RejectsRecordLongerThanPositionIndex) {
+// The old occurrence key used two 16-bit positions and rejected real pieces.
+TEST(BPEContinuationContractTest, LearnsOn122828AtomsWithoutSplitting) {
   const std::string input = TempPath("continuation_longrec_input.txt");
   const std::string spec_path = TempPath("continuation_longrec.pb");
   const std::string result_path = TempPath("continuation_longrec.result");
   const std::string prefix = TempPath("continuation_longrec_model");
-  ASSERT_TRUE(WriteLines(input, {std::string((1 << 16) + 1, 'a')}));
-  ASSERT_TRUE(WriteProto(spec_path, SingleAtomSpec(0)));
+  ASSERT_TRUE(WriteLines(input, {std::string(122828, 'a')}));
+  ASSERT_TRUE(WriteProto(spec_path, SingleAtomSpec(2)));
 
   TrainerSpec trainer =
       BpeContinuationSpec(input, spec_path, result_path, prefix, 16);
   trainer.set_max_sentence_length(1 << 18);
   const absl::Status status = RunTrainer(trainer, IdentityNormalizer());
-  EXPECT_EQ(absl::StatusCode::kOutOfRange, status.code()) << status;
+  ASSERT_TRUE(status.ok()) << status;
+  ExpansionResult result;
+  ASSERT_TRUE(ReadProto(result_path, &result));
+  ASSERT_EQ(2, result.learned_merges_size());
+  EXPECT_EQ(61414, result.learned_merges(0).weighted_count());
+  EXPECT_EQ(61414, result.learned_merges(0).application_count());
+  EXPECT_EQ(30707, result.learned_merges(1).weighted_count());
+  EXPECT_EQ(30707, result.training_final_tokens());
 }
 
-// One atom shorter still fits, so the limit is a real boundary rather than a
-// blanket refusal of long records.
-TEST(BPEContinuationContractTest, AcceptsRecordAtThePositionIndexLimit) {
+TEST(BPEContinuationContractTest, AcceptsFormerPositionIndexBoundary) {
   const std::string input = TempPath("continuation_atlimit_input.txt");
   const std::string spec_path = TempPath("continuation_atlimit.pb");
   const std::string result_path = TempPath("continuation_atlimit.result");

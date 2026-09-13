@@ -139,8 +139,8 @@ class ContinuationTrainer : public TrainerInterface {
     }
   };
 
-  static uint64_t EncodePos(int sid, int l, int r);
-  static Position DecodePos(uint64_t n);
+  static uint64_t EncodePos(int sid, int left);
+  Position DecodePos(uint64_t n) const;
 
   Symbol* GetAtomicSymbol(absl::string_view atom);
   Symbol* GetFrozenSymbol(absl::string_view piece);
