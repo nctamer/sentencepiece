@@ -40,6 +40,11 @@ class IdOverlayProcessor {
   absl::Status LoadFromSerialized(absl::string_view serialized);
   absl::Status LoadFromFile(absl::string_view path);
 
+  // Training augmentation only: ranks below this prefix are structural
+  // bootstrap and are never subjected to occurrence dropout. Deterministic
+  // dropout=0 execution is otherwise unchanged and remains one ranked pass.
+  absl::Status SetFixedBootstrapRuleCount(uint32_t count);
+
   // Applies the ranked overlay to base/model IDs. Protocol errors are rejected.
   // An unclosed final block is accepted only when allow_unclosed=true.
   absl::Status EncodeIds(const std::vector<int>& ids, double dropout,
@@ -95,6 +100,7 @@ class IdOverlayProcessor {
   int close_fence_id_ = -1;
   int max_input_ids_ = 0;
   int max_expansion_ids_ = 0;
+  uint32_t fixed_bootstrap_rule_count_ = 0;
   std::string base_identity_sha256_;
 };
 
