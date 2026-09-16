@@ -1260,6 +1260,41 @@ TEST(BPEContinuationContractTest, RejectsMergeChildIdMismatch) {
   EXPECT_FALSE(RunWithSpec(expansion, "childid").ok());
 }
 
+TEST(BPEContinuationContractTest, RejectsFinalRankUnreachableBootstrapPiece) {
+  ExpansionSpec expansion;
+  expansion.set_schema_version(1);
+  expansion.set_model_type(EXPANSION_BPE);
+  expansion.set_preserve_base_ids(true);
+  expansion.set_allow_rank_prepend(true);
+  expansion.set_requested_new_pieces(0);
+  AddPiece(&expansion, 0, "<unk>", ModelProto::SentencePiece::UNKNOWN,
+           false, false);
+  AddPiece(&expansion, 1, "a", ModelProto::SentencePiece::NORMAL, true, true);
+  AddPiece(&expansion, 2, "b", ModelProto::SentencePiece::NORMAL, true, true);
+  AddPiece(&expansion, 3, "c", ModelProto::SentencePiece::NORMAL, true, true);
+
+  // Constructive graph:
+  //   rank 0: b+c -> bc
+  //   rank 1: a+b -> ab
+  //   rank 2: ab+c -> abc
+  // Every declared child can be built from earlier declared parents, but final
+  // ranked replay of "abc" applies rank 0 first and strands a|bc. The final
+  // bootstrap macro is therefore unreachable and must fail the build.
+  AddBootstrapPiece(&expansion, "bc");
+  AddBootstrapMerge(&expansion, 0, "b", "c");
+  AddBootstrapPiece(&expansion, "ab");
+  AddBootstrapMerge(&expansion, 1, "a", "b");
+  AddBootstrapPiece(&expansion, "abc");
+  AddBootstrapMerge(&expansion, 2, "ab", "c");
+
+  const absl::Status status =
+      RunWithSpec(expansion, "unreachable_bootstrap", {"abc", "abc"}, 7);
+  EXPECT_EQ(absl::StatusCode::kFailedPrecondition, status.code()) << status;
+  EXPECT_NE(std::string::npos,
+            std::string(status.message()).find("bootstrap/learned pieces"))
+      << status;
+}
+
 TEST(BPEContinuationContractTest, RejectsBootstrapCollidingWithBase) {
   ExpansionSpec expansion = BasicAbcdSpec();
   AddBootstrapPiece(&expansion, "ab");  // already an inherited piece
