@@ -120,6 +120,21 @@ TEST(IdOverlayProcessorTest, DropoutEndpointsAndSeedAreReproducible) {
   EXPECT_EQ((std::vector<int>{8, 1, 1, 9}), expanded);
 }
 
+TEST(IdOverlayProcessorTest, FixedBootstrapRanksIgnoreDropout) {
+  IdOverlayProcessor proc;
+  ASSERT_TRUE(proc.Load(Program()).ok());
+  ASSERT_TRUE(proc.SetFixedBootstrapRuleCount(1).ok());
+
+  // Rank 0 is structural bootstrap and must still fire at dropout=1.0.
+  // Rank 1 remains a learned rule and is dropped.
+  EXPECT_EQ((std::vector<int>{8, 12, 2, 3, 9}),
+            Encode(proc, {8, 1, 1, 2, 3, 9}, 1.0, 77));
+
+  IdOverlayProcessor unloaded;
+  EXPECT_FALSE(unloaded.SetFixedBootstrapRuleCount(1).ok());
+  EXPECT_FALSE(proc.SetFixedBootstrapRuleCount(4).ok());
+}
+
 TEST(IdOverlayProcessorTest, InvalidArtifactIsRejected) {
   {
     auto p = Program();
