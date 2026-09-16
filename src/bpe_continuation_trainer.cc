@@ -2010,17 +2010,26 @@ absl::Status ContinuationTrainer::FinalizeArtifacts() {
   // reachable under ordinary flat replay.
   int unreachable = 0;
   const PairRanks pair_rank = BuildPairRanks(effective);
-  for (const auto& piece : learned_pieces_) {
+  auto certify_reachable = [&](const ExpansionPiece& piece,
+                               absl::string_view kind) {
+    if (piece.atomic() || !piece.mergeable()) return;
     if (!IsReachable(piece.piece(), pair_rank)) {
       ++unreachable;
-      LOG(ERROR) << "unreachable learned BPE piece id=" << piece.external_id()
-                 << " piece=" << piece.piece();
+      LOG(ERROR) << "unreachable " << kind << " BPE piece id="
+                 << piece.external_id() << " piece=" << piece.piece();
     }
+  };
+  for (const auto& piece : bootstrap_pieces_) {
+    certify_reachable(piece, "bootstrap");
+  }
+  for (const auto& piece : learned_pieces_) {
+    certify_reachable(piece, "learned");
   }
   if (unreachable != 0) {
     return absl::FailedPreconditionError(absl::StrCat(
         "BPE expansion failed reachability verification: ", unreachable,
-        " learned pieces are unreachable in the serialized final merge table"));
+        " bootstrap/learned pieces are unreachable in the serialized final "
+        "merge table"));
   }
 
   ExpansionResult result;
