@@ -67,6 +67,20 @@ absl::Status IdOverlayProcessor::Load(const IdOverlayProgram& program) {
   return absl::OkStatus();
 }
 
+absl::Status IdOverlayProcessor::SetFixedBootstrapRuleCount(
+    uint32_t count) {
+  if (!loaded_) {
+    return absl::FailedPreconditionError("overlay is not loaded");
+  }
+  if (count > rules_.size()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "fixed bootstrap rule count ", count,
+        " exceeds overlay rule count ", rules_.size()));
+  }
+  fixed_bootstrap_rule_count_ = count;
+  return absl::OkStatus();
+}
+
 absl::Status IdOverlayProcessor::LoadValidated(const IdOverlayProgram& program) {
   rules_.clear();
   protected_ids_.clear();
@@ -334,7 +348,8 @@ absl::Status IdOverlayProcessor::ApplyBlock(
     // The decision belongs to this live occurrence/version. A skipped
     // occurrence is not reinserted. If a neighboring merge later changes it,
     // push_pair creates a new version and a new decision.
-    if (DropOccurrence(dropout, seed, c.rank, c.position, l.version,
+    if (c.rank >= fixed_bootstrap_rule_count_ &&
+        DropOccurrence(dropout, seed, c.rank, c.position, l.version,
                        r.version)) {
       if (stats != nullptr) ++stats->dropout_skips;
       continue;
