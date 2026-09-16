@@ -562,6 +562,14 @@ PYBIND11_MODULE(_sentencepiece, m, py::mod_gil_not_used()) {
              if (!status.ok()) throw status;
              return true;
            })
+      .def("SetFixedBootstrapRuleCount",
+           [](sentencepiece::overlay::IdOverlayProcessor& self,
+              uint32_t count) {
+             auto status = self.SetFixedBootstrapRuleCount(count);
+             if (!status.ok()) throw status;
+             return true;
+           },
+           py::arg("count"))
       .def("EncodeIds",
            [](const sentencepiece::overlay::IdOverlayProcessor& self,
               const std::vector<int>& ids, double dropout, uint64_t seed,
