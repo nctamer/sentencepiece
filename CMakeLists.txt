@@ -224,7 +224,7 @@ if (SPM_PROTOBUF_PROVIDER STREQUAL "module")
   FetchContent_Declare(
     protobuf
     GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
-    GIT_TAG v36.1
+    GIT_TAG v36.2
     GIT_SHALLOW TRUE
   )
   # MSVC C++20 STL has an issue with Protobuf's UntypedMessage in
@@ -287,7 +287,7 @@ if(SPM_ENABLE_BENCHMARK)
   FetchContent_Declare(
     google_benchmark
     GIT_REPOSITORY https://github.com/google/benchmark.git
-    GIT_TAG v1.9.5
+    GIT_TAG v1.10.0
     GIT_SHALLOW TRUE
   )
   FetchContent_MakeAvailable(google_benchmark)
